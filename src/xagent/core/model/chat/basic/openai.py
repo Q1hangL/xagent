@@ -1642,7 +1642,7 @@ class OpenAICompatibleLLM(BaseLLM):
 
     @staticmethod
     async def list_available_models(
-        api_key: str, base_url: Optional[str] = None
+        api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
     ) -> List[Dict[str, Any]]:
         """Fetch available models from OpenAI-compatible API using SDK.
 
@@ -1651,6 +1651,8 @@ class OpenAICompatibleLLM(BaseLLM):
             base_url: Base URL for the API (optional).
                 - If not provided, uses official OpenAI API: https://api.openai.com/v1
                 - If provided, uses the specified endpoint (e.g., proxy or custom service)
+            raise_on_error: Raise read failures other than a rejected key
+                instead of answering them with an empty list.
 
         Returns:
             List of available models with their information
@@ -1702,6 +1704,8 @@ class OpenAICompatibleLLM(BaseLLM):
             raise ValueError("Invalid API key") from e
         except Exception as e:
             logger.error("Failed to fetch models: %s", redact_sensitive_text(str(e)))
+            if raise_on_error:
+                raise
             return []
         finally:
             await client.close()

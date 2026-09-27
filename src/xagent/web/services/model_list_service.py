@@ -1,5 +1,6 @@
 """Service to fetch available models from various providers using their SDKs."""
 
+import inspect
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -16,12 +17,21 @@ from ...core.utils.security import redact_sensitive_text
 logger = logging.getLogger(__name__)
 
 
+def _error_mode(raise_on_error: bool) -> Dict[str, Any]:
+    """Keyword for readers that can answer a failed read with an empty list.
+
+    Passed only when set, so the default call is exactly the long-standing
+    ``(api_key, base_url)`` call.
+    """
+    return {"raise_on_error": True} if raise_on_error else {}
+
+
 def _static_model_list(models: tuple[str, ...], owned_by: str) -> List[Dict[str, Any]]:
     return [{"id": model_id, "created": 0, "owned_by": owned_by} for model_id in models]
 
 
 async def fetch_openai_models(
-    api_key: str, base_url: Optional[str] = None
+    api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
     """Fetch available models from OpenAI using OpenAILLM.list_available_models().
 
@@ -34,7 +44,9 @@ async def fetch_openai_models(
     """
     from ...core.model.chat.basic.openai import OpenAILLM
 
-    return await OpenAILLM.list_available_models(api_key, base_url)
+    return await OpenAILLM.list_available_models(
+        api_key, base_url, **_error_mode(raise_on_error)
+    )
 
 
 async def fetch_deepseek_models(
@@ -47,7 +59,7 @@ async def fetch_deepseek_models(
 
 
 async def fetch_zhipu_models(
-    api_key: str, base_url: Optional[str] = None
+    api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
     """Fetch available models from Zhipu AI using ZhipuLLM.list_available_models().
 
@@ -60,11 +72,13 @@ async def fetch_zhipu_models(
     """
     from ...core.model.chat.basic.zhipu import ZhipuLLM
 
-    return await ZhipuLLM.list_available_models(api_key, base_url)
+    return await ZhipuLLM.list_available_models(
+        api_key, base_url, **_error_mode(raise_on_error)
+    )
 
 
 async def fetch_claude_models(
-    api_key: str, base_url: Optional[str] = None
+    api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
     """Fetch available models from Anthropic Claude using ClaudeLLM.list_available_models().
 
@@ -77,11 +91,13 @@ async def fetch_claude_models(
     """
     from ...core.model.chat.basic.claude import ClaudeLLM
 
-    return await ClaudeLLM.list_available_models(api_key, base_url)
+    return await ClaudeLLM.list_available_models(
+        api_key, base_url, **_error_mode(raise_on_error)
+    )
 
 
 async def fetch_gemini_models(
-    api_key: str, base_url: Optional[str] = None
+    api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
     """Fetch available models from Google Gemini using GeminiLLM.list_available_models().
 
@@ -94,7 +110,9 @@ async def fetch_gemini_models(
     """
     from ...core.model.chat.basic.gemini import GeminiLLM
 
-    return await GeminiLLM.list_available_models(api_key, base_url)
+    return await GeminiLLM.list_available_models(
+        api_key, base_url, **_error_mode(raise_on_error)
+    )
 
 
 async def fetch_xinference_models(
@@ -339,10 +357,10 @@ async def fetch_minimax_cn_coding_plan_models(
 
 
 async def fetch_kimi_for_coding_models(
-    api_key: str, base_url: Optional[str] = None
+    api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
     """Fetch available Kimi For Coding models via the Claude-compatible API."""
-    return await fetch_claude_models(api_key, base_url)
+    return await fetch_claude_models(api_key, base_url, **_error_mode(raise_on_error))
 
 
 async def _fetch_openai_compatible_video_models(
@@ -443,6 +461,8 @@ async def fetch_models_from_provider(
     provider: str,
     api_key: str,
     base_url: Optional[str] = None,
+    *,
+    raise_on_error: bool = False,
 ) -> List[Dict[str, Any]]:
     """Fetch available models from a specific provider.
 
@@ -450,6 +470,11 @@ async def fetch_models_from_provider(
         provider: Provider name (openai, zhipu, claude, etc.)
         api_key: API key for the provider
         base_url: Custom base URL (optional)
+        raise_on_error: Callers that must tell a failed read from an empty
+            catalog set this: fetchers that would otherwise answer a rate
+            limit, 5xx, timeout, connection or permission failure with an
+            empty list raise it instead. The default keeps each fetcher's
+            existing behavior.
 
     Returns:
         List of available models
@@ -463,7 +488,12 @@ async def fetch_models_from_provider(
 
     try:
         resolved_base_url = base_url or default_base_url_for_provider(provider_id)
-        result: List[Dict[str, Any]] = await fetcher(api_key, resolved_base_url)
+        supports_error_mode = "raise_on_error" in inspect.signature(fetcher).parameters
+        result: List[Dict[str, Any]] = await fetcher(
+            api_key,
+            resolved_base_url,
+            **_error_mode(raise_on_error and supports_error_mode),
+        )
         return result
     except Exception as e:
         logger.error(

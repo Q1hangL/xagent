@@ -1,10 +1,29 @@
 import os
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from openai import AsyncAzureOpenAI
 
 from ..timeout_config import TimeoutConfig
 from .openai import OpenAILLM
+
+
+class _ApiKeyOnlyAsyncAzureOpenAI(AsyncAzureOpenAI):
+    """An Azure client that authenticates with its ``api_key`` and nothing else.
+
+    The SDK fills an unset Entra token from ``AZURE_OPENAI_AD_TOKEN`` and then
+    prefers that token over ``api_key`` on every request, so an explicit key
+    alone does not decide which credential is sent. This client drops any
+    token and token provider after construction (``copy``/``with_options``
+    construct this class again), so requests carry only ``api-key``.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._azure_ad_token = None
+        self._azure_ad_token_provider = None
+
+    async def _get_azure_ad_token(self) -> Optional[str]:
+        return None
 
 
 class AzureOpenAILLM(OpenAILLM):
@@ -30,6 +49,7 @@ class AzureOpenAILLM(OpenAILLM):
         timeout: float = 180.0,
         abilities: Optional[List[str]] = None,
         timeout_config: Optional[TimeoutConfig] = None,
+        api_key_only: bool = False,
     ):
         """
         Initialize the Azure OpenAI LLM client.
@@ -43,7 +63,13 @@ class AzureOpenAILLM(OpenAILLM):
             default_max_tokens: Default maximum tokens to generate
             timeout: Request timeout in seconds
             abilities: List of abilities supported by this model
+            api_key_only: Authenticate with ``api_key`` only, never with an
+                Entra token from the environment (see ``_ApiKeyOnlyAsyncAzureOpenAI``).
+                Requires an explicit ``api_key``.
         """
+        if api_key_only and not api_key:
+            raise ValueError("api_key_only requires an explicit api_key")
+        self.api_key_only = api_key_only
         # Store Azure-specific configuration
         self.azure_endpoint = (
             azure_endpoint
@@ -88,7 +114,10 @@ class AzureOpenAILLM(OpenAILLM):
         """
         if self._client is None:
             assert self.azure_endpoint is not None, "azure_endpoint must be set"
-            self._client = AsyncAzureOpenAI(
+            client_class = (
+                _ApiKeyOnlyAsyncAzureOpenAI if self.api_key_only else AsyncAzureOpenAI
+            )
+            self._client = client_class(
                 azure_endpoint=self.azure_endpoint,
                 api_version=self.api_version,
                 api_key=self.api_key,

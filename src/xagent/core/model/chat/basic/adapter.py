@@ -8,6 +8,7 @@ from ...providers import (
     ROUTER_PROVIDER,
     canonical_provider_name,
     is_auto_router_model,
+    is_placeholder_api_key,
     provider_compatibility_for_provider,
     resolve_base_url_for_provider,
 )
@@ -86,6 +87,13 @@ def create_base_llm(
     provider = canonical_provider_name(model.model_provider)
     compatibility = provider_compatibility_for_provider(provider)
     llm: BaseLLM
+
+    if model.explicit_credentials_only and (
+        not model.api_key or is_placeholder_api_key(model.api_key)
+    ):
+        # Adapters treat a missing or placeholder key as "use the environment";
+        # an explicit-credentials config must never end up on those.
+        raise ValueError("An explicit, non-placeholder api_key is required")
 
     if is_auto_router_model(provider, model.model_name):
         # Pick a concrete model via xrouter-llm. Legacy OpenRouter Auto clones
@@ -172,6 +180,7 @@ def create_base_llm(
             default_max_tokens=model.default_max_tokens,
             timeout=model.timeout,
             abilities=model.abilities,
+            api_key_only=model.explicit_credentials_only,
         )
     elif provider == "zhipu":
         llm = ZhipuLLM(

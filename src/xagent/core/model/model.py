@@ -46,6 +46,15 @@ class ChatModelConfig(ModelConfig):
     router_config_name: Optional[str] = None
     router_candidate_models: Optional[List[str]] = None
     router_fallback_model: Optional[str] = None
+    # Runtime-only: authenticate with exactly the ``api_key`` in this config.
+    # The factory refuses a missing or placeholder key (which adapters would
+    # otherwise replace from the process environment) and adapters must not
+    # add or substitute ambient credentials such as ``AZURE_OPENAI_AD_TOKEN``.
+    # Hosts running configurations owned by someone other than the deployment
+    # (for example a model a user configured with their own key) set this;
+    # deployment-owned models keep the default and their environment-based
+    # credentials.
+    explicit_credentials_only: bool = False
 
 
 class ImageModelConfig(ModelConfig):
