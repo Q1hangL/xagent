@@ -156,6 +156,75 @@ class TaskSetupSnapshot:
     workforce_runtime: WorkforceTaskRuntime | None = None
 
 
+class TaskModelOverrideError(ValueError):
+    """A task model override cannot be applied as requested."""
+
+
+@dataclass(frozen=True)
+class TaskModelOverride:
+    """One caller-selected model for every conversational role of a task run.
+
+    Applied to a :class:`TaskSetupSnapshot` after the Agent Builder overlay
+    has resolved the task's models, so nothing built from the snapshot --
+    the ``AgentService`` model slots, and the tool models handed to
+    ``create_default_tools`` (a later tool rebuild reuses that tool config) --
+    can still reach the models the overlay chose.
+
+    ``vision_llm`` is the model vision tools use. ``None`` means vision is
+    deliberately unavailable for this run: an :class:`UnavailableVisionModel`
+    takes the slot, so tools do not fall back to a default vision model, and
+    any vision call is refused. ``excluded_tool_categories`` removes tool
+    categories from this run's selection; it requires an explicit category
+    list, since an unrestricted selection has no list to remove from.
+    """
+
+    llm: BaseLLM
+    vision_llm: BaseLLM | None = None
+    excluded_tool_categories: frozenset[str] = frozenset()
+
+
+def apply_task_model_override(
+    snapshot: TaskSetupSnapshot, override: TaskModelOverride
+) -> TaskSetupSnapshot:
+    """Return ``snapshot`` with ``override`` in every model slot it resolved.
+
+    Raises :class:`TaskModelOverrideError` when categories are to be excluded
+    from a selection that is not an explicit list.
+    """
+    from dataclasses import replace
+
+    from ...core.model.chat.basic.call_boundary import UnavailableVisionModel
+
+    agent_config = snapshot.agent_config
+    if override.excluded_tool_categories:
+        categories = agent_config.get("tool_categories") if agent_config else None
+        if not isinstance(categories, list):
+            raise TaskModelOverrideError(
+                "tool categories can only be excluded from an explicit selection"
+            )
+        agent_config = {
+            **cast(dict[str, Any], agent_config),
+            "tool_categories": [
+                category
+                for category in categories
+                if category not in override.excluded_tool_categories
+            ],
+        }
+    vision_llm = (
+        override.vision_llm
+        if override.vision_llm is not None
+        else UnavailableVisionModel()
+    )
+    return replace(
+        snapshot,
+        task_llm=override.llm,
+        task_fast_llm=override.llm,
+        task_vision_llm=vision_llm,
+        task_compact_llm=override.llm,
+        agent_config=agent_config,
+    )
+
+
 # NOTE: All LLM resolution + agent-builder merge + execution-mode →
 # pattern logic lives in ``llm_utils.resolve_task_runtime_config_core``.
 # This loader is the off-loop wrapper that:
