@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 import aiohttp
 
 from ...core.model.providers import (
+    ENDPOINT_KIND_OFFICIAL,
     canonical_provider_name,
     curated_models_for_provider,
     default_base_url_for_provider,
@@ -475,9 +476,30 @@ async def fetch_models_from_provider(
 
 
 def get_supported_providers() -> List[Dict[str, Any]]:
-    """Get list of supported providers.
+    """Get list of supported providers for the model configuration pages.
+
+    These pages configure an endpoint as a base URL. Providers whose official
+    endpoint is instead built from declared credential fields (an Azure
+    resource name) are left out until those pages can collect such fields;
+    hosts that consume the shared credential-field contract list them from
+    ``get_supported_provider_metadata``. A provider's routing hint, when it
+    declares one, is part of the description these pages show.
 
     Returns:
         List of provider information
     """
-    return get_supported_provider_metadata()
+    providers: List[Dict[str, Any]] = []
+    for provider in get_supported_provider_metadata():
+        if (
+            provider.get("endpoint_kind", ENDPOINT_KIND_OFFICIAL)
+            != ENDPOINT_KIND_OFFICIAL
+        ):
+            continue
+        info = dict(provider)
+        routing_hint = info.pop("routing_hint", None)
+        if routing_hint:
+            info["description"] = (
+                f"{info.get('description', '')} {routing_hint}".strip()
+            )
+        providers.append(info)
+    return providers
