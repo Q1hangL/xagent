@@ -85,6 +85,27 @@ PROVIDER_CALL_FAILURE_CODES = frozenset(
     }
 )
 
+# Failures that asking again with a smaller output budget cannot fix: the
+# cause is the provider's availability, the credential, the model or the call
+# scope, and the wrapped model's own retries have already run. A caller that
+# steps its budget down after a failure (the runtime's compaction-summary
+# ladder) stops on these. Left out on purpose, so they keep stepping down:
+# ``invalid_request`` and ``provider_error`` (a rejected ``max_tokens``
+# arrives as one of them) and ``provider_quota`` (some providers refuse an
+# over-budget request with 402 "fewer max_tokens"). ``context_length`` has
+# its own handling.
+BUDGET_INSENSITIVE_FAILURE_CODES = frozenset(
+    {
+        CREDENTIAL_REJECTED,
+        RATE_LIMITED,
+        TIMEOUT,
+        PROVIDER_UNAVAILABLE,
+        MODEL_NOT_AVAILABLE,
+        CALL_SCOPE_UNAVAILABLE,
+        VISION_UNAVAILABLE,
+    }
+)
+
 _SAFE_MESSAGES = {
     # Keeps a "context length exceeded" marker so is_context_length_error
     # recognizes the message as well as the type.
@@ -513,8 +534,19 @@ def guard_llm_calls(
     """Wrap ``llm`` so every provider call runs inside ``call_scope`` and fails safely.
 
     ``call_scope`` is entered afresh around each provider-touching operation
-    and must be cheap and re-entrant. ``on_failure`` receives the fixed
-    failure code of each error, inside the scope; it must not raise.
+    and must be cheap and re-entrant.
+
+    ``on_failure`` is told the fixed code of each provider failure the
+    wrapper replaces, from inside the scope, and ``call_scope_unavailable``
+    when the scope itself could not be entered -- that one is reported with
+    no scope active. One ``stream_chat`` call can report more than once: when
+    the scope cannot be re-entered to close the stream it also reports
+    ``call_scope_unavailable``, after a successful stream or after a failed
+    one, so the last code reported can differ from the raised error's. A
+    failure while closing the stream is logged, not reported. Do not count
+    calls to it or treat the last code as the call's outcome; the raised
+    error's ``.code`` is authoritative. ``on_failure`` must not raise; an
+    exception from it is logged by type only.
     """
     return BoundaryLLM(llm, call_scope=call_scope, on_failure=on_failure)
 

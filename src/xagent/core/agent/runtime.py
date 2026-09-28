@@ -24,6 +24,10 @@ from ..context_materializer import (
 )
 from ..inline_file_delivery import InlineFileDelivery, InlineFileStreamGuard
 from ..model.chat.basic.base import BaseLLM
+from ..model.chat.basic.call_boundary import (
+    BUDGET_INSENSITIVE_FAILURE_CODES,
+    ProviderCallError,
+)
 from ..model.chat.error import is_context_length_error, retry_on
 from ..model.chat.exceptions import LLMContextLengthError, LLMToolProtocolError
 from ..model.chat.token_context import extract_cached_input_tokens
@@ -295,6 +299,24 @@ def resolved_llm_metadata(llm: Any) -> dict[str, Any]:
     if isinstance(context_window, int) and context_window > 0:
         metadata["context_window"] = context_window
     return metadata
+
+
+def _budget_cannot_help(exc: Exception) -> bool:
+    """True when asking again with a smaller output budget is pointless.
+
+    Either the failure is transient by class (``retry_on``), so the model's
+    own retries are already spent, or it is a ``ProviderCallError`` -- which
+    by construction carries no cause for ``retry_on`` to read -- whose code a
+    smaller budget cannot fix. ``retry_on`` itself is
+    deliberately not taught these codes: a host that wraps a guarded model in
+    another retry layer would then retry every exhausted call again.
+    """
+    if retry_on(exc):
+        return True
+    return (
+        isinstance(exc, ProviderCallError)
+        and exc.code in BUDGET_INSENSITIVE_FAILURE_CODES
+    )
 
 
 @dataclass
@@ -1590,9 +1612,10 @@ class PatternRuntime:
             ]
             if not budgets:
                 raise
-            if retry_on(exc):
+            if _budget_cannot_help(exc):
                 # Transient by class -- the LLM object is already wrapped in
-                # backoff retries, so reaching here means those are spent.
+                # backoff retries, so reaching here means those are spent --
+                # or a guarded model's failure that is not about the budget.
                 # Sending the same request again with a smaller output budget
                 # would not address the cause and would double an outage's
                 # cost, for a fallback that is free.
@@ -1618,7 +1641,7 @@ class PatternRuntime:
                     exc = retry_exc
                     if (
                         is_context_length_error(retry_exc)
-                        or retry_on(retry_exc)
+                        or _budget_cannot_help(retry_exc)
                         or self._interrupt_requested
                     ):
                         break
