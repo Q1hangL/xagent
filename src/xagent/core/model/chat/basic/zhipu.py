@@ -231,12 +231,10 @@ class ZhipuLLM(BaseLLM):
             logger.debug("Making Zhipu API call...")
 
             try:
-                # Run in a copy of the caller's context, as asyncio.to_thread
-                # does, so context variables (log-scoping state among them)
+                # asyncio.to_thread runs the SDK call in a copy of the caller's
+                # context, so context variables (log-scoping state among them)
                 # reach the SDK thread.
-                response = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    contextvars.copy_context().run,
+                response = await asyncio.to_thread(
                     lambda: self._client.chat.completions.create(**completion_params),  # type: ignore
                 )
                 logger.debug(
@@ -893,12 +891,10 @@ class ZhipuLLM(BaseLLM):
             logger.debug("Making Zhipu Vision API call...")
 
             try:
-                # Run in a copy of the caller's context, as asyncio.to_thread
-                # does, so context variables (log-scoping state among them)
+                # asyncio.to_thread runs the SDK call in a copy of the caller's
+                # context, so context variables (log-scoping state among them)
                 # reach the SDK thread.
-                response = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    contextvars.copy_context().run,
+                response = await asyncio.to_thread(
                     lambda: self._client.chat.completions.create(**completion_params),  # type: ignore
                 )
                 logger.debug(

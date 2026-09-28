@@ -473,8 +473,11 @@ async def fetch_models_from_provider(
         raise_on_error: Callers that must tell a failed read from an empty
             catalog set this: fetchers that would otherwise answer a rate
             limit, 5xx, timeout, connection or permission failure with an
-            empty list raise it instead. The default keeps each fetcher's
-            existing behavior.
+            empty list raise it instead. It reaches only fetchers that accept
+            it: the Volcengine/BytePlus Ark video fetchers and the Xinference
+            rerank fetcher do not, so those failures still come back as an
+            empty list there, and an unknown provider is an empty list in
+            either mode. The default keeps each fetcher's existing behavior.
 
     Returns:
         List of available models

@@ -14,11 +14,28 @@ class _ApiKeyOnlyAsyncAzureOpenAI(AsyncAzureOpenAI):
     prefers that token over ``api_key`` on every request, so an explicit key
     alone does not decide which credential is sent. This client drops any
     token and token provider after construction (``copy``/``with_options``
-    construct this class again), so requests carry only ``api-key``.
+    construct this class again), so every credential header carries the
+    configured ``api_key`` and never an Entra token.
+
+    The SDK has no public switch for this, so the client relies on private
+    members; construction fails if a release renames them, instead of the
+    override silently doing nothing and the token being sent again.
     """
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        missing = [
+            name
+            for name in ("_azure_ad_token", "_azure_ad_token_provider")
+            if not hasattr(self, name)
+        ]
+        if not callable(getattr(super(), "_get_azure_ad_token", None)):
+            missing.append("_get_azure_ad_token")
+        if missing:
+            raise RuntimeError(
+                "Cannot enforce api-key-only Azure authentication: AsyncAzureOpenAI "
+                f"in the installed openai SDK has no {', '.join(missing)}"
+            )
         self._azure_ad_token = None
         self._azure_ad_token_provider = None
 

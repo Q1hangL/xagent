@@ -16,14 +16,17 @@ synthetic.
 
 import contextvars
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import openai
 import pytest
+from google.genai import errors as genai_errors
+from openai import AsyncAzureOpenAI
 
 from xagent.core.model.chat.basic.adapter import create_base_llm
 from xagent.core.model.chat.basic.azure_openai import AzureOpenAILLM
+from xagent.core.model.chat.basic.gemini import GeminiLLM
 from xagent.core.model.chat.basic.openai import OpenAILLM
 from xagent.core.model.chat.basic.zhipu import ZhipuLLM
 from xagent.core.model.model import ChatModelConfig
@@ -134,6 +137,80 @@ class TestAzureAuthentication:
         await llm.chat([{"role": "user", "content": "hi"}])
         _assert_caller_key_only(wire.sent[0])
 
+    async def test_api_key_only_never_calls_a_token_provider(self, wire, monkeypatch):
+        # An ambient token would win over the provider in the control below.
+        monkeypatch.delenv("AZURE_OPENAI_AD_TOKEN", raising=False)
+        calls: list[int] = []
+
+        def token_provider() -> str:
+            calls.append(1)
+            return PLATFORM_AD_TOKEN
+
+        llm = AzureOpenAILLM(
+            model_name="my-deployment",
+            azure_endpoint=ENDPOINT,
+            api_key=CALLER_KEY,
+            api_key_only=True,
+        )
+        llm._ensure_client()
+        # A provider handed to a per-request copy is dropped like the token.
+        copied = llm._client.with_options(azure_ad_token_provider=token_provider)
+        await copied.chat.completions.create(
+            model="my-deployment", messages=[{"role": "user", "content": "hi"}]
+        )
+        assert calls == []
+        _assert_caller_key_only(wire.sent[0])
+
+        # Control: the default client does authenticate with that provider.
+        default = AsyncAzureOpenAI(
+            azure_endpoint=ENDPOINT,
+            api_version="2024-08-01-preview",
+            api_key=CALLER_KEY,
+            azure_ad_token_provider=token_provider,
+        )
+        await default.chat.completions.create(
+            model="my-deployment", messages=[{"role": "user", "content": "hi"}]
+        )
+        assert calls == [1]
+        assert (
+            wire.sent[1].headers.get("authorization") == f"Bearer {PLATFORM_AD_TOKEN}"
+        )
+
+    @pytest.mark.parametrize(
+        "member",
+        ["_azure_ad_token", "_azure_ad_token_provider", "_get_azure_ad_token"],
+    )
+    async def test_api_key_only_fails_loudly_if_the_sdk_renames_a_member(
+        self, member, wire, monkeypatch
+    ):
+        # Stand-in for an openai release without a private member the
+        # override relies on: building the client fails instead of the
+        # override silently doing nothing.
+        if member == "_get_azure_ad_token":
+            monkeypatch.delattr(AsyncAzureOpenAI, member)
+        else:
+            sdk_init = AsyncAzureOpenAI.__init__
+
+            def renamed_init(self, *args, **kwargs):
+                sdk_init(self, *args, **kwargs)
+                self.__dict__[member + "_v2"] = self.__dict__.pop(member)
+
+            monkeypatch.setattr(AsyncAzureOpenAI, "__init__", renamed_init)
+        monkeypatch.setenv("AZURE_OPENAI_AD_TOKEN", PLATFORM_AD_TOKEN)
+        llm = AzureOpenAILLM(
+            model_name="my-deployment",
+            azure_endpoint=ENDPOINT,
+            api_key=CALLER_KEY,
+            api_key_only=True,
+        )
+        with pytest.raises(RuntimeError, match=f"has no {member}$"):
+            await llm.chat([{"role": "user", "content": "hi"}])
+        assert wire.sent == []
+        # The default client does not depend on those members to be built.
+        AzureOpenAILLM(
+            model_name="my-deployment", azure_endpoint=ENDPOINT, api_key=CALLER_KEY
+        )._ensure_client()
+
 
 class TestExplicitCredentialsFactoryGate:
     @pytest.mark.parametrize("api_key", [None, "", "your-deepseek-key"])
@@ -146,6 +223,24 @@ class TestExplicitCredentialsFactoryGate:
                     id="deepseek-v4-flash",
                     model_name="deepseek-v4-flash",
                     model_provider="deepseek",
+                    api_key=api_key,
+                    explicit_credentials_only=True,
+                )
+            )
+
+    @pytest.mark.parametrize(
+        ("provider", "api_key"),
+        [("router", None), ("router", CALLER_KEY), ("OpenRouter", CALLER_KEY)],
+    )
+    def test_auto_models_are_refused(self, provider, api_key):
+        # Auto runs its candidates' (or a derived) configuration, which the
+        # flag does not reach; refusing it keeps the flag from being dropped.
+        with pytest.raises(ValueError, match="Auto"):
+            create_base_llm(
+                ChatModelConfig(
+                    id="auto",
+                    model_name="Auto",
+                    model_provider=provider,
                     api_key=api_key,
                     explicit_credentials_only=True,
                 )
@@ -251,6 +346,99 @@ class TestStrictCatalogReads:
             assert await reader("sk-test") == []
             with pytest.raises(httpx.ReadTimeout):
                 await reader("sk-test", raise_on_error=True)
+
+    async def test_kimi_for_coding_forwards_the_error_mode(self, monkeypatch):
+        urls: list[str] = []
+
+        async def refuse(self, url, **kwargs):
+            urls.append(str(url))
+            raise httpx.ReadTimeout("read timed out")
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", refuse)
+        assert await fetch_models_from_provider("kimi-for-coding", "sk-test") == []
+        with pytest.raises(httpx.ReadTimeout):
+            await fetch_models_from_provider(
+                "kimi_for_coding", "sk-test", raise_on_error=True
+            )
+        # Both reads went to Kimi through the Claude-compatible reader.
+        assert urls == ["https://api.kimi.com/coding/v1/models"] * 2
+
+
+def _gemini_error(code: int, reason: str = "") -> Exception:
+    status = {
+        400: "INVALID_ARGUMENT",
+        401: "UNAUTHENTICATED",
+        403: "PERMISSION_DENIED",
+        429: "RESOURCE_EXHAUSTED",
+        503: "UNAVAILABLE",
+    }[code]
+    body = {"error": {"code": code, "message": "failed", "status": status}}
+    if reason:
+        body["error"]["details"] = [
+            {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": reason}
+        ]
+    cls = genai_errors.ServerError if code >= 500 else genai_errors.ClientError
+    return cls(code, body)
+
+
+@pytest.fixture
+def gemini_sdk(monkeypatch):
+    """Replace ``genai.Client``; ``gemini_sdk.list`` answers the catalog read."""
+    client = MagicMock()
+    client.aio.models.list = AsyncMock()
+    sdk = MagicMock(return_value=client)
+    monkeypatch.setattr("google.genai.Client", sdk)
+    return SimpleNamespace(client_class=sdk, list=client.aio.models.list)
+
+
+class TestStrictGeminiCatalogReads:
+    @pytest.mark.parametrize(
+        "error",
+        [
+            _gemini_error(400),
+            _gemini_error(429),
+            _gemini_error(503),
+            TimeoutError("read timed out"),
+        ],
+        ids=["400", "429", "503", "timeout"],
+    )
+    async def test_a_failed_read_raises_only_when_asked(self, error, gemini_sdk):
+        gemini_sdk.list.side_effect = error
+        assert await GeminiLLM.list_available_models("AIza-test") == []
+        assert await fetch_models_from_provider("gemini", "AIza-test") == []
+        with pytest.raises(type(error)):
+            await fetch_models_from_provider("google", "AIza-test", raise_on_error=True)
+
+    @pytest.mark.parametrize(
+        ("code", "reason"),
+        [(401, ""), (403, ""), (400, "API_KEY_INVALID")],
+        ids=["401", "403", "400-API_KEY_INVALID"],
+    )
+    async def test_a_rejected_key_is_a_value_error_when_asked(
+        self, code, reason, gemini_sdk
+    ):
+        gemini_sdk.list.side_effect = _gemini_error(code, reason)
+        assert await fetch_models_from_provider("gemini", "AIza-test") == []
+        with pytest.raises(ValueError) as caught:
+            await fetch_models_from_provider("gemini", "AIza-test", raise_on_error=True)
+        # The SDK error stays the cause, so its status is still readable.
+        assert isinstance(caught.value.__cause__, genai_errors.ClientError)
+        assert caught.value.__cause__.code == code
+
+    @pytest.mark.parametrize("api_key", ["", "  ", "your-gemini-key"])
+    async def test_a_strict_read_refuses_a_missing_or_placeholder_key(
+        self, api_key, gemini_sdk, monkeypatch
+    ):
+        # genai.Client would otherwise authenticate with the deployment's key.
+        monkeypatch.setenv("GOOGLE_API_KEY", "platform-google-key")
+        monkeypatch.setenv("GEMINI_API_KEY", "platform-gemini-key")
+        with pytest.raises(ValueError):
+            await fetch_models_from_provider("gemini", api_key, raise_on_error=True)
+        gemini_sdk.client_class.assert_not_called()
+        # Default callers (the connection test passes ``api_key or ""``) keep
+        # handing the key to genai.Client and its environment fallback.
+        assert await fetch_models_from_provider("gemini", api_key) == []
+        assert gemini_sdk.client_class.call_args.kwargs["api_key"] == api_key
 
 
 _CALLER_SCOPE: contextvars.ContextVar[str] = contextvars.ContextVar(

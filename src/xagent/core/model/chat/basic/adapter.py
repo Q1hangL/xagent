@@ -88,9 +88,15 @@ def create_base_llm(
     compatibility = provider_compatibility_for_provider(provider)
     llm: BaseLLM
 
-    if model.explicit_credentials_only and (
-        not model.api_key or is_placeholder_api_key(model.api_key)
+    if model.explicit_credentials_only and is_auto_router_model(
+        provider, model.model_name
     ):
+        # Auto runs other configurations (its candidates, or one the router
+        # derives), which this flag does not reach. Not supported for now:
+        # refuse it rather than let those run without the flag.
+        raise ValueError("Auto models do not support explicit_credentials_only")
+
+    if model.explicit_credentials_only and is_placeholder_api_key(model.api_key):
         # Adapters treat a missing or placeholder key as "use the environment";
         # an explicit-credentials config must never end up on those.
         raise ValueError("An explicit, non-placeholder api_key is required")

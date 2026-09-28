@@ -10,6 +10,7 @@ from google import genai  # type: ignore[import-untyped,unused-ignore]
 from google.genai import errors as genai_errors
 
 from ....utils.security import redact_sensitive_text
+from ...providers import is_placeholder_api_key
 from ..error import is_context_length_error
 from ..exceptions import (
     LLMContextLengthError,
@@ -1016,8 +1017,14 @@ class GeminiLLM(BaseLLM):
             base_url: Base URL for the API (optional).
                 - If not provided, uses official Google Generative AI API
                 - If provided, uses the specified endpoint (e.g., proxy or custom service)
-            raise_on_error: Raise read failures other than a rejected key
-                instead of answering them with an empty list.
+            raise_on_error: Raise read failures instead of answering them
+                with an empty list; a rejected key (HTTP 401/403, or 400
+                ``API_KEY_INVALID``) is raised as ``ValueError``. A missing
+                or placeholder key is refused with ``ValueError`` before any
+                request, since ``genai.Client`` would replace a missing key
+                with ``GOOGLE_API_KEY``/``GEMINI_API_KEY``. Without this
+                option every failure, a rejected key included, returns an
+                empty list.
 
         Returns:
             List of available Gemini models with their information
@@ -1031,6 +1038,8 @@ class GeminiLLM(BaseLLM):
             ...     base_url="https://my-proxy.com/v1beta"
             ... )
         """
+        if raise_on_error and is_placeholder_api_key(api_key):
+            raise ValueError("An explicit, non-placeholder api_key is required")
         try:
             # Prepare HTTP options for custom base URL if configured
             http_options = None
@@ -1072,6 +1081,12 @@ class GeminiLLM(BaseLLM):
         except Exception as e:
             logger.error(f"Failed to fetch Gemini models: {e}")
             if raise_on_error:
+                if isinstance(e, genai_errors.ClientError) and (
+                    e.code in (401, 403)
+                    # A wrong or expired key is a 400 with reason API_KEY_INVALID.
+                    or (e.code == 400 and "API_KEY_INVALID" in str(e.details))
+                ):
+                    raise ValueError("Gemini rejected the API key") from e
                 raise
             return []
 
