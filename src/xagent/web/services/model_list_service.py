@@ -482,8 +482,10 @@ def get_supported_providers() -> List[Dict[str, Any]]:
     endpoint is instead built from declared credential fields (an Azure
     resource name) are left out until those pages can collect such fields;
     hosts that consume the shared credential-field contract list them from
-    ``get_supported_provider_metadata``. A provider's routing hint, when it
-    declares one, is part of the description these pages show.
+    ``get_supported_provider_metadata``. These pages also do not get the
+    credential-field declarations; they collect an API key themselves. A
+    provider's routing hint, when it declares one, is part of the
+    description these pages show.
 
     Returns:
         List of provider information
@@ -496,6 +498,7 @@ def get_supported_providers() -> List[Dict[str, Any]]:
         ):
             continue
         info = dict(provider)
+        info.pop("credential_fields", None)
         routing_hint = info.pop("routing_hint", None)
         if routing_hint:
             info["description"] = (

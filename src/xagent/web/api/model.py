@@ -31,10 +31,12 @@ from xagent.core.model.model import (
     VideoModelConfig,
 )
 from xagent.core.model.providers import (
+    ENDPOINT_KIND_OFFICIAL,
     ROUTER_PROVIDER,
     canonical_provider_name,
     default_base_url_for_provider,
     is_auto_router_model,
+    provider_endpoint_kind,
     provider_requires_base_url,
 )
 from xagent.core.utils.security import redact_sensitive_text
@@ -2360,11 +2362,14 @@ async def fetch_provider_models(
     else:
         provider_to_use = provider.lower()
 
-    # Providers that mark base_url as mandatory (e.g. Azure OpenAI,
-    # Xinference, OpenAI-Compatible) must not silently fall back to a
-    # provider-side default when it's omitted.
+    # Providers that mark base_url as mandatory (e.g. Xinference,
+    # OpenAI-Compatible) must not silently fall back to a provider-side
+    # default when it's omitted, and neither may providers whose endpoint is
+    # built from credential fields (an Azure resource): base_url carries it.
+    # Both checks read the base provider, not a provider+category fetcher key.
     if not base_url and (
-        provider_to_use == "azure_openai" or provider_requires_base_url(provider)
+        provider_endpoint_kind(provider) != ENDPOINT_KIND_OFFICIAL
+        or provider_requires_base_url(provider)
     ):
         raise HTTPException(
             status_code=400,

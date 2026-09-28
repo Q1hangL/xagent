@@ -51,10 +51,39 @@ class TestAzureMetadata:
         ]
 
     def test_other_providers_get_the_single_key_default(self):
-        assert provider_credential_fields("deepseek") == [
+        default = [
             {"name": "api_key", "label": "API key", "kind": "secret", "required": True}
         ]
-        assert provider_credential_fields("openrouter")[0]["kind"] == "secret"
+        assert provider_credential_fields("deepseek") == default
+        assert provider_credential_fields("openrouter") == default
+        assert provider_credential_fields("openai-compatible") == default
+        assert provider_credential_fields("not-a-provider") == default
+
+    @pytest.mark.parametrize("provider", ["xinference", " Xinference "])
+    def test_xinference_declares_an_optional_key(self, provider):
+        assert provider_credential_fields(provider) == [
+            {"name": "api_key", "label": "API key", "kind": "secret", "required": False}
+        ]
+
+    @pytest.mark.parametrize("provider", ["azure_openai", "deepseek", "not-a-provider"])
+    def test_credential_fields_are_fresh_copies(self, provider):
+        fields = provider_credential_fields(provider)
+        expected = [dict(field) for field in fields]
+        fields[0]["label"] = "changed"
+        fields.append({"name": "extra"})
+        assert provider_credential_fields(provider) == expected
+
+    def test_metadata_entries_are_deep_copies(self):
+        entry = _metadata_entry("azure_openai")
+        assert entry is not None
+        entry["credential_fields"][0]["label"] = "changed"
+        entry["credential_fields"].append({"name": "extra"})
+        entry["category"].append("image")
+        again = _metadata_entry("azure_openai")
+        assert again is not None
+        assert again["credential_fields"] == provider_credential_fields("azure_openai")
+        assert again["credential_fields"][0]["label"] == "Resource name"
+        assert again["category"] == ["llm"]
 
 
 class TestAzureResourceEndpoint:
@@ -108,6 +137,21 @@ class TestOfficialEndpointResolution:
             == "https://openrouter.ai/api/v1"
         )
 
+    @pytest.mark.parametrize(
+        "provider",
+        ["claude", "gemini", "openai-compatible", "xinference", "not-a-provider"],
+    )
+    def test_none_when_the_registry_has_no_endpoint(self, provider):
+        assert official_endpoint_for_provider(provider) is None
+
+    def test_a_scoped_env_override_replaces_the_default(self, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://deepseek.example/v1")
+        assert official_endpoint_for_provider("deepseek") == (
+            "https://deepseek.example/v1"
+        )
+        monkeypatch.delenv("DEEPSEEK_BASE_URL")
+        assert official_endpoint_for_provider("deepseek") == "https://api.deepseek.com"
+
     def test_the_azure_adapter_branch_stays_reachable(self):
         from xagent.core.model.chat.basic.adapter import create_base_llm
         from xagent.core.model.chat.basic.azure_openai import AzureOpenAILLM
@@ -143,7 +187,28 @@ class TestNativeProviderList:
     def test_routing_hints_stay_on_native_pages_only(self):
         native = {p["id"]: p for p in get_supported_providers()}
         shared = {p["id"]: p for p in get_supported_provider_metadata()}
-        assert "Use model 'auto'" in native["openrouter"]["description"]
+        # The exact description these pages showed before the hint moved out.
+        assert native["openrouter"]["description"] == (
+            "OpenRouter aggregator: reach Claude, Gemini, GPT, DeepSeek, GLM, "
+            "and more through one OpenAI-compatible key. Use model 'auto' to let "
+            "xrouter-llm pick the cheapest capable model per prompt."
+        )
         assert "routing_hint" not in native["openrouter"]
         assert "auto" not in shared["openrouter"]["description"]
         assert shared["openrouter"]["routing_hint"].startswith("Use model 'auto'")
+
+    def test_native_pages_get_only_the_fields_they_already_had(self):
+        page_fields = {
+            "id",
+            "name",
+            "description",
+            "requires_base_url",
+            "compatibility",
+            "default_base_url",
+            "category",
+        }
+        for provider in get_supported_providers():
+            assert set(provider) <= page_fields, provider["id"]
+        # The declarations stay available to hosts that read the registry.
+        shared = {p["id"]: p for p in get_supported_provider_metadata()}
+        assert shared["xinference"]["credential_fields"][0]["required"] is False
