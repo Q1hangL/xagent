@@ -307,15 +307,15 @@ def _budget_cannot_help(exc: Exception) -> bool:
     Either the failure is transient by class (``retry_on``), so the model's
     own retries are already spent, or it is a ``ProviderCallError`` -- which
     by construction carries no cause for ``retry_on`` to read -- whose code a
-    smaller budget cannot fix. ``retry_on`` itself is
-    deliberately not taught these codes: a host that wraps a guarded model in
+    smaller budget cannot fix, or whose ``transient`` flag says the guarded
+    model's retry layer already treated it as transient. ``retry_on`` itself
+    is deliberately not taught these: a host that wraps a guarded model in
     another retry layer would then retry every exhausted call again.
     """
     if retry_on(exc):
         return True
-    return (
-        isinstance(exc, ProviderCallError)
-        and exc.code in BUDGET_INSENSITIVE_FAILURE_CODES
+    return isinstance(exc, ProviderCallError) and (
+        exc.code in BUDGET_INSENSITIVE_FAILURE_CODES or exc.transient
     )
 
 

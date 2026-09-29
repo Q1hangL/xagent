@@ -2080,6 +2080,30 @@ async def test_a_transient_guarded_failure_stops_the_ladder_on_a_lower_rung() ->
     assert result.strategy == "truncate"
 
 
+@pytest.mark.parametrize("code", sorted(_BUDGET_SENSITIVE_CODES))
+@pytest.mark.asyncio
+async def test_a_guarded_failure_already_retried_as_transient_stops_the_ladder(
+    code: str,
+) -> None:
+    """``transient`` carries what the guarded model's retry layer decided.
+
+    A budget-sensitive code alone would keep stepping down; when the retry
+    layer already treated the failure as transient (a 409, a quota 429, a
+    Claude-family 4xx, an empty completion), its retries are spent and a
+    smaller budget would only repeat them, so the ladder stops as it does for
+    the same unguarded model.
+    """
+    llm = _BudgetLadderProbe(ProviderCallError(code, transient=True))
+    result = await PatternRuntime().compact_context_if_needed(
+        context=_oversized_context(f"guarded-transient-{code}"),
+        llm=llm,
+        metadata={"phase": "test"},
+    )
+
+    assert llm.budgets == [8000]
+    assert result.strategy == "truncate"
+
+
 def test_only_the_budget_sensitive_codes_keep_the_ladder_going() -> None:
     # Pinned exactly: widening the set would cost a real budget refusal its
     # step-down; narrowing it would bring back one retry cycle per rung.
@@ -2166,12 +2190,51 @@ class TestGuardedCompactionBudgetLadder:
                 response = httpx.Response(
                     402, json={"error": {"message": message, "code": 402}}
                 )
+            elif mode == "empty":
+                # A completion with no content: the adapter raises
+                # LLMEmptyContentError, which the retry layer retries.
+                payload = _claude_message() if claude else _openai_completion()
+                if claude:
+                    payload["content"] = [{"type": "text", "text": ""}]
+                else:
+                    payload["choices"][0]["message"]["content"] = ""
+                response = httpx.Response(200, json=payload)
+            elif mode == "quota429":
+                # OpenAI's out-of-quota 429, with its structured code.
+                message = "You exceeded your current quota, please check your plan."
+                response = httpx.Response(
+                    429,
+                    json={
+                        "error": {
+                            "message": message,
+                            "type": "insufficient_quota",
+                            "code": "insufficient_quota",
+                        }
+                    },
+                )
+            elif mode == "credit":
+                # A Claude-family 4xx that is not about the budget.
+                message = "Your credit balance is too low to access the API."
+                response = httpx.Response(
+                    400,
+                    json={
+                        "type": "error",
+                        "error": {"type": "invalid_request_error", "message": message},
+                    },
+                )
             else:
-                status = {"429": 429, "500": 500, "401": 401, "budget": 400}[mode]
+                status = {
+                    "429": 429,
+                    "500": 500,
+                    "401": 401,
+                    "409": 409,
+                    "budget": 400,
+                }[mode]
                 error = {
                     "type": {
                         401: "authentication_error",
                         400: "invalid_request_error",
+                        409: "conflict_error",
                         429: "rate_limit_error",
                         500: "api_error",
                     }[status],
@@ -2247,6 +2310,34 @@ class TestGuardedCompactionBudgetLadder:
         assert result.strategy == "truncate"
 
     @pytest.mark.asyncio
+    async def test_a_doubly_guarded_rate_limit_costs_one_retry_cycle(
+        self, provider: dict[str, Any]
+    ) -> None:
+        provider["mode"] = "429"
+        llm = guard_llm_calls(
+            self._llm("openai", guarded=True), call_scope=contextlib.nullcontext
+        )
+        result = await self._compact(llm, "guard-guard-429")
+
+        assert provider["seen"] == [8000] * _LADDER_ATTEMPTS
+        assert result.strategy == "truncate"
+
+    @pytest.mark.asyncio
+    async def test_an_unguarded_claude_budget_refusal_stops_after_one_cycle(
+        self, provider: dict[str, Any]
+    ) -> None:
+        # The baseline the guarded step-down below improves on: the Claude
+        # adapter retries the refusal as transient, so unguarded the ladder
+        # stops after one cycle and compaction falls back to truncation.
+        provider["mode"] = "budget"
+        result = await self._compact(
+            self._llm("claude", guarded=False), "plain-budget-claude"
+        )
+
+        assert provider["seen"] == [8000] * _LADDER_ATTEMPTS
+        assert result.strategy == "truncate"
+
+    @pytest.mark.asyncio
     async def test_a_claude_credential_rejection_costs_one_retry_cycle_when_guarded(
         self, provider: dict[str, Any]
     ) -> None:
@@ -2260,6 +2351,38 @@ class TestGuardedCompactionBudgetLadder:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
+        ("provider_id", "mode"),
+        [
+            # Each of these is retried by the retry layer as transient but is
+            # coded budget-sensitive (invalid_request, provider_quota,
+            # provider_error); only ``transient`` tells the ladder to stop.
+            ("openai", "409"),
+            ("openai", "quota429"),
+            ("openai", "empty"),
+            ("claude", "credit"),
+        ],
+    )
+    async def test_a_failure_retried_as_transient_costs_one_retry_cycle_when_guarded(
+        self, provider: dict[str, Any], provider_id: str, mode: str
+    ) -> None:
+        provider["mode"] = mode
+        await self._compact(
+            self._llm(provider_id, guarded=False), f"plain-{mode}-{provider_id}"
+        )
+        baseline = list(provider["seen"])
+        provider["seen"].clear()
+
+        result = await self._compact(
+            self._llm(provider_id, guarded=True), f"guard-{mode}-{provider_id}"
+        )
+
+        # One full retry cycle at the first budget, exactly as unguarded.
+        assert baseline == [8000] * _LADDER_ATTEMPTS
+        assert provider["seen"] == baseline
+        assert result.strategy == "truncate"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
         ("provider_id", "mode", "expected"),
         [
             # A 400 is not retried by the OpenAI adapter: one request per rung.
@@ -2268,6 +2391,7 @@ class TestGuardedCompactionBudgetLadder:
             ("openrouter", "credits", [8000, 4096, 2048, 1024]),
             # The Claude adapter retries every status error, so each refused
             # rung costs one cycle; unguarded it would not step down at all.
+            # The refusal names max_tokens, so it is not marked transient.
             (
                 "claude",
                 "budget",

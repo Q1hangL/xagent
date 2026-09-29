@@ -12,15 +12,20 @@ Every provider-touching operation -- one ``chat``/``vision_chat`` await, each
 step of a ``stream_chat`` iteration, and the stream's ``aclose`` -- runs
 inside a context manager the caller supplies (a log-redaction scope, say),
 and every error raised there is caught inside that context and replaced by a
-:class:`ProviderCallError` that carries only a fixed failure code and a fixed
-message, with no cause and no context chain. Stream ``ERROR`` chunks, whose
+:class:`ProviderCallError` that carries only a fixed failure code, a fixed
+message and a text-free ``transient`` flag, with no cause and no context chain. Stream ``ERROR`` chunks, whose
 ``content``/``raw`` hold the same provider text, are treated as the error
 they report. The caller learns each failure code through ``on_failure``.
+A scope that cannot be entered, or that fails while it is left, fails the
+call with ``call_scope_unavailable`` rather than letting its own exception
+out. :data:`SAFE_PROVIDER_ERRORS` names the two error types that can leave.
 
 What stays as it was:
 
 * ``asyncio.CancelledError`` and other ``BaseException`` shutdown signals
-  pass through untouched; a cancelled call is not a failed call.
+  pass through; a cancelled call is not a failed call. Only their exception
+  chain is cleared: one raised while a retry layer was handling a provider
+  error (during a backoff sleep, say) would otherwise carry that error.
 * A context-window rejection becomes :class:`ProviderContextLengthError`,
   a :class:`LLMContextLengthError`, so the agent runtime's compaction
   recovery still recognizes it.
@@ -28,6 +33,9 @@ What stays as it was:
   from the model's own output, not from a provider error body, and the ReAct
   pattern repairs them from their code and details; they are re-raised as a
   fresh, chain-free copy and passed through respectively.
+* A safe error raised by an inner boundary (an already-guarded model, or an
+  :class:`UnavailableVisionModel`) keeps its code; it is re-raised as a
+  fresh copy, not re-classified.
 * Successful responses and ordinary chunks are returned unchanged.
 
 The wrapper exposes the ``BaseLLM`` surface only. There is deliberately no
@@ -37,16 +45,15 @@ unguarded client method by accident.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractContextManager
-from typing import Any, List
+from typing import Any, List, NamedTuple
 
 import httpx
 
-from ..error import is_context_length_error
+from ..error import is_context_length_error, retry_on
 from ..exceptions import LLMContextLengthError, LLMToolProtocolError
 from ..types import ChunkType, StreamChunk
 from .base import BaseLLM
@@ -134,21 +141,39 @@ _UNAVAILABLE_ERROR_NAMES = frozenset(
         "ServiceUnavailableError",
     }
 )
+# Structured quota codes (an SDK's ``code``/``type`` attribute).
+_QUOTA_CODES = frozenset({"insufficient_quota", "insufficient_balance"})
 _QUOTA_MARKERS = (
     "insufficient_quota",
     "insufficient quota",
     "insufficient balance",
     "insufficient_balance",
-    "exceeded your current quota",
     "billing hard limit",
 )
+# Also said by an ordinary per-minute 429 (Gemini's RESOURCE_EXHAUSTED), so it
+# means quota only when the failure is not a rate limit.
+_AMBIGUOUS_QUOTA_MARKERS = ("exceeded your current quota",)
+# Gemini reports a wrong or expired key as a 400 whose reason is
+# API_KEY_INVALID.
+_CREDENTIAL_MARKERS = ("api_key_invalid",)
+# A refusal that names the output budget: a smaller budget may fix it even
+# when the wrapped model's retry layer treated it as transient.
+_BUDGET_MARKERS = ("max_tokens", "max_output_tokens", "max_completion_tokens")
 
 
 class ProviderCallError(RuntimeError):
-    """A provider call failed; only a fixed code and message are kept."""
+    """A provider call failed; only a fixed code and message are kept.
 
-    def __init__(self, code: str) -> None:
+    ``transient`` is a text-free flag: the retry predicate (``retry_on``)
+    treats the failure as transient -- behind a retry layer, its retries are
+    already spent -- and the provider did not name the output budget as the
+    problem. A caller that steps its budget down after a failure (the
+    runtime's compaction-summary ladder) stops on it.
+    """
+
+    def __init__(self, code: str, *, transient: bool = False) -> None:
         self.code = code if code in PROVIDER_CALL_FAILURE_CODES else PROVIDER_ERROR
+        self.transient = bool(transient)
         super().__init__(_SAFE_MESSAGES[self.code])
 
 
@@ -158,6 +183,16 @@ class ProviderContextLengthError(LLMContextLengthError):
     def __init__(self) -> None:
         self.code = CONTEXT_LENGTH
         super().__init__(_SAFE_MESSAGES[CONTEXT_LENGTH])
+
+
+# Every error type a guarded call can raise for a provider failure; both
+# carry a fixed ``.code``. ``ProviderContextLengthError`` is an
+# ``LLMContextLengthError`` rather than a ``ProviderCallError`` so compaction
+# recovery keeps recognizing it; catch this tuple to handle both.
+SAFE_PROVIDER_ERRORS: tuple[type[Exception], ...] = (
+    ProviderCallError,
+    ProviderContextLengthError,
+)
 
 
 def _chain(exc: BaseException) -> list[BaseException]:
@@ -184,27 +219,32 @@ def _http_status(exc: BaseException) -> int | None:
     return None
 
 
-def _mentions_quota(exc: BaseException) -> bool:
+def _has_quota_code(exc: BaseException) -> bool:
+    for name in ("code", "type"):
+        value = getattr(exc, name, None)
+        if isinstance(value, str) and value.lower() in _QUOTA_CODES:
+            return True
+    return False
+
+
+def _mentions(exc: BaseException, markers: tuple[str, ...]) -> bool:
     # Read, never emitted: only the fixed code leaves this module.
-    code = getattr(exc, "code", None)
-    if isinstance(code, str) and code.lower() in {
-        "insufficient_quota",
-        "insufficient_balance",
-    }:
-        return True
     try:
         text = str(exc).lower()
     except Exception:  # noqa: BLE001 - an unprintable error has no text to match
         return False
-    return any(marker in text for marker in _QUOTA_MARKERS)
+    return any(marker in text for marker in markers)
 
 
 def classify_provider_failure(exc: BaseException) -> str:
     """The fixed failure code for an error raised by a provider call.
 
-    Reads type names, HTTP statuses, and a few well-known quota markers
-    anywhere in the exception chain; the provider's text itself is never
-    returned. Anything unrecognized is ``provider_error``.
+    Reads type names, HTTP statuses, structured quota codes, and a few
+    well-known credential and quota markers anywhere in the exception chain;
+    the provider's text itself is never returned. "Exceeded your current
+    quota" alone does not make a rate limit ``provider_quota``: an ordinary
+    per-minute 429 can say it too. Anything unrecognized is
+    ``provider_error``.
     """
     if is_context_length_error(exc):
         return CONTEXT_LENGTH
@@ -213,11 +253,24 @@ def classify_provider_failure(exc: BaseException) -> str:
     statuses = {
         status for cause in causes if (status := _http_status(cause)) is not None
     }
-    if names & _CREDENTIAL_ERROR_NAMES or statuses & {401, 403}:
+    if (
+        names & _CREDENTIAL_ERROR_NAMES
+        or statuses & {401, 403}
+        or any(_mentions(cause, _CREDENTIAL_MARKERS) for cause in causes)
+    ):
         return CREDENTIAL_REJECTED
-    if 402 in statuses or any(_mentions_quota(cause) for cause in causes):
+    rate_limited = bool(names & _RATE_LIMIT_ERROR_NAMES) or 429 in statuses
+    if (
+        402 in statuses
+        or any(_has_quota_code(cause) for cause in causes)
+        or any(_mentions(cause, _QUOTA_MARKERS) for cause in causes)
+        or (
+            not rate_limited
+            and any(_mentions(cause, _AMBIGUOUS_QUOTA_MARKERS) for cause in causes)
+        )
+    ):
         return PROVIDER_QUOTA
-    if names & _RATE_LIMIT_ERROR_NAMES or 429 in statuses:
+    if rate_limited:
         return RATE_LIMITED
     if names & _NOT_FOUND_ERROR_NAMES or 404 in statuses:
         return MODEL_NOT_AVAILABLE
@@ -225,9 +278,7 @@ def classify_provider_failure(exc: BaseException) -> str:
         names & _TIMEOUT_ERROR_NAMES
         or 408 in statuses
         or any(
-            isinstance(
-                cause, (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException)
-            )
+            isinstance(cause, (TimeoutError, httpx.TimeoutException))
             for cause in causes
         )
     ):
@@ -246,10 +297,39 @@ def classify_provider_failure(exc: BaseException) -> str:
     return PROVIDER_ERROR
 
 
-def _safe_error(code: str) -> Exception:
-    if code == CONTEXT_LENGTH:
+def _classify_safely(exc: BaseException) -> str:
+    """``classify_provider_failure`` that cannot itself fail."""
+    try:
+        return classify_provider_failure(exc)
+    except Exception:  # noqa: BLE001 - the boundary must not leak on its own failure
+        return PROVIDER_ERROR
+
+
+def _retried_as_transient(exc: BaseException) -> bool:
+    """Whether the retry predicate treats ``exc`` as transient.
+
+    A refusal that names the output budget is excluded: a smaller budget may
+    still fix it.
+    """
+    if not isinstance(exc, Exception):
+        return False
+    try:
+        return retry_on(exc) and not any(
+            _mentions(cause, _BUDGET_MARKERS) for cause in _chain(exc)
+        )
+    except Exception:  # noqa: BLE001 - the boundary must not leak on its own failure
+        return False
+
+
+class _Failure(NamedTuple):
+    code: str
+    transient: bool = False
+
+
+def _safe_error(failure: _Failure) -> Exception:
+    if failure.code == CONTEXT_LENGTH:
         return ProviderContextLengthError()
-    return ProviderCallError(code)
+    return ProviderCallError(failure.code, transient=failure.transient)
 
 
 def _detached_protocol_error(exc: LLMToolProtocolError) -> LLMToolProtocolError:
@@ -329,7 +409,7 @@ class BoundaryLLM(BaseLLM):
 
     # -- the boundary --------------------------------------------------------
 
-    def _open_scope(self) -> contextlib.ExitStack:
+    def _open_scope(self) -> _GuardedScope:
         """Enter the caller's scope, or fail with a safe, chain-free error."""
         stack = contextlib.ExitStack()
         failed_type: str | None = None
@@ -339,48 +419,93 @@ class BoundaryLLM(BaseLLM):
             failed_type = type(exc).__name__
         if failed_type is not None:
             # No scope is active here, so only the type name is logged.
-            logger.warning("Model call scope could not be entered (%s)", failed_type)
+            try:
+                logger.warning(
+                    "Model call scope could not be entered (%s)", failed_type
+                )
+            except Exception:  # noqa: BLE001 - a failing log filter changes nothing here
+                pass
             self._report(CALL_SCOPE_UNAVAILABLE)
             raise ProviderCallError(CALL_SCOPE_UNAVAILABLE)
-        return stack
+        return _GuardedScope(self, stack)
 
     def _report(self, code: str) -> None:
         if self._on_failure is None:
             return
+        failed_type: str | None = None
         try:
             self._on_failure(code)
         except Exception as exc:  # noqa: BLE001 - reporting must not replace the failure
-            logger.warning("Model failure callback raised (%s)", type(exc).__name__)
+            failed_type = type(exc).__name__
+        if failed_type is not None:
+            try:
+                logger.warning("Model failure callback raised (%s)", failed_type)
+            except Exception:  # noqa: BLE001 - a failing log filter changes nothing here
+                pass
 
-    def _record_failure(self, exc: BaseException, operation: str) -> str:
+    def _record_failure(self, exc: BaseException, operation: str) -> _Failure:
         """Classify and log one provider error. Call inside the caller's scope."""
-        code = classify_provider_failure(exc)
-        # Inside the caller's scope: a redacting scope scrubs the known secret
-        # values from this record's message and traceback.
-        logger.warning(
-            "Model provider %s failed: %s (%s)",
-            operation,
-            code,
-            type(exc).__name__,
-            exc_info=exc,
-        )
-        self._report(code)
-        return code
+        failure = _Failure(PROVIDER_ERROR)
+        try:
+            if isinstance(exc, ProviderCallError):
+                # An inner boundary already replaced the provider's error: keep
+                # its code rather than re-classify its fixed message.
+                code = getattr(exc, "code", PROVIDER_ERROR)
+                failure = _Failure(
+                    code if code in PROVIDER_CALL_FAILURE_CODES else PROVIDER_ERROR,
+                    getattr(exc, "transient", False) is True,
+                )
+            elif isinstance(exc, ProviderContextLengthError):
+                failure = _Failure(CONTEXT_LENGTH)
+            else:
+                failure = _Failure(_classify_safely(exc), _retried_as_transient(exc))
+        except Exception:  # noqa: BLE001 - the boundary must not leak on its own failure
+            pass
+        try:
+            # Inside the caller's scope: a redacting scope scrubs the known
+            # secret values from this record's message and traceback.
+            logger.warning(
+                "Model provider %s failed: %s (%s)",
+                operation,
+                failure.code,
+                type(exc).__name__,
+                exc_info=exc,
+            )
+        except Exception:  # noqa: BLE001 - a failing log filter must not replace the failure
+            pass
+        self._report(failure.code)
+        return failure
 
     async def _guarded_call(self, operation: str, **kwargs: Any) -> Any:
-        failure: str | None = None
+        failure: _Failure | None = None
         protocol_error: LLMToolProtocolError | None = None
-        with self._open_scope():
+        raw: Exception | None = None
+        result: Any = None
+        scope = self._open_scope()
+        with scope:
             try:
-                return await getattr(self._inner, operation)(**kwargs)
+                result = await getattr(self._inner, operation)(**kwargs)
             except LLMToolProtocolError as exc:
                 protocol_error = _detached_protocol_error(exc)
-            except Exception as exc:  # noqa: BLE001 - replaced below, outside the handler
-                failure = self._record_failure(exc, operation)
+            except Exception as exc:  # noqa: BLE001 - recorded below, outside the handler
+                raw = exc
+            if raw is not None:
+                # Outside the handler, still inside the scope: nothing raised
+                # while classifying, logging or reporting can carry the
+                # provider's error as its context.
+                failure = self._record_failure(raw, operation)
+                raw = None
         # Raised outside the handlers, so neither error carries a context chain.
         if protocol_error is not None:
             raise protocol_error
-        raise _safe_error(failure or PROVIDER_ERROR)
+        if failure is not None:
+            raise _safe_error(failure)
+        if scope.exit_failed:
+            # A scope that failed while it was left fails the call: its
+            # redaction may not have been undone, so do not hand back a
+            # result as if the call had run as the caller set it up.
+            raise ProviderCallError(CALL_SCOPE_UNAVAILABLE)
+        return result
 
     async def chat(
         self,
@@ -447,11 +572,13 @@ class BoundaryLLM(BaseLLM):
         # The scope is entered for each step rather than held across ``yield``:
         # what the consumer does between chunks is not a provider call, and a
         # context variable set in one step must be reset in the same context.
-        failure: str | None = None
+        failure: _Failure | None = None
         protocol_error: LLMToolProtocolError | None = None
+        raw: Exception | None = None
         stream: Any = None
         try:
-            with self._open_scope():
+            scope = self._open_scope()
+            with scope:
                 try:
                     stream = aiter(
                         self._inner.stream_chat(
@@ -466,23 +593,40 @@ class BoundaryLLM(BaseLLM):
                             **kwargs,
                         )
                     )
-                except Exception as exc:  # noqa: BLE001
-                    failure = self._record_failure(exc, "stream_chat")
+                except Exception as exc:  # noqa: BLE001 - recorded below
+                    raw = exc
+                if raw is not None:
+                    failure = self._record_failure(raw, "stream_chat")
+                    raw = None
+            if failure is None and scope.exit_failed:
+                failure = _Failure(CALL_SCOPE_UNAVAILABLE)
             while failure is None and protocol_error is None:
                 chunk: StreamChunk | None = None
                 finished = False
-                with self._open_scope():
+                scope = self._open_scope()
+                with scope:
                     try:
                         chunk = await anext(stream)
                     except StopAsyncIteration:
                         finished = True
                     except LLMToolProtocolError as exc:
                         protocol_error = _detached_protocol_error(exc)
-                    except Exception as exc:  # noqa: BLE001
-                        failure = self._record_failure(exc, "stream_chat")
-                    if chunk is not None and chunk.type == ChunkType.ERROR:
+                    except Exception as exc:  # noqa: BLE001 - recorded below
+                        raw = exc
+                    if raw is not None:
+                        failure = self._record_failure(raw, "stream_chat")
+                        raw = None
+                    if (
+                        chunk is not None
+                        and getattr(chunk, "type", None) == ChunkType.ERROR
+                    ):
                         failure = self._record_error_chunk(chunk)
                         chunk = None
+                if scope.exit_failed and failure is None and protocol_error is None:
+                    # Same rule as a single call: the step's outcome is not
+                    # handed on when its scope failed while it was left.
+                    failure = _Failure(CALL_SCOPE_UNAVAILABLE)
+                    chunk = None
                 if finished or chunk is None:
                     break
                 yield chunk
@@ -493,36 +637,97 @@ class BoundaryLLM(BaseLLM):
         if failure is not None:
             raise _safe_error(failure)
 
-    def _record_error_chunk(self, chunk: StreamChunk) -> str:
+    def _record_error_chunk(self, chunk: StreamChunk) -> _Failure:
         """Classify an ``ERROR`` chunk as the error it reports. Inside scope."""
         raw = chunk.raw
         if isinstance(raw, BaseException):
             return self._record_failure(raw, "stream_chat")
-        code = classify_provider_failure(RuntimeError(chunk.content or ""))
-        logger.warning("Model provider stream_chat reported an error chunk: %s", code)
+        code = _classify_safely(RuntimeError(chunk.content or ""))
+        try:
+            logger.warning(
+                "Model provider stream_chat reported an error chunk: %s", code
+            )
+        except Exception:  # noqa: BLE001 - a failing log filter must not replace the failure
+            pass
         self._report(code)
-        return code
+        return _Failure(code)
 
     async def _close_stream(self, stream: Any) -> None:
         aclose = getattr(stream, "aclose", None)
         if not callable(aclose):
             return
         try:
-            with self._open_scope():
+            scope = self._open_scope()
+        except ProviderCallError:
+            # The scope could not be entered for cleanup (already reported);
+            # the stream is left to garbage collection rather than closed
+            # outside the scope.
+            return
+        # A failure while leaving this scope is reported by the scope itself
+        # and, like every cleanup failure here, does not replace the outcome.
+        close_error: Exception | None = None
+        with scope:
+            try:
+                await aclose()
+            except Exception as exc:  # noqa: BLE001 - cleanup must not replace the outcome
+                close_error = exc
+            if close_error is not None:
+                code = _classify_safely(close_error)
                 try:
-                    await aclose()
-                except Exception as exc:  # noqa: BLE001 - cleanup must not replace the outcome
-                    code = classify_provider_failure(exc)
                     logger.warning(
                         "Closing a model provider stream failed: %s (%s)",
                         code,
-                        type(exc).__name__,
-                        exc_info=exc,
+                        type(close_error).__name__,
+                        exc_info=close_error,
                     )
-        except ProviderCallError:
-            # The scope could not be entered for cleanup; the stream is left
-            # to garbage collection rather than closed outside the scope.
-            pass
+                except Exception:  # noqa: BLE001 - a failing log filter changes nothing here
+                    pass
+                close_error = None
+
+
+class _GuardedScope:
+    """One entered caller scope whose own exit failure cannot escape.
+
+    Used as the ``with`` target around one provider-touching step. When the
+    caller's scope raises while it is left, the error is logged by type only
+    and reported as ``call_scope_unavailable`` -- no scope is active then --
+    and :attr:`exit_failed` tells the step to fail. An exception already in
+    flight (a cancellation, say) keeps propagating, with its exception chain
+    cleared, even if the caller's scope would suppress it.
+    """
+
+    def __init__(self, owner: BoundaryLLM, stack: contextlib.ExitStack) -> None:
+        self._owner = owner
+        self._stack = stack
+        self.exit_failed = False
+
+    def __enter__(self) -> _GuardedScope:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if exc is not None and not isinstance(exc, Exception):
+            # Only a cancellation or shutdown signal is in flight here (every
+            # Exception is caught inside the step). One raised while a retry
+            # layer was handling a provider error -- during its backoff sleep,
+            # say -- would carry that error, text and all, as its context.
+            exc.__context__ = None
+            exc.__cause__ = None
+        failed_type: str | None = None
+        try:
+            self._stack.__exit__(exc_type, exc, tb)
+        except Exception as scope_exc:  # noqa: BLE001 - replaced by the step's outcome
+            failed_type = type(scope_exc).__name__
+        if failed_type is not None:
+            self.exit_failed = True
+            try:
+                logger.warning(
+                    "Model call scope could not be left cleanly (%s)", failed_type
+                )
+            except Exception:  # noqa: BLE001 - a failing log filter changes nothing here
+                pass
+            self._owner._report(CALL_SCOPE_UNAVAILABLE)
+        # Never suppress (returns None): what is in flight around a provider
+        # call keeps propagating even if the caller's scope would swallow it.
 
 
 def guard_llm_calls(
@@ -534,29 +739,45 @@ def guard_llm_calls(
     """Wrap ``llm`` so every provider call runs inside ``call_scope`` and fails safely.
 
     ``call_scope`` is entered afresh around each provider-touching operation
-    and must be cheap and re-entrant.
+    and must be cheap and re-entrant. If it cannot be entered, or raises
+    while it is left, the operation fails with ``call_scope_unavailable``: an
+    otherwise successful result is not returned, an error the operation
+    already raised keeps its own code, and closing a stream is only reported.
 
     ``on_failure`` is told the fixed code of each provider failure the
     wrapper replaces, from inside the scope, and ``call_scope_unavailable``
-    when the scope itself could not be entered -- that one is reported with
-    no scope active. One ``stream_chat`` call can report more than once: when
-    the scope cannot be re-entered to close the stream it also reports
-    ``call_scope_unavailable``, after a successful stream or after a failed
-    one, so the last code reported can differ from the raised error's. A
-    failure while closing the stream is logged, not reported. Do not count
-    calls to it or treat the last code as the call's outcome; the raised
-    error's ``.code`` is authoritative. ``on_failure`` must not raise; an
-    exception from it is logged by type only.
+    when the scope itself could not be entered or left -- that one is
+    reported with no scope active. One call can report more than once: a
+    failed call whose scope then fails while it is left also reports
+    ``call_scope_unavailable``, and so does a ``stream_chat`` whose scope
+    cannot be re-entered to close the stream, after a successful stream or
+    after a failed one; the last code reported can then differ from the
+    raised error's. A failure while closing the stream is logged, not
+    reported. Do not count calls to it or treat the last code as the call's
+    outcome; the raised error's ``.code`` is authoritative. ``on_failure``
+    must not raise; an exception from it is logged by type only.
+
+    Wrapping an already-guarded model again is safe: both scopes are
+    entered, and the inner boundary's error keeps its code (and
+    ``transient`` flag). An :class:`UnavailableVisionModel` contacts no
+    provider and is returned as it is.
     """
+    if isinstance(llm, UnavailableVisionModel):
+        return llm
     return BoundaryLLM(llm, call_scope=call_scope, on_failure=on_failure)
 
 
 class UnavailableVisionModel(BaseLLM):
     """Stands in for a vision model that was deliberately left out.
 
-    Supplying it where a vision model is expected keeps tools from falling
-    back to a deployment default vision model; any call is refused with a
-    safe ``vision_unavailable`` error and nothing is sent anywhere.
+    Every call raises ``ProviderCallError("vision_unavailable")`` and sends
+    nothing anywhere. It is deliberately truthy: the tool configuration falls
+    back to the owner's configured vision model whenever its explicit vision
+    model is missing or falsy, and this stand-in is what keeps that fallback
+    shut. Vision tools built on it refuse through their own
+    ``has_ability("vision")`` check, with their own message, before calling
+    it; ``apply_task_model_override`` therefore also drops the ``vision``
+    tool category from an explicit selection, so those tools are not offered.
     """
 
     @property
