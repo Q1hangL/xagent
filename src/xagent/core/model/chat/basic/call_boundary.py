@@ -7,18 +7,19 @@ in the database, outbound stream frames, runner logs, and whatever the
 calling product renders to its users. A log filter cannot help with most of
 those, because they are data, not log records.
 
-:func:`guard_llm_calls` wraps an LLM so that none of that text leaves it.
+:func:`guard_llm_calls` replaces provider exceptions from the ``BaseLLM``
+call and streaming protocol with fixed errors.
 Every provider-touching operation -- one ``chat``/``vision_chat`` await, each
 step of a ``stream_chat`` iteration, and the stream's ``aclose`` -- runs
 inside a context manager the caller supplies (a log-redaction scope, say),
-and every error raised there is caught inside that context and replaced by a
+and ordinary provider exceptions are caught inside that context and replaced by a
 :class:`ProviderCallError` that carries only a fixed failure code, a fixed
 message and a text-free ``transient`` flag, with no cause and no context chain. Stream ``ERROR`` chunks, whose
 ``content``/``raw`` hold the same provider text, are treated as the error
 they report. The caller learns each failure code through ``on_failure``.
 A scope that cannot be entered, or that fails while it is left, fails the
 call with ``call_scope_unavailable`` rather than letting its own exception
-out. :data:`SAFE_PROVIDER_ERRORS` names the two error types that can leave.
+out. :data:`SAFE_PROVIDER_ERRORS` names the two provider failure types.
 
 What stays as it was:
 
@@ -26,6 +27,8 @@ What stays as it was:
   pass through; a cancelled call is not a failed call. Only their exception
   chain is cleared: one raised while a retry layer was handling a provider
   error (during a backoff sleep, say) would otherwise carry that error.
+  This does not sanitize a shutdown signal's own payload or recursively
+  sanitize members of a mixed ``BaseExceptionGroup``.
 * A context-window rejection becomes :class:`ProviderContextLengthError`,
   a :class:`LLMContextLengthError`, so the agent runtime's compaction
   recovery still recognizes it.
@@ -37,6 +40,11 @@ What stays as it was:
   :class:`UnavailableVisionModel`) keeps its code; it is re-raised as a
   fresh copy, not re-classified.
 * Successful responses and ordinary chunks are returned unchanged.
+
+Streaming adapters must yield the ``StreamChunk`` values required by
+``BaseLLM.stream_chat``. Arbitrary extension objects with raising properties
+are outside that protocol. Traceback frame locals are not scrubbed; hosts
+must not capture them as a substitute for the fixed failure code.
 
 The wrapper exposes the ``BaseLLM`` surface only. There is deliberately no
 attribute fallthrough to the wrapped object, so no caller can reach an

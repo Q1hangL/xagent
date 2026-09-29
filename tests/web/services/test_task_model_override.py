@@ -438,6 +438,37 @@ class TestACachedTask:
         )
         assert rebuilt is not service and rebuilt.llm is second.llm
 
+    async def test_an_unknown_execution_status_keeps_control_lookup_reachable(self):
+        builds = _Builds()
+        first, second = _override("first-turn"), _override("second-turn")
+        service = await builds.get(
+            apply_task_model_override(_snapshot(["basic"]), first)
+        )
+        with patch.object(
+            service, "get_execution_status", side_effect=RuntimeError("unavailable")
+        ):
+            assert await builds.get(None) is service
+            assert builds.manager._cached_model_override(42) is first
+            # An explicit new run must still bind its own model.
+            rebuilt = await builds.get(
+                apply_task_model_override(_snapshot(["basic"]), second)
+            )
+        assert rebuilt is not service and rebuilt.llm is second.llm
+        assert rebuilt.compact_llm is second.llm
+
+    @pytest.mark.parametrize("status", [None, {}])
+    async def test_an_empty_execution_status_rebuilds_on_the_task_models(self, status):
+        builds = _Builds()
+        service = await builds.get(
+            apply_task_model_override(_snapshot(["basic"]), _override("selected"))
+        )
+        with patch.object(service, "get_execution_status", return_value=status):
+            rebuilt = await builds.get(None)
+        assert rebuilt is not service
+        assert rebuilt.llm is OVERLAY_GENERAL
+        assert rebuilt.compact_llm is OVERLAY_COMPACT
+        assert builds.manager._cached_model_override(42) is None
+
     async def test_set_task_llms_leaves_an_override_service_alone(self):
         builds = _Builds()
         override = _override("selected")

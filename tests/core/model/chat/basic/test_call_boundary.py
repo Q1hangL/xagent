@@ -354,6 +354,14 @@ class TestClassification:
 
 
 class TestChat:
+    async def test_an_ordinary_exception_group_is_replaced(self):
+        inner = FakeLLM(behaviour=ExceptionGroup("provider failures", [_echo(401)]))
+        llm = guard_llm_calls(inner, call_scope=ScopeProbe())
+        with pytest.raises(ProviderCallError) as caught:
+            await llm.chat(MESSAGES)
+        _assert_safe(caught.value)
+        assert caught.value.code == PROVIDER_ERROR
+
     async def test_success_passes_through_inside_the_scope(self):
         probe = ScopeProbe()
         inner = FakeLLM()
