@@ -119,6 +119,7 @@ from .task_runtime import (
 )
 from .task_setup_snapshot import (
     RuntimeUserFields,
+    TaskModelOverride,
     TaskOwnerMismatchError,
     TaskSetupSnapshot,
     detach_runtime_user_fields,
@@ -1197,6 +1198,13 @@ class AgentServiceManager:
         # different scope between turns must evict and rebuild instead of
         # silently executing in the old scope's namespace.
         self._agent_scope_fingerprints: Dict[int, Optional[ScopeFingerprint]] = {}
+        # Task model override (``apply_task_model_override``) each cached
+        # AgentService was built from, with the service it belongs to. Its
+        # slots and tools hold that override's models, so a request carrying
+        # a different override -- or none -- must evict and rebuild.
+        self._agent_model_overrides: Dict[
+            int, tuple[AgentService, TaskModelOverride]
+        ] = {}
         # Ephemeral trusted actor policy bound once to an actor-marked task.
         # The durable task marker survives restarts; the credential owner does
         # not, so generic reconstruction remains unsupported.
@@ -1288,6 +1296,7 @@ class AgentServiceManager:
         self._agent_sandbox_keys.pop(task_key, None)
         self._agent_sandbox_providers.pop(task_key, None)
         self._agent_scope_fingerprints.pop(task_key, None)
+        self._agent_model_overrides.pop(task_key, None)
         raise RuntimeError(
             f"The sandbox for task {task_key} was reclaimed before "
             "execution started (idle reclamation or capacity "
@@ -1318,6 +1327,7 @@ class AgentServiceManager:
             self._agent_sandbox_keys.pop(task_key, None)
             self._agent_sandbox_providers.pop(task_key, None)
             self._agent_scope_fingerprints.pop(task_key, None)
+            self._agent_model_overrides.pop(task_key, None)
             logger.info(
                 "Evicted cached AgentService for task %s after releasing sandbox %s",
                 task_key,
@@ -1545,6 +1555,16 @@ class AgentServiceManager:
         # Configuration is now stored in Task table, this method is kept for backward compatibility
         # If AgentService already exists, update its LLM configuration
         if task_id in self._agents:
+            if self._cached_model_override(task_id) is not None:
+                # Built from a caller-selected override: swapping in the
+                # task's configured (unguarded) models would undo it for the
+                # rest of this run. The next build follows its own snapshot.
+                logger.info(
+                    "Leaving the models of task %s unchanged: its AgentService "
+                    "runs on a task model override",
+                    task_id,
+                )
+                return
             # This method doesn't have user context, use None for user_id
             default_llm, fast_llm, vision_llm, compact_llm = resolve_llms_from_names(
                 llm_ids, db, None
@@ -2309,6 +2329,7 @@ class AgentServiceManager:
             self._agent_sandbox_keys.pop(task_id, None)
             self._agent_sandbox_providers.pop(task_id, None)
             self._agent_scope_fingerprints.pop(task_id, None)
+            self._agent_model_overrides.pop(task_id, None)
 
         # Scope invariant: the cached instance baked its sandbox key (and,
         # later, workspace paths and memory dimensions) in at build time.
@@ -2350,6 +2371,46 @@ class AgentServiceManager:
             self._agent_sandbox_keys.pop(task_id, None)
             self._agent_sandbox_providers.pop(task_id, None)
             self._agent_scope_fingerprints.pop(task_id, None)
+            self._agent_model_overrides.pop(task_id, None)
+
+        # Model override invariant: the cached instance holds the models it
+        # was built with, in its slots and in its tools. A request carrying a
+        # task model override must not be served by an instance built from
+        # other models, and one built from an override must not serve a new
+        # run that did not bring it; evict and rebuild instead. A lookup
+        # without an override while that instance's run is in progress or
+        # waiting -- pause, resume, a reply injected into the waiting run --
+        # keeps reaching it. The workspace is NOT cleaned up here: same owner.
+        requested_model_override = (
+            task_setup_snapshot.model_override
+            if task_setup_snapshot is not None
+            else None
+        )
+        cached_model_override = (
+            self._cached_model_override(task_id) if task_id in self._agents else None
+        )
+        if (
+            task_id in self._agents
+            and cached_model_override is not requested_model_override
+            and requested_model_override is None
+            and self._agent_run_in_progress(task_id)
+        ):
+            requested_model_override = cached_model_override
+        if (
+            task_id in self._agents
+            and cached_model_override is not requested_model_override
+        ):
+            logger.info(
+                "Rebuilding cached AgentService for task %s: its task model "
+                "override differs from the request's",
+                task_id,
+            )
+            del self._agents[task_id]
+            self._agent_owner_ids.pop(task_id, None)
+            self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
+            self._agent_scope_fingerprints.pop(task_id, None)
+            self._agent_model_overrides.pop(task_id, None)
 
         if task_id not in self._agents:
             # Check if task exists in database
@@ -2467,6 +2528,9 @@ class AgentServiceManager:
                             )
                             self._agent_owner_ids[task_id] = runtime_user_id
                             self._agent_scope_fingerprints[task_id] = fingerprint
+                            self._record_model_override(
+                                task_id, requested_model_override
+                            )
                             self._sync_connector_runtime_turn(
                                 task_id, connector_runtime_turn_id
                             )
@@ -2488,6 +2552,7 @@ class AgentServiceManager:
                         self._agent_sandbox_keys.pop(task_id, None)
                         self._agent_sandbox_providers.pop(task_id, None)
                         self._agent_scope_fingerprints.pop(task_id, None)
+                        self._agent_model_overrides.pop(task_id, None)
                         raise
                     except Exception as e:
                         # Clean up any partial reconstruction that might have occurred
@@ -2500,6 +2565,7 @@ class AgentServiceManager:
                             self._agent_sandbox_keys.pop(task_id, None)
                             self._agent_sandbox_providers.pop(task_id, None)
                             self._agent_scope_fingerprints.pop(task_id, None)
+                            self._agent_model_overrides.pop(task_id, None)
                         if is_database_pool_timeout(e):
                             raise
                         logger.warning(
@@ -2954,10 +3020,38 @@ class AgentServiceManager:
 
         self._agent_owner_ids[task_id] = runtime_user_id
         self._agent_scope_fingerprints[task_id] = fingerprint
+        self._record_model_override(task_id, requested_model_override)
         self._sync_connector_runtime_turn(task_id, connector_runtime_turn_id)
         self._sync_mcp_actor_execution_identity(task_id, mcp_actor_execution_identity)
         self._sync_execution_scope(task_id, scope)
         return self._agents[task_id]
+
+    def _agent_run_in_progress(self, task_id: int) -> bool:
+        """Whether the cached AgentService has a running or resumable execution."""
+        agent = self._agents.get(task_id)
+        try:
+            status = agent.get_execution_status(str(task_id))  # type: ignore[union-attr]
+            if not status:
+                return False
+            return bool(status.get("is_running") or status.get("is_resumable"))
+        except Exception:  # noqa: BLE001 - unknown: keep the run reachable
+            return True
+
+    def _cached_model_override(self, task_id: int) -> Optional[TaskModelOverride]:
+        """The task model override the cached AgentService was built from."""
+        entry = self._agent_model_overrides.get(task_id)
+        if entry is None or entry[0] is not self._agents.get(task_id):
+            return None
+        return entry[1]
+
+    def _record_model_override(
+        self, task_id: int, override: Optional[TaskModelOverride]
+    ) -> None:
+        agent = self._agents.get(task_id)
+        if agent is None or override is None:
+            self._agent_model_overrides.pop(task_id, None)
+        else:
+            self._agent_model_overrides[task_id] = (agent, override)
 
     def _sync_connector_runtime_turn(
         self, task_id: int, connector_runtime_turn_id: Optional[str]
@@ -3146,6 +3240,7 @@ class AgentServiceManager:
                 self._agent_sandbox_keys.pop(task_id, None)
                 self._agent_sandbox_providers.pop(task_id, None)
                 self._agent_scope_fingerprints.pop(task_id, None)
+                self._agent_model_overrides.pop(task_id, None)
                 self._agent_evicted_scope_fingerprints.pop(task_id, None)
                 evicted_task_ids.append(task_id)
             finally:
@@ -3267,6 +3362,7 @@ class AgentServiceManager:
             self._agent_sandbox_keys.pop(task_id, None)
             self._agent_sandbox_providers.pop(task_id, None)
             self._agent_scope_fingerprints.pop(task_id, None)
+            self._agent_model_overrides.pop(task_id, None)
             self._agent_evicted_scope_fingerprints.pop(task_id, None)
             self._mcp_actor_policies.pop(task_id, None)
 

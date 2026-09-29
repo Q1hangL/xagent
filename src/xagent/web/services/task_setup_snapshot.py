@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import logging
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Optional, cast
 
 from sqlalchemy.orm import Session
@@ -154,10 +154,18 @@ class TaskSetupSnapshot:
     # Resolved by ``resolve_task_runtime_config_core`` using this same Session.
     # Kept as the service-layer frozen dataclass; no ORM row is retained.
     workforce_runtime: WorkforceTaskRuntime | None = None
+    # Set by ``apply_task_model_override``: the caller-selected models this
+    # snapshot's slots hold. ``AgentServiceManager`` rebuilds a cached
+    # service that was not built from this same override.
+    model_override: Optional["TaskModelOverride"] = None
 
 
 class TaskModelOverrideError(ValueError):
     """A task model override cannot be applied as requested."""
+
+
+# ``ToolCategory.VISION``: the tools that read images with the vision model.
+_VISION_TOOL_CATEGORY = "vision"
 
 
 @dataclass(frozen=True)
@@ -172,15 +180,44 @@ class TaskModelOverride:
 
     ``vision_llm`` is the model vision tools use. ``None`` means vision is
     deliberately unavailable for this run: an :class:`UnavailableVisionModel`
-    takes the slot, so tools do not fall back to a default vision model, and
-    any vision call is refused. ``excluded_tool_categories`` removes tool
-    categories from this run's selection; it requires an explicit category
-    list, since an unrestricted selection has no list to remove from.
+    takes the slot, so nothing falls back to a default vision model and any
+    vision call is refused with ``vision_unavailable``, and an explicit tool
+    category list loses its ``vision`` category, so no vision tool is offered.
+    (An unrestricted selection has no list to remove it from; its vision tools
+    are built on the stand-in and refuse.) ``excluded_tool_categories``
+    removes tool categories from this run's selection; it requires an
+    explicit category list, since an unrestricted selection has no list to
+    remove from.
+
+    Handing ``AgentServiceManager.get_agent_for_task`` a snapshot this was
+    applied to rebuilds a cached service for the task unless that service
+    was built from this same override object, so a later turn cannot run on
+    an earlier turn's models. A lookup without an override rebuilds a
+    service built from one too, unless its run is still in progress or
+    waiting, so pause, resume and replies keep reaching that run.
     """
 
     llm: BaseLLM
     vision_llm: BaseLLM | None = None
     excluded_tool_categories: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.llm, BaseLLM):
+            raise TypeError("llm must be a BaseLLM")
+        if self.vision_llm is not None and not isinstance(self.vision_llm, BaseLLM):
+            raise TypeError("vision_llm must be a BaseLLM or None")
+        categories: Any = self.excluded_tool_categories
+        # A bare string would be read character by character, or matched as
+        # a substring; neither is a category selection.
+        if isinstance(categories, (str, bytes)):
+            raise TypeError(
+                "excluded_tool_categories must be a collection of category "
+                "names, not a single string"
+            )
+        normalized = frozenset(categories)
+        if not all(isinstance(category, str) for category in normalized):
+            raise TypeError("excluded_tool_categories must hold category names")
+        object.__setattr__(self, "excluded_tool_categories", normalized)
 
 
 def apply_task_model_override(
@@ -191,25 +228,28 @@ def apply_task_model_override(
     Raises :class:`TaskModelOverrideError` when categories are to be excluded
     from a selection that is not an explicit list.
     """
-    from dataclasses import replace
-
     from ...core.model.chat.basic.call_boundary import UnavailableVisionModel
 
     agent_config = snapshot.agent_config
-    if override.excluded_tool_categories:
-        categories = agent_config.get("tool_categories") if agent_config else None
-        if not isinstance(categories, list):
-            raise TaskModelOverrideError(
-                "tool categories can only be excluded from an explicit selection"
-            )
+    categories = agent_config.get("tool_categories") if agent_config else None
+    if override.excluded_tool_categories and not isinstance(categories, list):
+        raise TaskModelOverrideError(
+            "tool categories can only be excluded from an explicit selection"
+        )
+    removed = set(override.excluded_tool_categories)
+    if override.vision_llm is None:
+        # Vision tools on the stand-in could only refuse; offer none.
+        removed.add(_VISION_TOOL_CATEGORY)
+    if isinstance(categories, list) and removed & set(categories):
         agent_config = {
             **cast(dict[str, Any], agent_config),
             "tool_categories": [
-                category
-                for category in categories
-                if category not in override.excluded_tool_categories
+                category for category in categories if category not in removed
             ],
         }
+    # Deliberately a truthy stand-in, never ``None``: the tool configuration
+    # falls back to the owner's configured vision model when its explicit one
+    # is missing or falsy.
     vision_llm = (
         override.vision_llm
         if override.vision_llm is not None
@@ -222,6 +262,7 @@ def apply_task_model_override(
         task_vision_llm=vision_llm,
         task_compact_llm=override.llm,
         agent_config=agent_config,
+        model_override=override,
     )
 
 

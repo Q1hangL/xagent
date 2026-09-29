@@ -11,6 +11,7 @@ from ...config import get_uploads_dir
 from ..memory import MemoryStore
 from ..memory.in_memory import InMemoryMemoryStore
 from ..model.chat.basic.base import BaseLLM
+from ..model.chat.basic.call_boundary import UnavailableVisionModel
 from ..task_runtime import (
     EMPTY_TASK_RUNTIME_CONTRIBUTION,
     FILE_OPERATION_ACCESS_VERSION_KEY,
@@ -419,7 +420,10 @@ class AgentService:
             "execution_type": self._execution_type(),
             "llm_configured": self.llm is not None,
             "fast_llm_configured": self.fast_llm is not None,
-            "vision_llm_configured": self.vision_llm is not None,
+            # The stand-in for a deliberately missing vision model refuses
+            # every call; it is not a configured vision model.
+            "vision_llm_configured": self.vision_llm is not None
+            and not isinstance(self.vision_llm, UnavailableVisionModel),
             "compact_llm_configured": self.compact_llm is not None,
             "dual_llm_enabled": self.fast_llm is not None,
             "compact_llm_enabled": self.compact_llm is not None,
