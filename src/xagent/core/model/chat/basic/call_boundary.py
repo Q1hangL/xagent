@@ -14,7 +14,8 @@ step of a ``stream_chat`` iteration, and the stream's ``aclose`` -- runs
 inside a context manager the caller supplies (a log-redaction scope, say),
 and ordinary provider exceptions are caught inside that context and replaced by a
 :class:`ProviderCallError` that carries only a fixed failure code, a fixed
-message and a text-free ``transient`` flag, with no cause and no context chain. Stream ``ERROR`` chunks, whose
+message and a text-free ``transient`` flag, without the provider's cause or
+context chain. Stream ``ERROR`` chunks, whose
 ``content``/``raw`` hold the same provider text, are treated as the error
 they report. The caller learns each failure code through ``on_failure``.
 A scope that cannot be entered, or that fails while it is left, fails the
@@ -426,7 +427,7 @@ class BoundaryLLM(BaseLLM):
         except Exception as exc:  # noqa: BLE001 - replaced below, outside the handler
             failed_type = type(exc).__name__
         if failed_type is not None:
-            # No scope is active here, so only the type name is logged.
+            # Entry did not complete, so log only the type name.
             try:
                 logger.warning(
                     "Model call scope could not be entered (%s)", failed_type
@@ -698,7 +699,7 @@ class _GuardedScope:
 
     Used as the ``with`` target around one provider-touching step. When the
     caller's scope raises while it is left, the error is logged by type only
-    and reported as ``call_scope_unavailable`` -- no scope is active then --
+    and reported as ``call_scope_unavailable`` after the caller's exit attempt
     and :attr:`exit_failed` tells the step to fail. An exception already in
     flight (a cancellation, say) keeps propagating, with its exception chain
     cleared, even if the caller's scope would suppress it.
@@ -755,7 +756,9 @@ def guard_llm_calls(
     ``on_failure`` is told the fixed code of each provider failure the
     wrapper replaces, from inside the scope, and ``call_scope_unavailable``
     when the scope itself could not be entered or left -- that one is
-    reported with no scope active. One call can report more than once: a
+    reported after the failed entry or exit attempt. The caller is responsible
+    for cleaning up any context state its scope changed before failing.
+    One call can report more than once: a
     failed call whose scope then fails while it is left also reports
     ``call_scope_unavailable``, and so does a ``stream_chat`` whose scope
     cannot be re-entered to close the stream, after a successful stream or
