@@ -1346,6 +1346,15 @@ class Tracer:
         )
         return event.id
 
+    async def load_committed_tool_outcome(
+        self, tool_call: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        for handler in list(self.handlers):
+            method = getattr(handler, "load_committed_tool_outcome", None)
+            if callable(method):
+                return cast(dict[str, Any] | None, await method(tool_call))
+        return None
+
     async def load_latest_checkpoint(
         self,
         execution_id: str,

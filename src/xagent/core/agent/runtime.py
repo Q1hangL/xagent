@@ -7,7 +7,7 @@ import logging
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from ...config import COMPACT_THRESHOLD_DEFAULT
@@ -30,6 +30,10 @@ from ..model.chat.basic.call_boundary import (
 )
 from ..model.chat.error import is_context_length_error, retry_on
 from ..model.chat.exceptions import LLMContextLengthError, LLMToolProtocolError
+from ..model.chat.stream_progress import (
+    NO_PAYLOAD_STREAM_FALLBACK,
+    STREAM_ABORTED_KEY,
+)
 from ..model.chat.token_context import extract_cached_input_tokens
 from ..model.chat.tool_protocol import TOOL_PROTOCOL_ERROR_KEY
 from ..model.chat.types import ChunkType
@@ -531,6 +535,7 @@ class PatternRuntime:
             provider_payload: dict[str, Any] = {}
             protocol_error_payload: dict[str, Any] = {}
             saw_payload_chunk = False
+            finish_reason = ""
             stream = aiter(stream_chat(**kwargs))
             loop_completed = False
             try:
@@ -570,6 +575,9 @@ class PatternRuntime:
                     if chunk_usage:
                         self._merge_usage(usage_payload, chunk_usage)
                     self._merge_provider_payload(provider_payload, chunk)
+                    chunk_finish_reason = getattr(chunk, "finish_reason", None)
+                    if isinstance(chunk_finish_reason, str) and chunk_finish_reason:
+                        finish_reason = chunk_finish_reason
                     if on_chunk is not None:
                         await self._maybe_await(on_chunk(chunk))
                 loop_completed = True
@@ -596,6 +604,21 @@ class PatternRuntime:
             tool_calls = [
                 tool_call_chunks[index] for index in sorted(tool_call_chunks.keys())
             ]
+
+            def stamp_stream_markers(response: dict[str, Any]) -> dict[str, Any]:
+                # Keep a truncated or usage-less stream visible in the trace
+                # (#2786): ``on_llm_end`` lifts both keys onto ``llm_call_end``.
+                # ``usage_missing`` is stamped here, not inferred from an absent
+                # ``usage`` key downstream, because non-streaming envelopes
+                # never carry top-level usage and must not be counted as
+                # truncated streams. Every dict return is stamped; the
+                # bare-string return at the end cannot carry either key.
+                if finish_reason:
+                    response["finish_reason"] = finish_reason
+                if not usage_payload:
+                    response["usage_missing"] = True
+                return response
+
             if protocol_error_payload:
                 protocol_response = {
                     "type": "tool_protocol_error",
@@ -605,7 +628,7 @@ class PatternRuntime:
                 }
                 if usage_payload:
                     protocol_response["usage"] = usage_payload
-                return protocol_response
+                return stamp_stream_markers(protocol_response)
             if tool_calls:
                 response: dict[str, Any] = {
                     "content": content,
@@ -615,9 +638,25 @@ class PatternRuntime:
                     response["usage"] = usage_payload
                 if provider_payload:
                     response.update(provider_payload)
-                return response
+                return stamp_stream_markers(response)
             if not saw_payload_chunk:
-                return await self.run_llm_call(llm, **kwargs)
+                # A stream that produced neither content nor a tool call
+                # (an aborted or cap-cut reasoning-only stream, #2785) is
+                # retried non-streaming. Log and mark it: the #2786 markers
+                # above only cover streams that returned a dict, so this
+                # path was invisible in the trace.
+                logger.warning(
+                    "LLM stream ended with no content or tool calls "
+                    "(finish_reason=%s); retrying as a non-streaming call",
+                    finish_reason or "none",
+                )
+                fallback_response = await self.run_llm_call(llm, **kwargs)
+                return self._stamp_stream_fallback(
+                    fallback_response,
+                    finish_reason,
+                    stream_aborted=provider_payload.get(STREAM_ABORTED_KEY),
+                    stream_usage=usage_payload,
+                )
             if usage_payload:
                 response = {
                     "content": content,
@@ -625,9 +664,9 @@ class PatternRuntime:
                 }
                 if provider_payload:
                     response.update(provider_payload)
-                return response
+                return stamp_stream_markers(response)
             if provider_payload:
-                return {"content": content, **provider_payload}
+                return stamp_stream_markers({"content": content, **provider_payload})
             return content
 
         task: asyncio.Future[Any] = asyncio.ensure_future(consume_stream())
@@ -642,6 +681,35 @@ class PatternRuntime:
             raise
         finally:
             self._active_llm_tasks.discard(task)
+
+    def _stamp_stream_fallback(
+        self,
+        response: Any,
+        stream_finish_reason: str,
+        *,
+        stream_aborted: Any = None,
+        stream_usage: dict[str, Any] | None = None,
+    ) -> Any:
+        """Mark a non-streaming retry taken because the stream had no payload.
+
+        ``stream_fallback`` says the retry happened; ``stream_finish_reason``
+        is how the discarded stream ended (``no_progress`` for an abort,
+        ``length`` for a cap cut); ``stream_aborted`` names the predicate
+        that aborted it; ``stream_usage`` is the discarded stream's usage
+        when the provider sent one. ``on_llm_end`` lifts all of them onto
+        ``llm_call_end``. A bare-string response cannot carry them and is
+        returned unchanged.
+        """
+        if not isinstance(response, dict):
+            return response
+        response["stream_fallback"] = NO_PAYLOAD_STREAM_FALLBACK
+        if stream_finish_reason:
+            response["stream_finish_reason"] = stream_finish_reason
+        if isinstance(stream_aborted, str) and stream_aborted:
+            response[STREAM_ABORTED_KEY] = stream_aborted
+        if stream_usage:
+            response["stream_usage"] = dict(stream_usage)
+        return response
 
     async def _raise_if_interrupted(self, message: str) -> None:
         if await self.should_interrupt():
@@ -726,7 +794,7 @@ class PatternRuntime:
             raw = model_dump()
         if not isinstance(raw, dict):
             return
-        for key in ("reasoning_content", "reasoning"):
+        for key in ("reasoning_content", "reasoning", STREAM_ABORTED_KEY):
             if key in raw and raw[key] is not None:
                 current[key] = raw[key]
         provider_state = raw.get("_xagent_provider_state")
@@ -1178,6 +1246,20 @@ class PatternRuntime:
                 # pattern exception instead of aborting the run.
                 logger.exception("finish_trace failed while reporting a pattern error")
 
+    async def load_committed_tool_outcome(
+        self, tool_call: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        if (
+            self.tracer is None
+            or getattr(self.tracer, "records_execution_events", False) is not True
+            or not tool_call.get("tool_attempt_id")
+        ):
+            return None
+        return cast(
+            dict[str, Any] | None,
+            await self.tracer.load_committed_tool_outcome(tool_call),
+        )
+
     async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
         # Count one billable action per tool invocation, at invocation time.
         # Deliberately NOT gated on tool success: success is derived from the
@@ -1462,6 +1544,12 @@ class PatternRuntime:
                 prompt_message_count=len(getattr(context, "messages", [])),
             )
         cached_tokens = self._extract_cached_tokens(response)
+        finish_reason = self._get_value(response, "finish_reason")
+        usage_missing = self._get_value(response, "usage_missing") is True
+        stream_fallback = self._get_value(response, "stream_fallback")
+        stream_finish_reason = self._get_value(response, "stream_finish_reason")
+        stream_aborted = self._get_value(response, STREAM_ABORTED_KEY)
+        stream_usage = self._get_value(response, "stream_usage")
         await self._emit_trace_event(
             TraceEventType(TraceScope.ACTION, TraceAction.END, TraceCategory.LLM),
             task_id=str(event_metadata.get("task_id") or self._task_id(context)),
@@ -1479,6 +1567,32 @@ class PatternRuntime:
                     else {}
                 ),
                 **({"cached_input_tokens": cached_tokens} if cached_tokens else {}),
+                **(
+                    {"finish_reason": finish_reason}
+                    if isinstance(finish_reason, str) and finish_reason
+                    else {}
+                ),
+                **({"usage_missing": True} if usage_missing else {}),
+                **(
+                    {"stream_fallback": stream_fallback}
+                    if isinstance(stream_fallback, str) and stream_fallback
+                    else {}
+                ),
+                **(
+                    {"stream_finish_reason": stream_finish_reason}
+                    if isinstance(stream_finish_reason, str) and stream_finish_reason
+                    else {}
+                ),
+                **(
+                    {STREAM_ABORTED_KEY: stream_aborted}
+                    if isinstance(stream_aborted, str) and stream_aborted
+                    else {}
+                ),
+                **(
+                    {"stream_usage": dict(stream_usage)}
+                    if isinstance(stream_usage, dict) and stream_usage
+                    else {}
+                ),
                 **event_metadata,
             },
         )

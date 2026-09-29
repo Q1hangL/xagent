@@ -25,6 +25,7 @@ from xagent.core.agent.checkpoint import (
     CheckpointCorruptError,
     CheckpointReadError,
     CheckpointUnavailableError,
+    UnknownToolEffectError,
 )
 from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.web.api import a2a as a2a_api
@@ -1916,6 +1917,7 @@ def test_resume_lease_contention_preserves_the_a2a_error() -> None:
         (AutoModelUnavailableError("private model details"), 409),
         (CheckpointUnavailableError("checkpoint query failed"), 503),
         (CheckpointCorruptError("all matching rows undecodable"), 400),
+        (UnknownToolEffectError("unknown external effect"), 400),
         (
             CheckpointAccessRefusedError("active lease is not bound to this reader"),
             400,

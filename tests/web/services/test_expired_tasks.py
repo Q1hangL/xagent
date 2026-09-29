@@ -504,7 +504,7 @@ def test_user_initiated_deletion_records_nothing(sessions) -> None:
         )
         db.commit()
 
-        purge_task_rows(db, task_id=task_id)
+        purge_task_rows(db, task_id=task_id, detached_reason="task_deleted")
         db.commit()
 
     with sessions() as db:

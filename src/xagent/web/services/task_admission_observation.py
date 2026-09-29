@@ -55,7 +55,8 @@ def read_admission_snapshot(
             continue
         active, pending, oldest = db.execute(
             select(
-                func.coalesce(func.sum(case((held, 1), else_=0)), 0),
+                # One task's held tickets are one active execution.
+                func.count(func.distinct(case((held, Task.id)))),
                 func.coalesce(func.sum(case((waiting, 1), else_=0)), 0),
                 func.min(case((waiting, TaskExecutionCommand.created_at))),
             )

@@ -936,7 +936,6 @@ def test_expired_lease_outcome_fact_and_task_are_atomic(
         recover_task_lease_candidate_no_commit,
     )
     from xagent.web.services.task_lease_service import (
-        TASK_RUN_ID_TRACE_FIELD,
         get_expired_task_lease_candidates,
         utc_now,
     )
@@ -950,18 +949,24 @@ def test_expired_lease_outcome_fact_and_task_are_atomic(
         task.runner_id = "dead-runner"
         task.lease_expires_at = utc_now() - timedelta(seconds=5)
         if with_checkpoint:
-            db.add(
-                TraceEvent(
-                    task_id=tid,
-                    event_id="expired-checkpoint",
-                    event_type="system_update_general",
-                    timestamp=utc_now(),
-                    data={
+            writer.append_fact_no_commit(
+                db,
+                task_id=tid,
+                kind="recovery_state",
+                key="expired-checkpoint",
+                run_id="expired-run",
+                payload={
+                    "protocol_event_id": "expired-checkpoint",
+                    "data": {
                         "checkpoint_type": CHECKPOINT_TYPE,
-                        "snapshot": {"type": "checkpoint"},
-                        TASK_RUN_ID_TRACE_FIELD: "expired-run",
+                        "snapshot_schema_version": 1,
+                        "execution_id": str(tid),
+                        "snapshot": {
+                            "execution_id": str(tid),
+                            "context": {"messages": []},
+                        },
                     },
-                )
+                },
             )
             task.last_checkpoint_event_id = "expired-checkpoint"
         db.commit()
@@ -982,7 +987,7 @@ def test_expired_lease_outcome_fact_and_task_are_atomic(
         assert db.get(Task, tid).status == TaskStatus.RUNNING
         assert db.get(Task, tid).runner_id == "dead-runner"
         assert db.get(Task, tid).state_version == candidate.state_version
-        assert facts(db, tid) == []
+        assert len(facts(db, tid)) == int(with_checkpoint)
 
         expected = TaskStatus.PAUSED if with_checkpoint else TaskStatus.FAILED
         assert (
@@ -994,8 +999,8 @@ def test_expired_lease_outcome_fact_and_task_are_atomic(
         db.commit()
         assert db.get(Task, tid).status == expected
         assert db.get(Task, tid).runner_id is None
-        assert len(facts(db, tid)) == 1
-        outcome = facts(db, tid)[0]
+        assert len(facts(db, tid)) == 1 + int(with_checkpoint)
+        outcome = facts(db, tid)[-1]
         assert outcome.kind == "execution_settled"
         assert outcome.run_id == "expired-run"
         assert outcome.payload == {
@@ -1008,7 +1013,7 @@ def test_expired_lease_outcome_fact_and_task_are_atomic(
             )
             is None
         )
-        assert len(facts(db, tid)) == 1
+        assert len(facts(db, tid)) == 1 + int(with_checkpoint)
 
 
 @pytest.mark.asyncio

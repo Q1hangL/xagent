@@ -20,6 +20,7 @@ from ...core.agent.checkpoint import (
     CheckpointCorruptError,
     CheckpointReadError,
     CheckpointUnavailableError,
+    UnknownToolEffectError,
     checkpoint_execution_id,
 )
 from ...core.agent.trace import (
@@ -348,26 +349,26 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 result = self._sync_load_latest_checkpoint_unguarded(
                     db, execution_id, partition
                 )
-            except CheckpointCorruptError:
-                # A corrupt verdict is not exempt from staleness: the row
+            except (CheckpointCorruptError, UnknownToolEffectError):
+                # A terminal verdict is not exempt from staleness: the row
                 # that failed validation may have failed only because the
                 # widening it was read under has since gone stale (a
                 # concurrent writer tagged the task after the probe that
                 # decided to widen, before this verdict was reached). Ask
                 # the same question the success path asks below before
-                # letting a genuinely corrupt verdict through.
+                # letting a corrupt or unknown-effect verdict through.
                 #
                 # If that question itself cannot be answered -- the probe
                 # inside _raise_if_widening_went_stale fails for a genuine
                 # DB reason -- it raises its own CheckpointUnavailableError,
-                # which replaces this CheckpointCorruptError outright: the
-                # `raise` below never runs, and the corrupt verdict survives
+                # which replaces this terminal verdict outright: the
+                # `raise` below never runs, and the original verdict survives
                 # only as the new error's __context__. This is deliberate,
                 # not a bug: when the staleness check cannot run, handing
-                # down a terminal corrupt verdict anyway would be wrong just
+                # down a terminal verdict anyway would be wrong just
                 # the same way a stale one would be. A retry re-reads the
-                # row from scratch, and a genuinely corrupt row surfaces the
-                # same CheckpointCorruptError again there.
+                # row from scratch, and an unchanged row surfaces the same
+                # terminal error again there.
                 if partition is not None and partition.widened:
                     self._raise_if_widening_went_stale(db)
                 raise

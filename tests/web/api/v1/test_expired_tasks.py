@@ -277,7 +277,9 @@ def test_a_task_deleted_by_its_owner_stays_404():
     try:
         # The real owner-deletion path, not a raw row delete: it exercises
         # the same non-cascading cleanup an actual delete would.
-        assert purge_task_rows(db, task_id=task_id) is True
+        assert (
+            purge_task_rows(db, task_id=task_id, detached_reason="task_deleted") is True
+        )
         db.commit()
     finally:
         db.close()

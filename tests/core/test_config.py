@@ -2477,6 +2477,152 @@ class TestLlmRetryBudgetConfig:
         assert get_llm_capacity_max_attempts() == 2
 
 
+class TestLlmStreamProgressConfig:
+    """#2785: knobs for aborting an OpenAI-compatible LLM stream that stops
+    making progress."""
+
+    def test_empty_delta_limit_default(self, monkeypatch):
+        from xagent.config import get_llm_stream_empty_delta_limit
+
+        monkeypatch.delenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", raising=False)
+        assert get_llm_stream_empty_delta_limit() == 200
+
+    def test_empty_delta_limit_env_override(self, monkeypatch):
+        from xagent.config import get_llm_stream_empty_delta_limit
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "50")
+        assert get_llm_stream_empty_delta_limit() == 50
+
+    def test_empty_delta_limit_zero_disables(self, monkeypatch):
+        """0 is a valid, explicit way to disable the check."""
+        from xagent.config import get_llm_stream_empty_delta_limit
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "0")
+        assert get_llm_stream_empty_delta_limit() == 0
+
+    @pytest.mark.parametrize("value", ["abc", "-5"])
+    def test_empty_delta_limit_rejects_unusable_values(self, monkeypatch, value):
+        from xagent.config import get_llm_stream_empty_delta_limit
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", value)
+        assert get_llm_stream_empty_delta_limit() == 200
+
+    def test_degenerate_window_default(self, monkeypatch):
+        from xagent.config import get_llm_stream_degenerate_window
+
+        monkeypatch.delenv("XAGENT_LLM_STREAM_DEGENERATE_WINDOW", raising=False)
+        assert get_llm_stream_degenerate_window() == 256
+
+    def test_degenerate_window_env_override(self, monkeypatch):
+        from xagent.config import get_llm_stream_degenerate_window
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_DEGENERATE_WINDOW", "128")
+        assert get_llm_stream_degenerate_window() == 128
+
+    def test_degenerate_window_zero_disables(self, monkeypatch):
+        """0 is a valid, explicit way to disable the check."""
+        from xagent.config import get_llm_stream_degenerate_window
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_DEGENERATE_WINDOW", "0")
+        assert get_llm_stream_degenerate_window() == 0
+
+    @pytest.mark.parametrize("value", ["abc", "-5"])
+    def test_degenerate_window_rejects_unusable_values(self, monkeypatch, value):
+        from xagent.config import get_llm_stream_degenerate_window
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_DEGENERATE_WINDOW", value)
+        assert get_llm_stream_degenerate_window() == 256
+
+    def test_degenerate_max_period_default(self, monkeypatch):
+        from xagent.config import get_llm_stream_degenerate_max_period
+
+        monkeypatch.delenv("XAGENT_LLM_STREAM_DEGENERATE_MAX_PERIOD", raising=False)
+        assert get_llm_stream_degenerate_max_period() == 64
+
+    def test_degenerate_max_period_env_override(self, monkeypatch):
+        from xagent.config import get_llm_stream_degenerate_max_period
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_DEGENERATE_MAX_PERIOD", "32")
+        assert get_llm_stream_degenerate_max_period() == 32
+
+    @pytest.mark.parametrize("value", ["abc", "-5", "0"])
+    def test_degenerate_max_period_rejects_unusable_values(self, monkeypatch, value):
+        """Unlike the window/limit knobs, 0 is below the minimum of 1 here."""
+        from xagent.config import get_llm_stream_degenerate_max_period
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_DEGENERATE_MAX_PERIOD", value)
+        assert get_llm_stream_degenerate_max_period() == 64
+
+    def test_no_payload_abort_models_unset(self, monkeypatch):
+        from xagent.config import get_llm_stream_no_payload_abort_models
+
+        monkeypatch.delenv("XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS", raising=False)
+        result = get_llm_stream_no_payload_abort_models()
+        assert result == frozenset()
+        assert isinstance(result, frozenset)
+
+    def test_no_payload_abort_models_parses_and_strips(self, monkeypatch):
+        from xagent.config import get_llm_stream_no_payload_abort_models
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS", " a , b,,c ")
+        result = get_llm_stream_no_payload_abort_models()
+        assert result == {"a", "b", "c"}
+        assert isinstance(result, frozenset)
+
+    def test_no_payload_abort_models_blank(self, monkeypatch):
+        from xagent.config import get_llm_stream_no_payload_abort_models
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS", "   ")
+        result = get_llm_stream_no_payload_abort_models()
+        assert result == frozenset()
+        assert isinstance(result, frozenset)
+
+    def test_no_payload_timeout_invalid_value_logs_the_real_default(
+        self, monkeypatch, caplog
+    ):
+        import logging
+
+        from xagent.config import get_llm_stream_no_payload_timeout_seconds
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS", "abc")
+        with caplog.at_level(logging.WARNING, logger="xagent.config"):
+            assert get_llm_stream_no_payload_timeout_seconds() == 30.0
+        assert any("falling back to 30.0" in r.getMessage() for r in caplog.records)
+
+    def test_retry_deadline_invalid_value_logs_the_real_default(
+        self, monkeypatch, caplog
+    ):
+        import logging
+
+        from xagent.config import get_llm_retry_deadline_seconds
+
+        monkeypatch.setenv("XAGENT_LLM_RETRY_DEADLINE_SECONDS", "abc")
+        with caplog.at_level(logging.WARNING, logger="xagent.config"):
+            assert get_llm_retry_deadline_seconds() == 300.0
+        assert any("falling back to 300.0" in r.getMessage() for r in caplog.records)
+
+    def test_no_payload_timeout_default(self, monkeypatch):
+        from xagent.config import get_llm_stream_no_payload_timeout_seconds
+
+        monkeypatch.delenv(
+            "XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS", raising=False
+        )
+        assert get_llm_stream_no_payload_timeout_seconds() == 30.0
+
+    def test_no_payload_timeout_env_override(self, monkeypatch):
+        from xagent.config import get_llm_stream_no_payload_timeout_seconds
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS", "15.5")
+        assert get_llm_stream_no_payload_timeout_seconds() == 15.5
+
+    @pytest.mark.parametrize("value", ["0", "nan", "abc"])
+    def test_no_payload_timeout_rejects_unusable_values(self, monkeypatch, value):
+        from xagent.config import get_llm_stream_no_payload_timeout_seconds
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS", value)
+        assert get_llm_stream_no_payload_timeout_seconds() == 30.0
+
+
 class TestWorkforcePreviewRunReapConfig:
     """PR #1060 review: get_workforce_preview_run_stale_seconds() had no
     test, unlike its sibling TTL config functions above."""

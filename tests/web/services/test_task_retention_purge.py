@@ -797,10 +797,10 @@ def test_a_failing_task_is_counted_and_the_batch_carries_on(
 
     real = purge_module.purge_task_rows
 
-    def failing(db, *, task_id):
+    def failing(db, *, task_id, detached_reason):
         if task_id == doomed:
             raise RuntimeError("deterministic per-task failure")
-        return real(db, task_id=task_id)
+        return real(db, task_id=task_id, detached_reason=detached_reason)
 
     monkeypatch.setattr(purge_module, "purge_task_rows", failing)
 

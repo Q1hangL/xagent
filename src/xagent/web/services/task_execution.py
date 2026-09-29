@@ -1071,6 +1071,8 @@ def _uploaded_file_record_in_task_scope(
     if record_user_id != int(task_user_id):
         return False
 
+    if getattr(file_record, "detached_reason", None) is not None:
+        return False
     record_task_id = getattr(file_record, "task_id", None)
     if record_task_id is None:
         return True
@@ -1311,6 +1313,7 @@ def _prepare_task_file_outputs_isolated(
                     .filter(
                         UploadedFile.file_id == resolved_input.item_file_id,
                         UploadedFile.user_id == owner_user_id,
+                        UploadedFile.detached_reason.is_(None),
                         or_(
                             UploadedFile.task_id == task_id,
                             UploadedFile.task_id.is_(None),
@@ -1416,6 +1419,7 @@ def _prepare_task_file_outputs_isolated(
                     .filter(
                         UploadedFile.file_id == resolved_input.item_file_id,
                         UploadedFile.user_id == owner_user_id,
+                        UploadedFile.detached_reason.is_(None),
                         or_(
                             UploadedFile.task_id == task_id,
                             UploadedFile.task_id.is_(None),
@@ -2888,6 +2892,8 @@ async def execute_resume_background(
     ``task_owner_user_id`` is the task OWNER's id -- the runtime identity the
     resume executes as (``UserContext``), not the acting principal.
     """
+    from .agent_service_manager import caller_facing_execution_metadata
+
     resume_owner_task = asyncio.current_task()
     if resume_owner_task is None:
         raise RuntimeError(f"Task {task_id} resume has no asyncio task")
@@ -3697,7 +3703,11 @@ async def execute_resume_background(
                 "error_details": result.get("error_details"),
                 **control_event_state,
                 "type": "task_completed",
-                "metadata": result.get("metadata", {}),
+                # The owner's socket, not the operator trace: fold the raw
+                # memory availability reason.
+                "metadata": caller_facing_execution_metadata(
+                    result.get("metadata", {})
+                ),
                 "timestamp": datetime.now(timezone.utc).timestamp(),
             },
             task_id,

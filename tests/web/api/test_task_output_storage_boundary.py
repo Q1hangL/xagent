@@ -59,7 +59,8 @@ def _seed_running_task(*, runner_id: str, run_id: str) -> tuple[int, int]:
         db.close()
 
 
-def test_output_prepare_excludes_compensating_metadata() -> None:
+@pytest.mark.parametrize("state", ["detached", "compensating"])
+def test_output_prepare_excludes_unavailable_metadata(state) -> None:
     task_id, user_id = _seed_running_task(
         runner_id="compensating-runner",
         run_id="compensating-run",
@@ -70,14 +71,17 @@ def test_output_prepare_excludes_compensating_metadata() -> None:
             UploadedFile(
                 file_id="compensating-output",
                 user_id=user_id,
-                task_id=task_id,
+                task_id=None if state == "detached" else task_id,
                 filename="compensating.txt",
                 storage_path="/tmp/compensating.txt",
                 storage_key=(
                     f"users/{user_id}/tasks/{task_id}/outputs/"
                     "compensating-output/compensating.txt"
                 ),
-                storage_status="compensating",
+                storage_status="compensating"
+                if state == "compensating"
+                else "available",
+                detached_reason="task_deleted" if state == "detached" else None,
                 mime_type="text/plain",
                 file_size=12,
             )

@@ -407,7 +407,10 @@ class TestWorkspaceFileToolConsistency:
 
         assert workspace.resolve_file_id("foreign-file") is None
 
-    def test_resolve_file_id_detached_uses_worker_owned_session(self, tmp_path, mocker):
+    @pytest.mark.parametrize("state", ["available", "detached", "compensating"])
+    def test_resolve_file_id_detached_uses_worker_owned_session(
+        self, tmp_path, mocker, state
+    ):
         """Detached resolution must not reuse the caller's SQLAlchemy session."""
         registered_file = tmp_path / "registered.txt"
         registered_file.write_text("content")
@@ -426,6 +429,10 @@ class TestWorkspaceFileToolConsistency:
                     file_id="registered-file",
                     user_id=1,
                     task_id=None,
+                    detached_reason="task_deleted" if state == "detached" else None,
+                    storage_status="compensating"
+                    if state == "compensating"
+                    else "available",
                     storage_path=str(registered_file),
                 )
 
@@ -445,7 +452,9 @@ class TestWorkspaceFileToolConsistency:
             return_value=worker_session,
         )
 
-        assert workspace.resolve_file_id_detached("registered-file") == registered_file
+        assert workspace.resolve_file_id_detached("registered-file") == (
+            registered_file if state == "available" else None
+        )
         assert worker_session.closed is True
 
     def test_resolve_file_id_rejects_durable_only_other_user_records(

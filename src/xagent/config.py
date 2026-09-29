@@ -128,6 +128,11 @@ _STANDARD_OTEL_SERVICE_NAME = "OTEL_SERVICE_NAME"
 MCP_TOOL_INIT_TIMEOUT_SECONDS = "XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS"
 LLM_RETRY_DEADLINE_SECONDS = "XAGENT_LLM_RETRY_DEADLINE_SECONDS"
 LLM_CAPACITY_MAX_ATTEMPTS = "XAGENT_LLM_CAPACITY_MAX_ATTEMPTS"
+LLM_STREAM_EMPTY_DELTA_LIMIT = "XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT"
+LLM_STREAM_DEGENERATE_WINDOW = "XAGENT_LLM_STREAM_DEGENERATE_WINDOW"
+LLM_STREAM_DEGENERATE_MAX_PERIOD = "XAGENT_LLM_STREAM_DEGENERATE_MAX_PERIOD"
+LLM_STREAM_NO_PAYLOAD_ABORT_MODELS = "XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS"
+LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS = "XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS"
 SANDBOX_CPUS = "SANDBOX_CPUS"
 SANDBOX_MEMORY = "SANDBOX_MEMORY"
 SANDBOX_ENV = "SANDBOX_ENV"
@@ -2921,7 +2926,7 @@ def get_llm_retry_deadline_seconds() -> float:
         values fall back to the default, because an unbounded loop is the
         defect this exists to prevent.
     """
-    deadline = _get_positive_float_env(LLM_RETRY_DEADLINE_SECONDS, None)
+    deadline = _get_positive_float_env(LLM_RETRY_DEADLINE_SECONDS, 300.0)
     return 300.0 if deadline is None else deadline
 
 
@@ -2942,6 +2947,108 @@ def get_llm_capacity_max_attempts() -> int:
         values fall back to the default.
     """
     return _get_positive_int_env(LLM_CAPACITY_MAX_ATTEMPTS, 2)
+
+
+def get_llm_stream_empty_delta_limit() -> int:
+    """Get the consecutive-empty-delta budget before an LLM stream is abandoned.
+
+    Counts streaming deltas in a row that carry no content, no tool-call
+    bytes, no reasoning text and no finish_reason -- a stream stuck emitting
+    nothing is making no progress even though the connection is still open.
+
+    Priority:
+        1. XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT environment variable
+        2. 200
+
+    Returns:
+        The count of consecutive empty deltas at which the stream is
+        abandoned (the Nth empty delta in a row triggers it); 0 disables the
+        check. Invalid or negative values fall back to the default.
+    """
+    return _get_positive_int_env(LLM_STREAM_EMPTY_DELTA_LIMIT, 200, minimum=0)
+
+
+def get_llm_stream_degenerate_window() -> int:
+    """Get the trailing-character window inspected for a degenerate stream tail.
+
+    Used two ways: to size the trailing slice of reasoning text checked for a
+    whitespace-only or periodic (repeated) tail, and as the trailing-whitespace
+    budget allowed after a complete tool-call JSON object has already been
+    emitted.
+
+    Priority:
+        1. XAGENT_LLM_STREAM_DEGENERATE_WINDOW environment variable
+        2. 256
+
+    Returns:
+        Trailing characters inspected; 0 disables the whitespace and
+        periodicity checks (non-whitespace after a complete tool-call object
+        is still rejected: it can never parse). Invalid or
+        negative values fall back to the default.
+    """
+    return _get_positive_int_env(LLM_STREAM_DEGENERATE_WINDOW, 256, minimum=0)
+
+
+def get_llm_stream_degenerate_max_period() -> int:
+    """Get the longest repeat period the periodicity check searches for.
+
+    Bounds how far the degenerate-tail check looks inside the trailing
+    window (``get_llm_stream_degenerate_window``) for a repeating substring,
+    e.g. a model looping on the same few characters instead of finishing.
+
+    Priority:
+        1. XAGENT_LLM_STREAM_DEGENERATE_MAX_PERIOD environment variable
+        2. 64
+
+    Returns:
+        Longest repeat period, in characters, considered. Invalid or
+        non-positive values fall back to the default.
+    """
+    return _get_positive_int_env(LLM_STREAM_DEGENERATE_MAX_PERIOD, 64)
+
+
+def get_llm_stream_no_payload_abort_models() -> frozenset[str]:
+    """Get the model allowlist for the opt-in no-payload wall-clock abort.
+
+    The wall-clock abort in ``get_llm_stream_no_payload_timeout_seconds`` only
+    applies to models named here, because it is a blunter, time-based signal
+    than the delta- and degenerate-tail checks above and is meant for models
+    known to stall without ever emitting the finish signals those checks rely
+    on. Matching is exact and case-sensitive against the model string sent on
+    the wire (e.g. ``moonshotai.kimi-k2.5``) -- no normalization or prefix
+    matching is applied.
+
+    Priority:
+        1. XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS environment variable
+        2. empty (no models opted in)
+
+    Returns:
+        Frozenset of wire model names for which the no-payload abort is
+        enabled; empty when unset or blank.
+    """
+    raw = os.getenv(LLM_STREAM_NO_PAYLOAD_ABORT_MODELS, "")
+    return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+
+def get_llm_stream_no_payload_timeout_seconds() -> float:
+    """Get the no-payload wall-clock timeout for allow-listed models.
+
+    Seconds after the first streamed chunk before an allow-listed model's
+    stream (see ``get_llm_stream_no_payload_abort_models``) is abandoned if it
+    has produced no content and no tool-call chunk in that time. Only applies
+    to models on that allowlist; other models are governed solely by the
+    delta- and degenerate-tail checks above.
+
+    Priority:
+        1. XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS environment variable
+        2. 30
+
+    Returns:
+        Seconds allowed with no payload before the stream is abandoned;
+        invalid or non-positive values fall back to the default.
+    """
+    timeout = _get_positive_float_env(LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS, 30.0)
+    return 30.0 if timeout is None else timeout
 
 
 def get_sandbox_cpus() -> int | None:

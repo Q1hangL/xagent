@@ -2601,3 +2601,34 @@ def test_the_routing_prompt_has_no_second_default_for_the_marker() -> None:
         "evidence_state"
     ]
     assert parameter.default is inspect.Parameter.empty
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["react", "plan_execute"])
+async def test_auto_ordinary_tool(action):
+    responses = [decision_tool_response(action, "Needs search.")]
+    if action == "plan_execute":
+        responses.append(plan_tool_response([{"id": "search", "task": "Search"}]))
+    responses += [
+        {
+            "content": "searching",
+            "tool_calls": [
+                {
+                    "id": "call",
+                    "function": {
+                        "name": "zhipu_web_search",
+                        "arguments": '{"query":"xagent"}',
+                    },
+                }
+            ],
+        },
+        "done",
+    ]
+    tool = FakeSearchTool()
+    ctx = ExecutionContext()
+    ctx.add_user_message("Search for xagent")
+    result = await AutoPattern(dag_pattern=DAGPattern(LLMPlanGenerator())).run(
+        context=ctx, tools=[tool], llm=FakeLLM(responses), runtime=PatternRuntime()
+    )
+    assert result["success"]
+    assert len(tool.calls) == 1

@@ -214,6 +214,11 @@ class _AutoChildRuntime:
     async def run_llm_call(self, llm: Any, **kwargs: Any) -> Any:
         return await self.parent.run_llm_call(llm, **kwargs)
 
+    async def load_committed_tool_outcome(
+        self, tool_call: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        return await self.parent.load_committed_tool_outcome(tool_call)
+
     async def run_tool_call(self, invoke: Any) -> Any:
         return await self.parent.run_tool_call(invoke)
 

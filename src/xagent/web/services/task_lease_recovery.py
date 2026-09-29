@@ -15,7 +15,11 @@ from ..models.chat_message import TaskChatMessage
 from ..models.task import Task, TaskStatus, task_status_predicate
 from .chat_history_service import DELIVERY_DISPATCHED, DELIVERY_PENDING
 from .db_runtime import is_database_pool_timeout, run_db_io_cancellation_safe
-from .ops_signals import CHECKPOINT_LEGACY_POINTER_AMBIGUOUS, clear_degradation
+from .ops_signals import (
+    CHECKPOINT_LEGACY_POINTER_AMBIGUOUS,
+    CHECKPOINT_RECOVERY_UNAVAILABLE,
+    clear_degradation,
+)
 from .task_execution_controller import TaskControlState
 from .task_lease_service import (
     CheckpointRecoveryVerdict,
@@ -37,6 +41,10 @@ logger = logging.getLogger(__name__)
 
 TASK_LEASE_EXPIRED_ERROR = (
     "Task execution lease expired before the runner completed the task."
+)
+TASK_UNKNOWN_TOOL_EFFECT_ERROR = (
+    "Task execution lease expired with an unknown tool effect; "
+    "automatic replay is unsafe."
 )
 TASK_LEASE_PAUSED_TRIGGER_ERROR = (
     "Task paused after execution lease expiry; manual resume is required."
@@ -264,9 +272,9 @@ def recover_task_lease_candidate_no_commit(
 
     verdict = resolve_checkpoint_recovery(db, candidate)
     if verdict is CheckpointRecoveryVerdict.INDETERMINATE:
-        # The checkpoint pointer's row identity could not be resolved this
-        # round (an ambiguous legacy event_id match). Leave the candidate's
-        # lease and status untouched -- no recovery statement runs below --
+        # Checkpoint identity/content could not be resolved this round
+        # (an ambiguous legacy event_id or unavailable event read). Leave
+        # the lease and status untouched -- no recovery statement runs below --
         # so the next sweep re-selects it and can retry cleanly instead of
         # failing a task whose checkpoint may in fact be readable.
         return None
@@ -275,7 +283,13 @@ def recover_task_lease_candidate_no_commit(
         if verdict is CheckpointRecoveryVerdict.RECOVERABLE
         else TaskStatus.FAILED
     )
-    task_error = None if next_status == TaskStatus.PAUSED else TASK_LEASE_EXPIRED_ERROR
+    task_error = (
+        None
+        if next_status == TaskStatus.PAUSED
+        else TASK_UNKNOWN_TOOL_EFFECT_ERROR
+        if verdict is CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT
+        else TASK_LEASE_EXPIRED_ERROR
+    )
     recovered = recover_expired_task_lease_no_commit(
         db,
         candidate,
@@ -520,6 +534,7 @@ async def recover_expired_task_leases_until_cutoff(
     # erase what page 1 registered, since the cursor has already advanced
     # past it. At either finer grain the signal could never stay set.
     clear_degradation(CHECKPOINT_LEGACY_POINTER_AMBIGUOUS)
+    clear_degradation(CHECKPOINT_RECOVERY_UNAVAILABLE)
 
     recovered = 0
     cursor: TaskLeaseRecoveryCursor | None = None

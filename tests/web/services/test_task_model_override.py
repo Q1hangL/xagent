@@ -11,11 +11,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from xagent.core.agent.service import AgentService
+from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.chat.basic.call_boundary import UnavailableVisionModel
 from xagent.web.models.task import TaskStatus
 from xagent.web.models.user import User
-from xagent.web.services.agent_service_manager import AgentServiceManager
+from xagent.web.services.agent_service_manager import (
+    AgentServiceManager,
+    AgentServiceMemoryPolicy,
+)
 from xagent.web.services.llm_utils import AgentRuntimeFields
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
@@ -220,6 +224,9 @@ def test_the_stand_in_is_not_reported_as_a_configured_vision_model() -> None:
             compact_llm=None,
             tools=[],
             memory=object(),
+            memory_enabled=False,
+            memory_available=True,
+            memory_availability_reason=None,
             _execution_type=lambda: "react",
         )
         return AgentService.get_status(service)  # type: ignore[arg-type]
@@ -254,6 +261,9 @@ class _Builds:
             def get_execution_status(self, execution_id: str) -> dict[str, Any]:
                 return dict(self.execution_status)
 
+            def revoke_memory(self, **kwargs: Any) -> None:
+                AgentService.revoke_memory(self, **kwargs)
+
             def __init__(self, **kwargs: Any) -> None:
                 super().__init__()
                 self.execution_status = {"is_running": False, "is_resumable": False}
@@ -262,6 +272,13 @@ class _Builds:
                 self.fast_llm = kwargs["fast_llm"]
                 self.vision_llm = kwargs["vision_llm"]
                 self.compact_llm = kwargs["compact_llm"]
+                self.memory = kwargs["memory"]
+                self.memory_enabled = kwargs["memory_enabled"]
+                self.memory_available = kwargs["memory_available"]
+                self.memory_availability_reason = kwargs["memory_availability_reason"]
+                self.execution_metadata = dict(kwargs["execution_metadata"])
+                self.agent = SimpleNamespace(memory_store=self.memory)
+                self._execution_adapter = None
                 self.workspace = None
                 builds.services.append(self)
 
@@ -337,6 +354,75 @@ class TestACachedTask:
         two = await builds.get(snapshot)
         assert two is one
         assert len(builds.services) == 1
+
+    async def test_the_same_override_still_reconciles_revoked_memory(self):
+        builds = _Builds()
+        override = _override("selected")
+        snapshot = apply_task_model_override(_snapshot(["basic"]), override)
+        ready = AgentServiceMemoryPolicy(
+            memory=InMemoryMemoryStore(), memory_enabled=True
+        )
+        blocked = AgentServiceMemoryPolicy(
+            memory=InMemoryMemoryStore(),
+            memory_enabled=False,
+            memory_available=False,
+            memory_availability_reason="restart_required",
+        )
+        with patch(
+            "xagent.web.services.agent_service_manager.resolve_agent_service_memory_policy_async",
+            new=AsyncMock(side_effect=[ready, blocked]),
+        ) as resolve_memory:
+            one = await builds.get(snapshot)
+            two = await builds.get(snapshot)
+
+        assert two is one
+        assert len(builds.services) == len(builds.tool_calls) == 1
+        assert two.llm is two.fast_llm is two.compact_llm is override.llm
+        assert isinstance(two.vision_llm, UnavailableVisionModel)
+        assert two.memory is blocked.memory
+        assert two.agent.memory_store is blocked.memory
+        assert two.memory_enabled is False and two.memory_available is False
+        assert (
+            two.execution_metadata["memory_availability_reason"] == "restart_required"
+        )
+        assert builds.manager._cached_model_override(42) is override
+        assert resolve_memory.await_count == 2
+
+    async def test_a_new_override_builds_with_the_current_memory_policy(self):
+        builds = _Builds()
+        first, second = _override("first-turn"), _override("second-turn")
+        ready = AgentServiceMemoryPolicy(
+            memory=InMemoryMemoryStore(), memory_enabled=True
+        )
+        blocked = AgentServiceMemoryPolicy(
+            memory=InMemoryMemoryStore(),
+            memory_enabled=False,
+            memory_available=False,
+            memory_availability_reason="restart_required",
+        )
+        with patch(
+            "xagent.web.services.agent_service_manager.resolve_agent_service_memory_policy_async",
+            new=AsyncMock(side_effect=[ready, blocked]),
+        ) as resolve_memory:
+            one = await builds.get(
+                apply_task_model_override(_snapshot(["basic"]), first)
+            )
+            two = await builds.get(
+                apply_task_model_override(_snapshot(["basic"]), second)
+            )
+
+        assert two is not one
+        assert two.llm is two.fast_llm is two.compact_llm is second.llm
+        assert isinstance(two.vision_llm, UnavailableVisionModel)
+        assert [call["llm"] for call in builds.tool_calls] == [first.llm, second.llm]
+        assert two.memory is blocked.memory
+        assert two.memory_enabled is False and two.memory_available is False
+        assert (
+            two.execution_metadata["memory_availability_reason"] == "restart_required"
+        )
+        assert one.memory is ready.memory and one.memory_enabled is True
+        assert builds.manager._cached_model_override(42) is second
+        assert resolve_memory.await_count == 2
 
     async def test_a_request_without_the_override_rebuilds_on_the_task_models(self):
         builds = _Builds()

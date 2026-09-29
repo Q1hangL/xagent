@@ -16,6 +16,7 @@ from ...core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointCorruptError,
     CheckpointReadError,
+    UnknownToolEffectError,
 )
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
@@ -26,6 +27,7 @@ from .llm_utils import AutoModelUnavailableError
 from .task_command_transport import (
     COMMAND_COMPLETED,
     COMMAND_FAILED,
+    COMMAND_PENDING,
     COMMAND_PROCESSING,
     ClaimedTaskCommand,
     SettledTaskCommand,
@@ -200,6 +202,11 @@ def _read_reply_outcome(command_db_id: int) -> dict | None:
         if result.get("outcome"):
             return result
         if row.status == COMMAND_FAILED:
+            if result.get("rejection_reason"):
+                # The handoff or a control rejected the command before any
+                # injection, so nothing was written: the same ID replays this
+                # answer and a new attempt needs a new ID.
+                return _outcome_fields("busy", True)
             return {"outcome": "unavailable"}
         if row.status == COMMAND_COMPLETED:
             task = db.get(Task, row.task_id)
@@ -225,6 +232,29 @@ def _read_reply_outcome(command_db_id: int) -> dict | None:
         return None
 
 
+def _read_capacity_wait(command_db_id: int) -> dict | None:
+    """The acceptance snapshot of a reply provably waiting for admission."""
+    from .task_execution_admission import waiting_for_capacity
+
+    with get_session_local()() as db:
+        row = db.get(TaskExecutionCommand, command_db_id)
+        if (
+            row is None
+            or row.status != COMMAND_PENDING
+            or row.target_run_id is None
+            or not waiting_for_capacity(db, command_db_id)
+        ):
+            return None
+        task = db.get(Task, row.task_id)
+        if task is None:
+            return None
+        return {
+            "run_id": str(row.target_run_id),
+            "state_version": int(row.target_state_version),
+            "control_state": str(task.control_state),
+        }
+
+
 async def enqueue_resume_input(
     ctx: TaskReplyInput,
     *,
@@ -233,6 +263,7 @@ async def enqueue_resume_input(
     command_id: str | None = None,
 ) -> TaskReplyResumeResult:
     from .task_event_bridge import get_task_event_bridge
+    from .task_execution_admission import admission_enabled
 
     get_task_event_bridge().require_ready()
     command_id = command_id or ctx.command_id or uuid4().hex
@@ -240,6 +271,9 @@ async def enqueue_resume_input(
         lambda: _admit_reply(ctx, source, message_id, command_id)
     )
     notify_task_command_dispatcher()
+    # Only SDK ingress projects a queued reply; A2A has no projection for it
+    # and keeps waiting, and a host without a classifier staged no ticket.
+    acknowledge_queued = source == "sdk" and admission_enabled()
     # These APIs already wait for checkpoint validation and local scheduling.
     # Preserve that response boundary while preparation now runs on a worker.
     deadline = asyncio.get_running_loop().time() + get_task_reply_wait_timeout_seconds()
@@ -248,6 +282,23 @@ async def enqueue_resume_input(
             lambda: _read_reply_outcome(command_db_id)
         )
     ) is None:
+        # Capacity waiting is durable acceptance, not an unknown outcome:
+        # acknowledge it now rather than holding the request for a slot.
+        queued = (
+            await run_db_io_cancellation_safe(
+                lambda: _read_capacity_wait(command_db_id)
+            )
+            if acknowledge_queued
+            else None
+        )
+        if queued is not None:
+            return TaskReplyResumeResult(
+                run_id=queued["run_id"],
+                state_version=queued["state_version"],
+                control_state=queued["control_state"],
+                command_id=command_id,
+                queued=True,
+            )
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             raise TaskResumeOutcomeUnknownError(command_id)
@@ -466,7 +517,11 @@ async def _execute_resume_input(command: ClaimedTaskCommand) -> SettledTaskComma
             retry_with_new_id = True
         except TaskResumeBusyError:
             outcome = "busy"
-        except (TaskResumeNotResumableError, CheckpointCorruptError):
+        except (
+            TaskResumeNotResumableError,
+            CheckpointCorruptError,
+            UnknownToolEffectError,
+        ):
             outcome = "not_resumable"
         except CheckpointAccessRefusedError as exc:
             outcome = "not_resumable" if exc.reason == "superseded_legacy" else "busy"

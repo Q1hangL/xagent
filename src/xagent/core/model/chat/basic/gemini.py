@@ -788,6 +788,8 @@ class GeminiLLM(BaseLLM):
             candidate_diagnostics: List[Dict[str, Any]] = []
             partial_call_diagnostics: List[Dict[str, Any]] = []
             emitted_content_or_tool = False
+            emitted_tool_call = False
+            last_candidate_finish_reason: Any = None
             tool_call_index = 0
 
             # Process streaming response (async iteration)
@@ -860,6 +862,7 @@ class GeminiLLM(BaseLLM):
                     continue
 
                 candidate = chunk.candidates[0]
+                last_candidate_finish_reason = getattr(candidate, "finish_reason", None)
                 diagnostics = _gemini_candidate_diagnostics(candidate)
                 if diagnostics:
                     candidate_diagnostics.append(diagnostics)
@@ -890,6 +893,7 @@ class GeminiLLM(BaseLLM):
                             continue
 
                         emitted_content_or_tool = True
+                        emitted_tool_call = True
                         yield StreamChunk(
                             type=ChunkType.TOOL_CALL,
                             tool_calls=[
@@ -937,10 +941,28 @@ class GeminiLLM(BaseLLM):
                 )
                 return
 
-            # Yield end chunk
+            # Yield end chunk. Gemini reports STOP on the final chunk even for
+            # function-call turns, so tool calls are detected from what the
+            # stream actually emitted rather than trusted from the last
+            # candidate. MAX_TOKENS maps to the OpenAI-style "length" value
+            # this adapter already uses elsewhere (#2790 tracks the wider
+            # finish-reason vocabulary question).
+            end_finish_reason = "stop"
+            if emitted_tool_call:
+                end_finish_reason = "tool_calls"
+            else:
+                reason_value = getattr(
+                    last_candidate_finish_reason, "name", last_candidate_finish_reason
+                )
+                if (
+                    isinstance(reason_value, str)
+                    and reason_value.upper() == "MAX_TOKENS"
+                ):
+                    end_finish_reason = "length"
+
             yield StreamChunk(
                 type=ChunkType.END,
-                finish_reason="stop",
+                finish_reason=end_finish_reason,
                 raw=None,
             )
 

@@ -132,6 +132,9 @@ class TaskReplyResumeResult:
     state_version: int
     control_state: str
     command_id: str | None = None
+    # The durable command is still waiting for execution capacity; nothing
+    # has been validated or resumed yet. Replaying ``command_id`` observes it.
+    queued: bool = False
 
 
 # Control states a waiting task may be claimed from. Mirrors the a2a

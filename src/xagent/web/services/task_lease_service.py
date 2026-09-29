@@ -15,7 +15,7 @@ from enum import Enum
 from typing import Any, Callable, Coroutine, Iterator, Sequence, TypeVar, cast
 
 from sqlalchemy import and_, case, false, func, or_, select, text, update
-from sqlalchemy.exc import MultipleResultsFound
+from sqlalchemy.exc import MultipleResultsFound, SQLAlchemyError
 from sqlalchemy.orm import Query, Session
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -33,6 +33,7 @@ from .db_runtime import (
 )
 from .ops_signals import (
     CHECKPOINT_LEGACY_POINTER_AMBIGUOUS,
+    CHECKPOINT_RECOVERY_UNAVAILABLE,
     register_degradation,
 )
 from .task_execution_controller import control_state_for_status
@@ -339,14 +340,17 @@ class CheckpointRecoveryVerdict(str, Enum):
     ``RECOVERABLE`` and ``NOT_RECOVERABLE`` both mean the checkpoint's row
     identity was authoritatively resolved (found-and-valid, or found-invalid,
     or provably absent); the caller acts on the candidate immediately,
-    recovering to PAUSED or FAILED respectively. ``INDETERMINATE`` means row
-    identity itself could not be established this round (an ambiguous legacy
-    match) -- the caller must leave the candidate's lease and status
-    untouched so the next sweep can retry, never fold this into FAILED.
+    recovering to PAUSED or FAILED respectively. ``UNKNOWN_TOOL_EFFECT`` also
+    fails the task, preserving why replay is unsafe for the persisted error.
+    ``INDETERMINATE`` means row
+    identity or content could not be established this round (an ambiguous
+    legacy match or unavailable event read) -- the caller must leave the
+    candidate's lease and status untouched so the next sweep can retry, never fold this into FAILED.
     """
 
     RECOVERABLE = "recoverable"
     NOT_RECOVERABLE = "not_recoverable"
+    UNKNOWN_TOOL_EFFECT = "unknown_tool_effect"
     INDETERMINATE = "indeterminate"
 
 
@@ -507,6 +511,47 @@ def resolve_checkpoint_recovery(
     see the migration) -- so it too falls back to the legacy string
     resolution instead of failing the candidate outright.
     """
+
+    from ...core.agent.checkpoint import (
+        CheckpointAccessRefusedError,
+        CheckpointCorruptError,
+        CheckpointUnavailableError,
+        UnknownToolEffectError,
+    )
+    from .task_execution_event_writer import uses_execution_events
+
+    try:
+        if uses_execution_events(db, candidate.task_id):
+            from .task_execution_event_recovery import read_event_checkpoint
+
+            if candidate.run_id is None:
+                return CheckpointRecoveryVerdict.NOT_RECOVERABLE
+            try:
+                data = read_event_checkpoint(
+                    db,
+                    task_id=candidate.task_id,
+                    scope_id="root",
+                    execution_id=str(candidate.task_id),
+                    run_id=candidate.run_id,
+                )
+            except UnknownToolEffectError:
+                return CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT
+            except (CheckpointCorruptError, CheckpointAccessRefusedError):
+                return CheckpointRecoveryVerdict.NOT_RECOVERABLE
+            return (
+                CheckpointRecoveryVerdict.RECOVERABLE
+                if data is not None
+                else CheckpointRecoveryVerdict.NOT_RECOVERABLE
+            )
+    except (CheckpointUnavailableError, SQLAlchemyError) as exc:
+        # Include the storage-version probe; do not publish SQL/parameters.
+        detail = f"task_id={candidate.task_id}: {type(exc).__name__}"
+        logger.warning("Event recovery unavailable: %s", detail)
+        register_degradation(CHECKPOINT_RECOVERY_UNAVAILABLE, detail)
+        if isinstance(exc, SQLAlchemyError):
+            # Keep existing rollback and pool-timeout handling in the sweeper.
+            raise
+        return CheckpointRecoveryVerdict.INDETERMINATE
 
     if candidate.last_checkpoint_trace_event_id is not None:
         row = db.get(TraceEvent, candidate.last_checkpoint_trace_event_id)

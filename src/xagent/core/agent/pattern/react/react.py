@@ -5594,6 +5594,20 @@ class ReActPattern(AgentPattern):
         is_control = tool_call["name"] in CONTROL_TOOL_NAMES
         if not is_control:
             tool_call = self._with_trace_safe_tool_args(tool_call, tools)
+            committed = await runtime.load_committed_tool_outcome(tool_call)
+            if committed is not None:
+                result = committed["result"]
+                self._record_tool_call(
+                    tool_call,
+                    status="waiting_for_user"
+                    if tool_result_waits_for_user(result)
+                    else (
+                        "completed" if self._tool_result_success(result) else "failed"
+                    ),
+                    result=result,
+                    error=committed["error"],
+                )
+                return result
             # The duplicate-write scan runs before this call writes any ledger
             # record: provider-supplied tool_call ids are not guaranteed
             # unique (see _run_concurrent_batch), so recording "running" first

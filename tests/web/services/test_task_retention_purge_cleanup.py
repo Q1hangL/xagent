@@ -221,7 +221,7 @@ def test_a_purge_that_fails_records_nothing(
     """Same transaction as the row deletion: rolled back together."""
     _owner_id, task_id = _expired_task(sessions, "failing-owner")
 
-    def _explode(db, *, task_id):
+    def _explode(db, *, task_id, detached_reason):
         raise RuntimeError("a foreign key this census missed")
 
     monkeypatch.setattr(purge_module, "purge_task_rows", _explode)

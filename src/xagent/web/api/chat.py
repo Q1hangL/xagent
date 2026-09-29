@@ -187,7 +187,7 @@ def _compensate_failed_task_extension_create(
     """Remove a just-created task after provider binding setup failed."""
 
     db.rollback()
-    deleted = purge_task_rows(db, task_id=task_id)
+    deleted = purge_task_rows(db, task_id=task_id, detached_reason="task_create_failed")
     db.commit()
     if deleted:
         invalidate_task_cache(task_id)
@@ -244,7 +244,9 @@ def _delete_task_sync(
     session_factory = get_session_local()
     delete_db = session_factory()
     try:
-        deleted = purge_task_rows(delete_db, task_id=task_id)
+        deleted = purge_task_rows(
+            delete_db, task_id=task_id, detached_reason="task_deleted"
+        )
         if not deleted:
             delete_db.rollback()
             return None
@@ -637,21 +639,18 @@ async def create_task(
         )
 
         if selected_file_ids:
-            from ..models.uploaded_file import UploadedFile
+            from ..services.file_turn import bind_turn_files_no_commit
 
-            (
-                db.query(UploadedFile)
-                .filter(
-                    UploadedFile.file_id.in_(selected_file_ids),
-                    UploadedFile.user_id == int(user.id),
-                    UploadedFile.task_id.is_(None),
-                    UploadedFile.storage_status != "compensating",
+            if bind_turn_files_no_commit(
+                db=db,
+                file_ids=selected_file_ids,
+                task_id=int(task.id),
+                owner_user_id=int(user.id),
+            ):
+                db.rollback()
+                raise HTTPException(
+                    status_code=409, detail="Selected files are no longer available"
                 )
-                .update(
-                    {UploadedFile.task_id: int(task.id)},
-                    synchronize_session=False,
-                )
-            )
 
         if runtime_extension_requests:
             # Record which providers this task binds to *before* any hook runs,

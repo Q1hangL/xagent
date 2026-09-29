@@ -2,8 +2,9 @@
 
 Status: reader prerequisites and source audit, based on main `90660939a`.
 This document distinguishes existing facts from the readers still to be built.
-Production task creation remains V1. Stage 3.3-B/C/D integrate recovery, model
-context, and display/Trace respectively; production routing is stage 3.4.
+Production task creation remains V1. The stage 3.3-B implementation is described
+below; C and D still cover model context and display/Trace. Production routing
+is stage 3.4.
 
 ## Scope and compatibility
 
@@ -299,3 +300,59 @@ atomicity, stale attempts, and complete-fact/limited-projection behavior.
 The additional cases above cover compacted-turn replay, adopted DAG/child state,
 tool crash horizons, and live/settled identity data after legacy-content deletion.
 Passing A's tests does not certify the not-yet-implemented four readers.
+
+
+## Stage 3.3-B: event-backed recovery
+
+For V2 tasks, `ExecutionEventTraceAdapter` reads `recovery_state` instead of
+legacy Trace checkpoint content. It selects the latest state in the existing
+root run/execution partition or delegated build/execution scope, bounded by the
+committed task sequence. The root reader retains the existing partition-widening
+policy and its recheck, including terminal unknown-tool-effect verdicts; both root
+and child readers verify a bound lease again
+before returning, including current terminal task status: coordinator cancellation
+can retain the lease identity and can commit after the captured horizon.
+A completed/failed settlement after the state prevents root
+resume, including cancellations recorded as failed settlements.
+
+Before a saved state reaches the scheduler, every pending ordinary tool attempt
+is checked, including active DAG steps and Auto's selected ReAct/DAG child. Auto
+state with a non-empty child but no recognized decision is rejected as corrupt;
+empty pre-decision and final-answer states remain readable. A committed result is reused through
+the existing ReAct result application path; no second tool invocation or tool
+start/result fact is emitted. A start without a confirmed result, including an
+interrupted attempt, raises `UnknownToolEffectError`. Lease-expiry recovery
+settles that run as FAILED through its existing fenced transaction; it does not
+leave an expired RUNNING lease for endless retries. The task error and settled
+fact distinguish an unknown tool effect from a generic lease-expiry failure.
+This includes pausing or
+stopping V2 while a tool is in flight: cancellation does not prove that an
+external side effect was rolled back, so that pending attempt cannot be resumed
+automatically. The context reader may show a failure observation to the model;
+that observation is not confirmation of the external outcome. V1 replay behavior
+is unchanged. Manual reconciliation of unknown effects is outside this stage.
+A database read failure reports unavailable (retryable); an unsupported recovery
+payload reports corrupt. Unavailable lease reads report an operational degradation
+for the sweep. None falls
+back to legacy content. Control-message retries retain their existing occurrence
+identity and outbound reconciliation path.
+
+Interaction anchors resolve the stored protocol event ID against a root recovery
+fact with the same task, run and execution. Answer authorization and interaction
+CAS are unchanged. The legacy Trace FK remains identity-only compatibility
+control storage until stage 3.5; it is not used to load checkpoint content.
+Waiting-question fallback reads outbound facts. Lease-expiry recovery eligibility
+also uses state facts. Setup reconstruction uses the adopted state as its history
+presence input; the runner still owns partitioned state restoration.
+
+The focused recovery suite exercises actual `AgentRunner.resume`, root and child
+ReAct/DAG crash windows, completed/failed/waiting/unknown tool outcomes, settlement,
+lease replacement during a read, interaction anchors and compacted input retries.
+Deleting legacy Trace/checkpoint content does not prevent these recovery reads.
+An accepted input is not applied merely because its acceptance fact exists;
+application and compacted retry identity remain in the saved context.
+
+This is a recovery boundary, not whole-task isolation certification: setup still
+reads model transcript and cross-round tool/skill context through legacy sources
+until C, and UI/Trace reads await D. Compatibility writers, control fields,
+production defaults, checkpoint formats, database schema and V1 remain unchanged.

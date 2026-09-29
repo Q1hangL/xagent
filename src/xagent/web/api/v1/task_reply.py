@@ -8,10 +8,15 @@ from ....core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointCorruptError,
     CheckpointReadError,
+    UnknownToolEffectError,
 )
 from ...models.database import get_session_local
-from ...models.task import TaskStatus
-from ...schemas.v1 import ReplyRequest, ReplyResponse
+from ...schemas.v1 import (
+    REPLY_STATUS_QUEUED,
+    REPLY_STATUS_RUNNING,
+    ReplyRequest,
+    ReplyResponse,
+)
 from ...services import task_resume as task_resume_service
 from ...services.db_runtime import (
     run_db_io_cancellation_safe,
@@ -77,8 +82,12 @@ async def reply_to_task(
         principal: Key-bound owner from the auth dependency.
 
     Returns:
-        :class:`ReplyResponse` with ``status='running'`` and the same
-        ``run_id`` the task was waiting on.
+        :class:`ReplyResponse` with the same ``run_id`` the task was
+        waiting on. ``status`` is ``'running'`` once the reply has been
+        validated and resumed, or ``'queued'`` when the durable reply is
+        still waiting for execution capacity under an admission policy:
+        nothing has been validated yet, and repeating the same
+        ``command_id`` observes the later outcome without resending.
 
     Raises:
         V1ApiError 401: missing / invalid / revoked key.
@@ -146,7 +155,7 @@ async def reply_to_task(
     except task_resume_service.TaskResumeNotResumableError as exc:
         raise V1ApiError(V1ErrorCode.INTERACTION_NOT_RESUMABLE, 409) from exc
     except CheckpointReadError as exc:
-        if isinstance(exc, CheckpointCorruptError):
+        if isinstance(exc, (CheckpointCorruptError, UnknownToolEffectError)):
             raise V1ApiError(V1ErrorCode.INTERACTION_NOT_RESUMABLE, 409) from exc
         if isinstance(exc, CheckpointAccessRefusedError):
             if exc.reason == "superseded_legacy":
@@ -170,7 +179,7 @@ async def reply_to_task(
         workforce_id=(
             int(principal.workforce.id) if principal.workforce is not None else None
         ),
-        status=TaskStatus.RUNNING.value,
+        status=REPLY_STATUS_QUEUED if result.queued else REPLY_STATUS_RUNNING,
         accepted_at=datetime.now(timezone.utc),
         run_id=result.run_id,
         state_version=result.state_version,

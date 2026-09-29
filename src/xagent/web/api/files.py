@@ -779,6 +779,11 @@ def _validate_public_task_file_access(
     public preview and download URLs. Share and widget tasks additionally bind
     file access to a signed guest token, which must resolve to the same task.
     """
+    if (
+        file_record.detached_reason is not None
+        or file_record.storage_status == "compensating"
+    ):
+        raise HTTPException(status_code=403, detail="Access denied")
     if not file_record.task_id:
         return
 
@@ -1285,7 +1290,10 @@ async def list_files(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    query = db.query(UploadedFile)
+    query = db.query(UploadedFile).filter(
+        UploadedFile.detached_reason.is_(None),
+        UploadedFile.storage_status != "compensating",
+    )
     if not _is_admin_user(user):
         query = query.filter(UploadedFile.user_id == _user_id_value(user))
 

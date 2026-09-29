@@ -648,7 +648,7 @@ def _purge_task(
             # Before the delete: the tombstone is read from the row, and the
             # runs are found by the ``task_id`` the delete SETs NULL.
             record_task_expiry_no_commit(db, task_id, now=now)
-            purge_task_rows(db, task_id=task_id)
+            purge_task_rows(db, task_id=task_id, detached_reason="task_deleted")
         elif _purge_trace_rows(db, task_id, now=now) == 0:
             # Either the rows went between the scan and the lock, or the scan
             # admitted a drifted task whose trace an earlier sweep removed

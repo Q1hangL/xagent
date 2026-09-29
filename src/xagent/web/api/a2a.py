@@ -16,6 +16,7 @@ from ...core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointCorruptError,
     CheckpointReadError,
+    UnknownToolEffectError,
 )
 from ..models.agent import Agent
 from ..models.database import get_session_local
@@ -280,7 +281,7 @@ async def _start_a2a_turn(
             details={"taskId": task_id},
         ) from exc
     except CheckpointReadError as exc:
-        if isinstance(exc, CheckpointCorruptError):
+        if isinstance(exc, (CheckpointCorruptError, UnknownToolEffectError)):
             raise a2a_error(
                 "unsupported_operation",
                 "The task's saved progress is unreadable.",

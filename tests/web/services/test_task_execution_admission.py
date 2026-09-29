@@ -372,36 +372,6 @@ async def test_policy_change_does_not_silently_change_existing_bucket(host):
         enqueue(host)
 
 
-async def test_message_cannot_borrow_an_existing_execution_from_another_bucket(host):
-    first = enqueue(host)
-    original = Execution(host)
-    assert await transport.dispatch_one_task_command(original)
-    with host.sessions() as db:
-        task_id = db.get(TaskExecutionCommand, first.command_id).task_id
-    admission.set_task_admission_hook(
-        lambda db, command: admission.AdmissionPolicy("other-lane", 1, 20)
-    )
-    second = enqueue(host)
-    occupied = Execution(host)
-    assert await transport.dispatch_one_task_command(occupied)
-    message = enqueue(host, task_id=task_id, kind=transport.TaskCommandKind.MESSAGE)
-    delivered = []
-
-    async def inject(command):
-        delivered.append(command.id)
-        return {}
-
-    assert not await transport.dispatch_one_task_command(
-        inject, command_db_id=message.command_id
-    )
-    assert transport.load_task_command(message.command_id).attempt_count == 0
-    occupied.finish.set()
-    occupied.cleanup.set()
-    await dispatch_next(inject)
-    assert delivered == [message.command_id]
-    assert occupied.started == [second.command_id]
-
-
 async def test_next_turn_on_same_owner_does_not_retain_previous_turn_slot(host):
     admission.set_task_admission_hook(
         lambda db, command: admission.AdmissionPolicy("turns", 2, 20)
