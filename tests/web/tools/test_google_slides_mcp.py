@@ -2444,17 +2444,29 @@ def test_get_presentation_maps_not_found_to_an_actionable_message(monkeypatch):
     assert message.endswith("HTTP 404 Requested entity was not found.")
 
 
-def test_add_slide_maps_permission_denied_to_an_actionable_message(monkeypatch):
+_VIEW_ONLY_403 = {
+    "error": {
+        "code": 403,
+        "message": "The caller does not have permission",
+        "status": "PERMISSION_DENIED",
+    }
+}
+
+
+def _assert_refused_edit(result):
+    assert result["status"] == "error"
+    message = result["message"]
+    assert message.startswith("Google Slides could not make this change")
+    assert "only view or comment access" in message
+    assert "can edit the presentation" in message
+    assert "could not open" not in message
+    assert message.endswith("HTTP 403 The caller does not have permission")
+
+
+def test_add_slide_explains_a_permission_denied_read(monkeypatch):
     presentations = Mock()
     presentations.get.return_value.execute.side_effect = _http_error(
-        403,
-        {
-            "error": {
-                "code": 403,
-                "message": "The caller does not have permission",
-                "status": "PERMISSION_DENIED",
-            }
-        },
+        403, _VIEW_ONLY_403
     )
     _mock_slides_service(monkeypatch, presentations)
 
@@ -2462,10 +2474,75 @@ def test_add_slide_maps_permission_denied_to_an_actionable_message(monkeypatch):
         google_slides.google_slides_add_slide("pres1", title="T", body="B")
     )
 
+    _assert_refused_edit(result)
+    assert "may not be able to open it at all" in result["message"]
+    presentations.batchUpdate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "invoke",
+    [
+        pytest.param(
+            lambda: google_slides.google_slides_add_slide("pres1", title="T", body="B"),
+            id="add_slide",
+        ),
+        pytest.param(
+            lambda: google_slides.google_slides_update_slide(
+                "pres1", "slide1", title="T"
+            ),
+            id="update_slide",
+        ),
+        pytest.param(
+            lambda: google_slides.google_slides_delete_slide("pres1", "slide1"),
+            id="delete_slide",
+        ),
+        pytest.param(
+            lambda: google_slides.google_slides_batch_update(
+                "pres1", '[{"deleteObject": {"objectId": "slide1"}}]'
+            ),
+            id="batch_update",
+        ),
+    ],
+)
+def test_editing_tools_explain_a_refused_edit_on_a_readable_presentation(
+    monkeypatch, invoke
+):
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.side_effect = _http_error(
+        403, _VIEW_ONLY_403
+    )
+    _mock_slides_service(monkeypatch, presentations)
+    _mock_presentation_get(
+        presentations, "slide1", [_placeholder_element("title_obj", "TITLE")]
+    )
+
+    result = json.loads(invoke())
+
+    _assert_refused_edit(result)
+    presentations.batchUpdate.assert_called_once()
+
+
+def test_editing_tool_maps_not_found_to_an_actionable_message(monkeypatch):
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.side_effect = _http_error(
+        404,
+        {"error": {"code": 404, "message": "Requested entity was not found."}},
+    )
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(google_slides.google_slides_batch_update("pres1", "[]"))
+
     assert result["message"].startswith(
         "Google Slides could not open this presentation"
     )
-    presentations.batchUpdate.assert_not_called()
+
+
+async def test_get_presentation_description_says_drive_is_not_needed():
+    tools = {tool.name: tool for tool in await google_slides.mcp.list_tools()}
+
+    description = " ".join(tools["google_slides_get_presentation"].description.split())
+    assert "cannot search for or list presentations by name" in description
+    assert "Connecting Google Drive is not needed" in description
 
 
 def test_get_presentation_rejects_a_title_without_calling_the_api(monkeypatch):

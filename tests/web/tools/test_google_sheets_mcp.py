@@ -577,3 +577,83 @@ def test_id_taking_tools_reject_a_title_without_calling_the_api(monkeypatch, inv
     assert "cannot search for or list spreadsheets by name" in message
     assert "https://docs.google.com/spreadsheets/d/" in message
     get_service.assert_not_called()
+
+
+_VIEW_ONLY_403 = {
+    "error": {
+        "code": 403,
+        "message": "The caller does not have permission",
+        "status": "PERMISSION_DENIED",
+    }
+}
+
+# (tool call, the mocked request whose execute() raises) for each tool that
+# changes a spreadsheet.
+_EDITING_CALLS = [
+    pytest.param(
+        lambda: google_sheets.google_sheets_update_range("sid", "Sheet1!A1", [["x"]]),
+        lambda spreadsheets: spreadsheets.values.return_value.update.return_value,
+        id="update_range",
+    ),
+    pytest.param(
+        lambda: google_sheets.google_sheets_append_rows("sid", "Sheet1!A1", [["x"]]),
+        lambda spreadsheets: spreadsheets.values.return_value.append.return_value,
+        id="append_rows",
+    ),
+    pytest.param(
+        lambda: google_sheets.google_sheets_clear_range("sid", "Sheet1!A1:B2"),
+        lambda spreadsheets: spreadsheets.values.return_value.clear.return_value,
+        id="clear_range",
+    ),
+    pytest.param(
+        lambda: google_sheets.google_sheets_add_sheet("sid", "Q4"),
+        lambda spreadsheets: spreadsheets.batchUpdate.return_value,
+        id="add_sheet",
+    ),
+    pytest.param(
+        lambda: google_sheets.google_sheets_delete_sheet("sid", 7),
+        lambda spreadsheets: spreadsheets.batchUpdate.return_value,
+        id="delete_sheet",
+    ),
+]
+
+
+@pytest.mark.parametrize(("invoke", "request_of"), _EDITING_CALLS)
+def test_editing_tools_explain_a_refused_edit(monkeypatch, invoke, request_of):
+    spreadsheets = Mock()
+    request_of(spreadsheets).execute.side_effect = _http_error(403, _VIEW_ONLY_403)
+    _mock_sheets_service(monkeypatch, spreadsheets)
+
+    result = json.loads(invoke())
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert message.startswith("Google Sheets could not make this change")
+    assert "only view or comment access" in message
+    assert "can edit the spreadsheet" in message
+    assert "could not open" not in message
+    assert message.endswith("HTTP 403 The caller does not have permission")
+
+
+@pytest.mark.parametrize(("invoke", "request_of"), _EDITING_CALLS)
+def test_editing_tools_map_not_found_to_an_actionable_message(
+    monkeypatch, invoke, request_of
+):
+    spreadsheets = Mock()
+    request_of(spreadsheets).execute.side_effect = _http_error(
+        404,
+        {"error": {"code": 404, "message": "Requested entity was not found."}},
+    )
+    _mock_sheets_service(monkeypatch, spreadsheets)
+
+    result = json.loads(invoke())
+
+    assert result["message"].startswith("Google Sheets could not open this spreadsheet")
+
+
+async def test_get_spreadsheet_description_says_drive_is_not_needed():
+    tools = {tool.name: tool for tool in await google_sheets.mcp.list_tools()}
+
+    description = " ".join(tools["google_sheets_get_spreadsheet"].description.split())
+    assert "cannot search for or list spreadsheets by name" in description
+    assert "Connecting Google Drive is not needed" in description

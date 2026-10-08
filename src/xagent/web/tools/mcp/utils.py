@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dateutil import parser as _date_parser
@@ -1844,6 +1844,25 @@ def google_api_error_summary(exc: BaseException) -> str:
     return f"HTTP {status}"
 
 
+# 403 reasons about the request or the token (rate limits, quota, a disabled
+# API, a missing OAuth scope) rather than about access to one file. A 403
+# with one of these reasons is not a permission problem with the file.
+GOOGLE_NON_FILE_ACCESS_403_REASONS = frozenset(
+    {
+        "rateLimitExceeded",
+        "userRateLimitExceeded",
+        "dailyLimitExceeded",
+        "sharingRateLimitExceeded",
+        "quotaExceeded",
+        "RATE_LIMIT_EXCEEDED",
+        "accessNotConfigured",
+        "SERVICE_DISABLED",
+        "insufficientPermissions",
+        "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+    }
+)
+
+
 def setup_proxy_env() -> None:
     """Setup proxy environment variables from system proxies if missing."""
     # Filter out empty proxy vars to prevent httplib2 hangs
@@ -1913,23 +1932,22 @@ def naive_day_bounds(
 # an unrelated URL) cannot name a file.
 _GOOGLE_FILE_ID_RE = re.compile(r"[a-zA-Z0-9_-]+")
 
-# 403 reasons about the request or the token (rate limits, quota, a disabled
-# API, a missing OAuth scope) rather than about access to one file.
-_NON_FILE_ACCESS_403_REASONS = frozenset(
-    {
-        "rateLimitExceeded",
-        "userRateLimitExceeded",
-        "dailyLimitExceeded",
-        "quotaExceeded",
-        "RATE_LIMIT_EXCEEDED",
-        "accessNotConfigured",
-        "SERVICE_DISABLED",
-        "insufficientPermissions",
-        "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
-    }
+_MAX_SHOWN_INPUT_LENGTH = 80
+
+# Path segments of docs.google.com links, by the product that opens them.
+_GOOGLE_EDITOR_LINK_PRODUCTS = (
+    ("/document/", "Google Docs"),
+    ("/spreadsheets/", "Google Sheets"),
+    ("/presentation/", "Google Slides"),
 )
 
-_MAX_SHOWN_INPUT_LENGTH = 80
+_LINK_PREFIX_RE = re.compile(
+    r"^(?:[a-z][a-z0-9+.-]*://|www\.|[a-z0-9-]+\.google\.com/)"
+)
+
+# Connecting Google Drive does not widen what these connectors can open: a
+# file opens when the account can open it, which depends on sharing.
+_DRIVE_NOT_NEEDED_NOTE = "Connecting Google Drive would not change this access."
 
 
 @dataclass(frozen=True)
@@ -1943,6 +1961,12 @@ class GoogleFileKind:
     create_tool: str
 
 
+def _shown_input(value: str) -> str:
+    if len(value) > _MAX_SHOWN_INPUT_LENGTH:
+        return value[: _MAX_SHOWN_INPUT_LENGTH - 3] + "..."
+    return value
+
+
 def resolve_google_file_id(
     value: str, pattern: re.Pattern[str], field_name: str, kind: GoogleFileKind
 ) -> str:
@@ -1952,36 +1976,66 @@ def resolve_google_file_id(
     These connectors open files only by link or id. A caller that passes a
     file's name instead would otherwise get a bare "not found" from the API,
     which reads as if the file did not exist. Rejecting it here explains how
-    to get a usable link instead, without spending an API call.
+    to get a usable link instead, without spending an API call. A
+    percent-encoded link (for example one wrapped by a redirect URL) is
+    decoded once before giving up, and a link to another kind of Google file
+    is named as such.
     """
     resolved = resolve_id_from_url(value, pattern, field_name)
     if _GOOGLE_FILE_ID_RE.fullmatch(resolved):
         return resolved
-    shown = resolved
-    if len(shown) > _MAX_SHOWN_INPUT_LENGTH:
-        shown = shown[: _MAX_SHOWN_INPUT_LENGTH - 3] + "..."
+    decoded = unquote(resolved)
+    if decoded != resolved:
+        match = pattern.search(decoded)
+        if match:
+            return match.group(1)
+    shown = _shown_input(resolved)
+    lowered = decoded.lower()
+    if "docs.google.com" in lowered:
+        for segment, product in _GOOGLE_EDITOR_LINK_PRODUCTS:
+            if segment in lowered and product != kind.product:
+                raise ValueError(
+                    f"{field_name} {shown!r} is a {product} link, not a "
+                    f"{kind.product} link. Open it with the {product} tools "
+                    "if they are available. If the user meant a "
+                    f"{kind.noun}, ask them for the {kind.noun}'s link "
+                    f"({kind.link_example})."
+                )
+    if _LINK_PREFIX_RE.match(lowered):
+        raise ValueError(
+            f"{field_name} {shown!r} is not a {kind.product} link or "
+            f"{kind.noun} id. Ask the user for the {kind.noun}'s own link "
+            f"({kind.link_example}), or offer to create a new {kind.noun} "
+            f"with {kind.create_tool}."
+        )
     raise ValueError(
         f"{field_name} {shown!r} is not a {kind.product} link or {kind.noun} "
         f"id. These tools open a {kind.noun} only by its link or id and "
         f"cannot search for or list {kind.noun}s by name. Ask the user to "
         f"paste the {kind.noun}'s link ({kind.link_example}), or offer to "
-        f"create a new {kind.noun} with {kind.create_tool}."
+        f"create a new {kind.noun} with {kind.create_tool}. Connecting Google "
+        f"Drive is not needed to open a {kind.noun} by its link, and with "
+        "per-file Drive access a Drive search only finds files created "
+        "through this app or granted to it."
     )
 
 
 def is_google_file_access_error(exc: BaseException) -> bool:
     """Whether ``exc`` means the file does not exist or the connected
-    account cannot open it: an HTTP 404, or a 403 whose reasons are not
-    about rate limits, quota, a disabled API or a missing OAuth scope."""
+    account cannot open or change it: an HTTP 404, or a 403 whose reasons
+    are not about rate limits, quota, a disabled API or a missing OAuth
+    scope."""
     status = google_api_error_status(exc)
     if status == 404:
         return True
     return status == 403 and not (
-        google_api_error_reasons(exc) & _NON_FILE_ACCESS_403_REASONS
+        google_api_error_reasons(exc) & GOOGLE_NON_FILE_ACCESS_403_REASONS
     )
 
 
-def google_file_error_message(exc: BaseException, kind: GoogleFileKind) -> str:
+def google_file_error_message(
+    exc: BaseException, kind: GoogleFileKind, *, editing: bool = False
+) -> str:
     """Return ``str(exc)``, or an actionable message when ``exc`` means the
     file does not exist or the connected Google account cannot open it.
 
@@ -1989,15 +2043,31 @@ def google_file_error_message(exc: BaseException, kind: GoogleFileKind) -> str:
     leaves the caller guessing whether another connection is missing. The
     actionable message names what the user can do instead, and keeps the
     API's own wording at the end for diagnosis.
+
+    Pass ``editing=True`` from a tool that changes the file. A 403 there
+    usually means the account can open the file but not edit it (view or
+    comment access only), so it is described as a refused change rather
+    than as a file that could not be opened.
     """
     if not is_google_file_access_error(exc):
         return str(exc)
+    summary = google_api_error_summary(exc)
+    if editing and google_api_error_status(exc) == 403:
+        return (
+            f"{kind.product} could not make this change: the connected Google "
+            f"account may have only view or comment access to this "
+            f"{kind.noun}, or may not be able to open it at all. Ask the user "
+            f"to check that this Google account can edit the {kind.noun} (its "
+            "owner can share it with edit access), or offer to create a new "
+            f"{kind.noun} with {kind.create_tool} instead. "
+            f"{_DRIVE_NOT_NEEDED_NOTE} Google API response: {summary}"
+        )
     return (
         f"{kind.product} could not open this {kind.noun}: it does not exist, "
         "or the connected Google account does not have the needed access to "
         "it. Ask the user to check that the link is complete and that this "
         f"Google account can open the {kind.noun} (it may need to be shared "
         f"with that account), or offer to create a new {kind.noun} with "
-        f"{kind.create_tool}. Google API response: "
-        f"{google_api_error_summary(exc)}"
+        f"{kind.create_tool}. {_DRIVE_NOT_NEEDED_NOTE} Google API response: "
+        f"{summary}"
     )

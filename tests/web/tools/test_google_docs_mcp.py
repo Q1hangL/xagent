@@ -81,7 +81,46 @@ def test_get_document_rejects_a_title_without_calling_the_api(monkeypatch):
     assert "cannot search for or list documents by name" in message
     assert "https://docs.google.com/document/d/" in message
     assert "google_docs_create_document" in message
+    assert "Connecting Google Drive is not needed" in message
     get_service.assert_not_called()
+
+
+def test_get_document_names_a_link_to_another_kind_of_google_file(monkeypatch):
+    _, get_service = _mock_docs_service(monkeypatch)
+
+    result = json.loads(
+        google_docs.google_docs_get_document(
+            "https://docs.google.com/spreadsheets/d/abc123/edit"
+        )
+    )
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert "is a Google Sheets link, not a Google Docs link" in message
+    assert "Open it with the Google Sheets tools" in message
+    assert "by name" not in message
+    get_service.assert_not_called()
+
+
+def test_get_document_decodes_a_percent_encoded_wrapped_link(monkeypatch):
+    service, _ = _mock_docs_service(monkeypatch)
+    service.documents.return_value.get.return_value.execute.return_value = {
+        "documentId": "doc123",
+        "title": "Plan",
+        "body": {"content": []},
+    }
+
+    result = json.loads(
+        google_docs.google_docs_get_document(
+            "https://www.google.com/url?q=https%3A%2F%2Fdocs.google.com%2F"
+            "document%2Fd%2Fdoc123%2Fedit&sa=D"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert service.documents.return_value.get.call_args.kwargs == {
+        "documentId": "doc123"
+    }
 
 
 def test_get_document_maps_not_found_to_an_actionable_message(monkeypatch):
@@ -95,7 +134,7 @@ def test_get_document_maps_not_found_to_an_actionable_message(monkeypatch):
     assert message.startswith("Google Docs could not open this document")
     assert "does not exist" in message
     assert "google_docs_create_document" in message
-    assert "Google Drive" not in message
+    assert "Connecting Google Drive would not change this access." in message
     assert message.endswith(
         "Google API response: HTTP 404 Requested entity was not found."
     )
@@ -177,3 +216,86 @@ def test_editing_tools_reject_a_title_without_calling_the_api(monkeypatch, call)
     assert result["status"] == "error"
     assert "is not a Google Docs link" in result["message"]
     get_service.assert_not_called()
+
+
+_VIEW_ONLY_403 = {
+    "error": {
+        "code": 403,
+        "message": "The caller does not have permission",
+        "status": "PERMISSION_DENIED",
+    }
+}
+
+
+def _assert_refused_edit(result):
+    assert result["status"] == "error"
+    message = result["message"]
+    assert message.startswith("Google Docs could not make this change")
+    assert "only view or comment access" in message
+    assert "can edit the document" in message
+    assert "could not open" not in message
+    assert "Connecting Google Drive would not change this access." in message
+    assert message.endswith(
+        "Google API response: HTTP 403 The caller does not have permission"
+    )
+
+
+def test_append_text_explains_a_refused_edit_on_a_readable_document(monkeypatch):
+    service, _ = _mock_docs_service(monkeypatch)
+    documents = service.documents.return_value
+    documents.get.return_value.execute.return_value = {
+        "documentId": "doc123",
+        "body": {"content": [{"endIndex": 5}]},
+    }
+    documents.batchUpdate.return_value.execute.side_effect = _http_error(
+        403, _VIEW_ONLY_403
+    )
+
+    result = json.loads(google_docs.google_docs_append_text("doc123", "more"))
+
+    _assert_refused_edit(result)
+    documents.batchUpdate.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: google_docs.google_docs_replace_text("doc123", "a", "b"),
+        lambda: google_docs.google_docs_batch_update(
+            "doc123", '[{"insertText": {"location": {"index": 1}, "text": "x"}}]'
+        ),
+    ],
+)
+def test_editing_tools_explain_a_refused_edit(monkeypatch, call):
+    service, _ = _mock_docs_service(monkeypatch)
+    service.documents.return_value.batchUpdate.return_value.execute.side_effect = (
+        _http_error(403, _VIEW_ONLY_403)
+    )
+
+    _assert_refused_edit(json.loads(call()))
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: google_docs.google_docs_replace_text("doc123", "a", "b"),
+        lambda: google_docs.google_docs_batch_update("doc123", "[]"),
+    ],
+)
+def test_editing_tools_map_not_found_to_an_actionable_message(monkeypatch, call):
+    service, _ = _mock_docs_service(monkeypatch)
+    service.documents.return_value.batchUpdate.return_value.execute.side_effect = (
+        _not_found()
+    )
+
+    result = json.loads(call())
+
+    assert result["message"].startswith("Google Docs could not open this document")
+
+
+async def test_get_document_description_says_drive_is_not_needed():
+    tools = {tool.name: tool for tool in await google_docs.mcp.list_tools()}
+
+    description = " ".join(tools["google_docs_get_document"].description.split())
+    assert "cannot search for or list documents by name" in description
+    assert "Connecting Google Drive is not needed" in description

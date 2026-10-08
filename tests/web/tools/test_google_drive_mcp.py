@@ -678,27 +678,36 @@ def test_search_adds_no_note_when_files_are_found(monkeypatch):
     assert "note" not in result
 
 
+# Example texts for these errors. The code keys on the status and the reason,
+# never on the message.
+_FILE_NOT_FOUND = (404, "File not found: f1.", "notFound")
+_APP_NOT_AUTHORIZED = (
+    403,
+    "The user has not granted the app 123456 read access to the file f1.",
+    "appNotAuthorizedToFile",
+)
+
+
 @pytest.mark.parametrize(
-    ("status", "reason"),
-    [(404, "notFound"), (403, "appNotAuthorizedToFile")],
+    ("status", "message", "reason"), [_FILE_NOT_FOUND, _APP_NOT_AUTHORIZED]
 )
 def test_get_file_content_explains_a_file_this_connection_cannot_see(
-    monkeypatch, status, reason
+    monkeypatch, status, message, reason
 ):
     files = Mock()
     files.get.return_value.execute.side_effect = _drive_http_error(
-        status, "File not found: f1.", reason
+        status, message, reason
     )
     _mock_drive_service_with_files(monkeypatch, files)
 
     result = json.loads(google_drive.google_drive_get_file_content("f1"))
 
     assert result["status"] == "error"
-    message = result["message"]
-    assert message.startswith("Google Drive could not open this file")
-    assert "per-file Drive access" in message
-    assert "ask the user for its link" in message
-    assert message.endswith(f"Google API response: HTTP {status} File not found: f1.")
+    text = result["message"]
+    assert text.startswith("Google Drive could not open this file")
+    assert "per-file Drive access" in text
+    assert "ask the user for its link" in text
+    assert text.endswith(f"Google API response: HTTP {status} {message}")
 
 
 def test_get_file_content_keeps_raw_error_for_other_403(monkeypatch):

@@ -82,11 +82,11 @@ def _resolve_document_id(document_id: str) -> str:
     )
 
 
-def _document_error(exc: Exception) -> str:
+def _document_error(exc: Exception, *, editing: bool = False) -> str:
     return json.dumps(
         {
             "status": "error",
-            "message": google_file_error_message(exc, _DOCUMENT_KIND),
+            "message": google_file_error_message(exc, _DOCUMENT_KIND, editing=editing),
         }
     )
 
@@ -241,7 +241,7 @@ def google_docs_append_text(document_id: str, text: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error appending text: {e}")
-        return _document_error(e)
+        return _document_error(e, editing=True)
 
 
 @mcp.tool()
@@ -288,7 +288,7 @@ def google_docs_replace_text(
         )
     except Exception as e:
         logger.error(f"Error replacing text: {e}")
-        return _document_error(e)
+        return _document_error(e, editing=True)
 
 
 @mcp.tool()
@@ -321,7 +321,7 @@ def google_docs_batch_update(document_id: str, requests_json: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error applying batch update: {e}")
-        return _document_error(e)
+        return _document_error(e, editing=True)
 
 
 if __name__ == "__main__":
