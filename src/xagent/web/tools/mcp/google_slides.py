@@ -595,8 +595,11 @@ def google_slides_get_presentation(presentation_id: str) -> str:
     Returns the title and the text content of each slide.
 
     Presentations are opened only by link or id; this connector cannot
-    search for or list presentations by name. When the user names a
-    presentation without giving its link, ask them to paste the link
+    search for or list presentations by name. When the user names a presentation
+    without giving its link, use google_drive_search to find its id if
+    that tool is available (with per-file Drive access it only finds
+    files created through this app or granted to it); otherwise, or if
+    it finds nothing, ask the user to paste the link
     (https://docs.google.com/presentation/d/...). Connecting Google Drive is
     not needed to open a presentation by its link.
     """

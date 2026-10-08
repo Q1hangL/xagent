@@ -135,11 +135,14 @@ def google_docs_get_document(document_id: str) -> str:
     Read a Google Doc by document id or full document URL.
     Returns the title and the document text with headings rendered as Markdown.
 
-    Documents are opened only by link or id; this connector cannot search
-    for or list documents by name. When the user names a document without
-    giving its link, ask them to paste the link
-    (https://docs.google.com/document/d/...). Connecting Google Drive is not
-    needed to open a document by its link.
+    Documents are opened only by link or id; this connector cannot
+    search for or list documents by name. When the user names a document
+    without giving its link, use google_drive_search to find its id if
+    that tool is available (with per-file Drive access it only finds
+    files created through this app or granted to it); otherwise, or if
+    it finds nothing, ask the user to paste the link
+    (https://docs.google.com/document/d/...). Connecting Google Drive is
+    not needed to open a document by its link.
     """
     try:
         doc_id = _resolve_document_id(document_id)

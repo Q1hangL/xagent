@@ -2430,4 +2430,5 @@ def test_resolve_google_file_id_only_mentions_name_search_for_a_non_link(
     message = str(excinfo.value)
     assert "https://docs.google.com/document/d/..." in message
     assert ("cannot search for or list documents by name" in message) is by_name
+    assert ("If google_drive_search is available" in message) is by_name
     assert ("Connecting Google Drive is not needed" in message) is by_name

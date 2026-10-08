@@ -91,9 +91,12 @@ def google_sheets_get_spreadsheet(spreadsheet_id: str) -> str:
     Get metadata for a Google Sheets spreadsheet by id or full URL: its title
     and the list of sheets (tabs) with their sheet_id, title, and grid size.
 
-    Spreadsheets are opened only by link or id; this connector cannot search
-    for or list spreadsheets by name. When the user names a spreadsheet
-    without giving its link, ask them to paste the link
+    Spreadsheets are opened only by link or id; this connector cannot
+    search for or list spreadsheets by name. When the user names a spreadsheet
+    without giving its link, use google_drive_search to find its id if
+    that tool is available (with per-file Drive access it only finds
+    files created through this app or granted to it); otherwise, or if
+    it finds nothing, ask the user to paste the link
     (https://docs.google.com/spreadsheets/d/...). Connecting Google Drive is
     not needed to open a spreadsheet by its link.
     """

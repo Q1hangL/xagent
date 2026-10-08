@@ -79,6 +79,10 @@ def test_get_document_rejects_a_title_without_calling_the_api(monkeypatch):
     message = result["message"]
     assert "'Q3 planning notes' is not a Google Docs link" in message
     assert "cannot search for or list documents by name" in message
+    assert "If google_drive_search is available, use it to find the document's id" in (
+        message
+    )
+    assert "otherwise, or if it finds nothing, ask the user to paste" in message
     assert "https://docs.google.com/document/d/" in message
     assert "google_docs_create_document" in message
     assert "Connecting Google Drive is not needed" in message
@@ -180,7 +184,8 @@ def test_get_document_not_found_for_a_one_word_title_says_names_are_not_searched
     message = result["message"]
     assert message.startswith("Google Docs could not open this document")
     assert "cannot search for or list documents by name" in message
-    assert "if this value is the document's name rather than its id" in message
+    assert "If this value is the document's name rather than its id" in message
+    assert "If google_drive_search is available" in message
     assert "https://docs.google.com/document/d/..." in message
 
 
@@ -343,3 +348,10 @@ async def test_get_document_description_says_drive_is_not_needed():
     description = " ".join(tools["google_docs_get_document"].description.split())
     assert "cannot search for or list documents by name" in description
     assert "Connecting Google Drive is not needed" in description
+    assert (
+        "use google_drive_search to find its id if that tool is available"
+        in description
+    )
+    assert "otherwise, or if it finds nothing, ask the user to paste the link" in (
+        description
+    )

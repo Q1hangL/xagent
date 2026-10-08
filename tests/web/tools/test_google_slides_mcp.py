@@ -2696,6 +2696,13 @@ async def test_get_presentation_description_says_drive_is_not_needed():
     description = " ".join(tools["google_slides_get_presentation"].description.split())
     assert "cannot search for or list presentations by name" in description
     assert "Connecting Google Drive is not needed" in description
+    assert (
+        "use google_drive_search to find its id if that tool is available"
+        in description
+    )
+    assert "otherwise, or if it finds nothing, ask the user to paste the link" in (
+        description
+    )
 
 
 def test_get_presentation_rejects_a_title_without_calling_the_api(monkeypatch):

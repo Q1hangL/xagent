@@ -1986,6 +1986,19 @@ class GoogleFileKind:
     create_tool: str
 
 
+def _find_by_name_hint(kind: GoogleFileKind) -> str:
+    # The Drive connector may or may not be connected next to this one, so
+    # the search is offered only "if available", and connecting it is never
+    # suggested: opening a file by its link does not need it.
+    return (
+        f"If google_drive_search is available, use it to find the "
+        f"{kind.noun}'s id by name (with per-file Drive access it only finds "
+        "files created through this app or granted to it); otherwise, or if "
+        f"it finds nothing, ask the user to paste the {kind.noun}'s link "
+        f"({kind.link_example})"
+    )
+
+
 def _shown_input(value: str) -> str:
     if len(value) > _MAX_SHOWN_INPUT_LENGTH:
         return value[: _MAX_SHOWN_INPUT_LENGTH - 3] + "..."
@@ -2042,12 +2055,10 @@ def resolve_google_file_id(
     raise ValueError(
         f"{field_name} {shown!r} is not a {kind.product} link or {kind.noun} "
         f"id. These tools open a {kind.noun} only by its link or id and "
-        f"cannot search for or list {kind.noun}s by name. Ask the user to "
-        f"paste the {kind.noun}'s link ({kind.link_example}), or offer to "
-        f"create a new {kind.noun} with {kind.create_tool}. Connecting Google "
-        f"Drive is not needed to open a {kind.noun} by its link, and with "
-        "per-file Drive access a Drive search only finds files created "
-        "through this app or granted to it."
+        f"cannot search for or list {kind.noun}s by name. "
+        f"{_find_by_name_hint(kind)}, or offer to create a new {kind.noun} "
+        f"with {kind.create_tool}. Connecting Google Drive is not needed to "
+        f"open a {kind.noun} by its link."
     )
 
 
@@ -2122,9 +2133,9 @@ def google_file_error_message(
     if status == 404:
         name_hint = (
             f"These tools open a {kind.noun} only by its link or id and cannot "
-            f"search for or list {kind.noun}s by name, so if this value is the "
-            f"{kind.noun}'s name rather than its id, ask the user to paste its "
-            f"link ({kind.link_example}). "
+            f"search for or list {kind.noun}s by name. If this value is the "
+            f"{kind.noun}'s name rather than its id: "
+            f"{_find_by_name_hint(kind)}. "
         )
         ask = "Otherwise, ask"
     return (
