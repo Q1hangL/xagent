@@ -1920,6 +1920,18 @@ def _default_page_with_empty_placeholders():
     }
 
 
+def _titled_default_page(title):
+    """The default page after google_slides_create_presentation wrote the deck
+    title into its CENTERED_TITLE placeholder."""
+    return {
+        "objectId": "p",
+        "pageElements": [
+            _placeholder_element("p_title", "CENTERED_TITLE", f"{title}\n"),
+            _placeholder_element("p_subtitle", "SUBTITLE"),
+        ],
+    }
+
+
 def test_outline_deck_maps_cover_and_body_placeholders_and_replaces_default_page(
     monkeypatch,
 ):
@@ -1939,15 +1951,21 @@ def test_outline_deck_maps_cover_and_body_placeholders_and_replaces_default_page
     created = json.loads(google_slides.google_slides_create_presentation("Q3 Review"))
 
     assert created["default_slide_id"] == "p"
+    assert _batch_update_requests(presentations) == [
+        {"insertText": {"objectId": "p_title", "text": "Q3 Review"}}
+    ]
     next_step = created["next_step"]
     assert next_step.startswith("When you add slides to this presentation")
     assert "default_slide_id='p'" in next_step
+    assert "already shows the deck title" in next_step
     assert "Unless the user asked for a different first slide" in next_step
     assert "layout='TITLE'" in next_step
+    assert "do not add a second cover" in next_step
 
     google_slides._CREATED_DEFAULT_SLIDES.clear()
     presentations.get.return_value.execute.return_value = {
-        "slides": [_default_page_with_empty_placeholders()]
+        "title": "Q3 Review",
+        "slides": [_titled_default_page("Q3 Review")],
     }
     cover = json.loads(
         google_slides.google_slides_add_slide(
@@ -2024,6 +2042,154 @@ def test_outline_deck_maps_cover_and_body_placeholders_and_replaces_default_page
             }
         },
     ]
+
+
+def test_create_presentation_writes_the_deck_title_into_the_default_page(
+    monkeypatch,
+):
+    presentations = Mock()
+    presentations.create.return_value.execute.return_value = {
+        "presentationId": "pres1",
+        "title": "Q3\nReview ",
+        "slides": [_default_page_with_empty_placeholders()],
+    }
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(google_slides.google_slides_create_presentation("Q3 Review"))
+
+    assert result["status"] == "success"
+    assert result["default_slide_id"] == "p"
+    presentations.batchUpdate.assert_called_once()
+    assert presentations.batchUpdate.call_args.kwargs["presentationId"] == "pres1"
+    assert _batch_update_requests(presentations) == [
+        {"insertText": {"objectId": "p_title", "text": "Q3 Review"}}
+    ]
+    assert google_slides._CREATED_DEFAULT_SLIDES == {"pres1": "p"}
+
+
+def test_create_presentation_still_succeeds_when_the_title_write_fails(monkeypatch):
+    presentations = Mock()
+    presentations.create.return_value.execute.return_value = {
+        "presentationId": "pres1",
+        "title": "Q3 Review",
+        "slides": [_default_page_with_empty_placeholders()],
+    }
+    presentations.batchUpdate.return_value.execute.side_effect = RuntimeError("boom")
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(google_slides.google_slides_create_presentation("Q3 Review"))
+
+    assert result["status"] == "success"
+    assert result["default_slide_id"] == "p"
+    assert "already shows the deck title" not in result["next_step"]
+    assert "can remain as an empty first slide" in result["next_step"]
+
+
+@pytest.mark.parametrize("pass_id", [True, False], ids=["explicit-id", "tracked-id"])
+def test_add_slide_replaces_the_titled_default_page_for_a_different_first_slide(
+    monkeypatch, pass_id
+):
+    """The user asked for an agenda as the first slide: the default page that
+    create titled is still replaced in the same batch, so no stray title page
+    is left in front of it."""
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "title": "Q3 Review",
+        "slides": [_titled_default_page("Q3 Review")],
+    }
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+    if not pass_id:
+        google_slides._CREATED_DEFAULT_SLIDES["pres1"] = "p"
+
+    result = json.loads(
+        google_slides.google_slides_add_slide(
+            "pres1",
+            title="Agenda",
+            body="Results\nPlans",
+            default_slide_id="p" if pass_id else "",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["default_slide_removed"] is True
+    requests = _batch_update_requests(presentations)
+    assert "createSlide" in requests[0]
+    assert requests[-1] == {"deleteObject": {"objectId": "p"}}
+    assert "pres1" not in google_slides._CREATED_DEFAULT_SLIDES
+
+
+def test_add_slide_without_id_keeps_the_titled_default_page_as_the_cover(
+    monkeypatch,
+):
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "title": "Q3 Review",
+        "slides": [_titled_default_page("Q3 Review")],
+    }
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide("pres1", title="Highlights", body="Up")
+    )
+
+    assert result["status"] == "success"
+    assert result["default_slide_removed"] is False
+    assert not any(
+        "deleteObject" in request for request in _batch_update_requests(presentations)
+    )
+
+
+@pytest.mark.parametrize(
+    "elements",
+    [
+        pytest.param(
+            [
+                _placeholder_element("p_title", "CENTERED_TITLE", "Another title"),
+                _placeholder_element("p_subtitle", "SUBTITLE"),
+            ],
+            id="title-changed",
+        ),
+        pytest.param(
+            [
+                _placeholder_element("p_title", "CENTERED_TITLE", "Q3 Review"),
+                _placeholder_element("p_subtitle", "SUBTITLE", "Added by the user"),
+            ],
+            id="subtitle-added",
+        ),
+        pytest.param(
+            [
+                _placeholder_element("p_title", "CENTERED_TITLE", "Q3 Review"),
+                {"objectId": "img", "image": {}},
+            ],
+            id="image-added",
+        ),
+    ],
+)
+def test_add_slide_keeps_a_default_page_that_was_edited_after_create(
+    monkeypatch, elements
+):
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "title": "Q3 Review",
+        "slides": [{"objectId": "p", "pageElements": elements}],
+    }
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide(
+            "pres1", title="Highlights", body="Up", default_slide_id="p"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["default_slide_removed"] is False
+    assert not any(
+        "deleteObject" in request for request in _batch_update_requests(presentations)
+    )
 
 
 async def test_first_slide_steering_defers_to_the_users_own_first_slide():

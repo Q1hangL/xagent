@@ -37,8 +37,10 @@ when there is no default page to replace), pass it to the first
 `google_slides_add_slide` call. Unless the user specified a different first
 slide, make that first slide the cover (`layout="TITLE"` with the deck title).
 Calls may run in separate MCP processes; without the id the connector only
-removes a sole page that has no elements at all, so a default page with empty
-placeholders would remain as a blank first slide. An empty page in a
+removes a sole page that has no elements at all, so a default page with
+placeholders stays as the first slide. `google_slides_create_presentation`
+writes the deck title into that page when it can, so it then reads as a
+title-only cover: do not add a second cover in that case. An empty page in a
 multi-page deck is preserved. Pass `preserve_blank_slide=true` when that sole
 page is intentional.
 `google_slides_add_slide` only supports layouts with title/body placeholders;
