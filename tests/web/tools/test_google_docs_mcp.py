@@ -140,6 +140,23 @@ def test_get_document_maps_not_found_to_an_actionable_message(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("title", ["budget", "Q3-report"])
+def test_get_document_not_found_for_a_one_word_title_says_names_are_not_searched(
+    monkeypatch, title
+):
+    service, _ = _mock_docs_service(monkeypatch)
+    service.documents.return_value.get.return_value.execute.side_effect = _not_found()
+
+    result = json.loads(google_docs.google_docs_get_document(title))
+
+    assert service.documents.return_value.get.call_args.kwargs == {"documentId": title}
+    message = result["message"]
+    assert message.startswith("Google Docs could not open this document")
+    assert "cannot search for or list documents by name" in message
+    assert "if this value is the document's name rather than its id" in message
+    assert "https://docs.google.com/document/d/..." in message
+
+
 def test_get_document_maps_permission_denied_to_an_actionable_message(monkeypatch):
     service, _ = _mock_docs_service(monkeypatch)
     service.documents.return_value.get.return_value.execute.side_effect = _http_error(

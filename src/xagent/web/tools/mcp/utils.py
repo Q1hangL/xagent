@@ -2052,7 +2052,8 @@ def google_file_error_message(
     if not is_google_file_access_error(exc):
         return str(exc)
     summary = google_api_error_summary(exc)
-    if editing and google_api_error_status(exc) == 403:
+    status = google_api_error_status(exc)
+    if editing and status == 403:
         return (
             f"{kind.product} could not make this change: the connected Google "
             f"account may have only view or comment access to this "
@@ -2062,12 +2063,24 @@ def google_file_error_message(
             f"{kind.noun} with {kind.create_tool} instead. "
             f"{_DRIVE_NOT_NEEDED_NOTE} Google API response: {summary}"
         )
+    # A one-word title ("budget", "Q3-report") looks like an id, so it gets
+    # past resolve_google_file_id and only fails here, as a 404.
+    name_hint = ""
+    ask = "Ask"
+    if status == 404:
+        name_hint = (
+            f"These tools open a {kind.noun} only by its link or id and cannot "
+            f"search for or list {kind.noun}s by name, so if this value is the "
+            f"{kind.noun}'s name rather than its id, ask the user to paste its "
+            f"link ({kind.link_example}). "
+        )
+        ask = "Otherwise, ask"
     return (
         f"{kind.product} could not open this {kind.noun}: it does not exist, "
         "or the connected Google account does not have the needed access to "
-        "it. Ask the user to check that the link is complete and that this "
-        f"Google account can open the {kind.noun} (it may need to be shared "
-        f"with that account), or offer to create a new {kind.noun} with "
+        f"it. {name_hint}{ask} the user to check that the link is complete and "
+        f"that this Google account can open the {kind.noun} (it may need to be "
+        f"shared with that account), or offer to create a new {kind.noun} with "
         f"{kind.create_tool}. {_DRIVE_NOT_NEEDED_NOTE} Google API response: "
         f"{summary}"
     )

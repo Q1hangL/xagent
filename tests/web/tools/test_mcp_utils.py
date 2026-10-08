@@ -2265,6 +2265,25 @@ def test_google_file_error_message_describes_a_refused_edit():
         assert "Connecting Google Drive would not change this access." in message
 
 
+def test_google_file_error_message_says_names_are_not_searched_only_for_404():
+    not_found = _google_http_error(404, b'{"error": {"message": "Not found."}}')
+    denied = _google_http_error(
+        403, b'{"error": {"message": "The caller does not have permission"}}'
+    )
+
+    for editing in (False, True):
+        message = utils.google_file_error_message(
+            not_found, _TEST_FILE_KIND, editing=editing
+        )
+        assert "cannot search for or list documents by name" in message
+        assert "Otherwise, ask the user to check that the link is complete" in message
+    for editing in (False, True):
+        message = utils.google_file_error_message(
+            denied, _TEST_FILE_KIND, editing=editing
+        )
+        assert "by name" not in message
+
+
 @pytest.mark.parametrize(
     ("value", "product"),
     [
