@@ -1962,6 +1962,16 @@ _GOOGLE_EDITOR_LINK_PRODUCTS = (
     ("/presentation/", "Google Slides"),
 )
 
+# A Drive link to a file ("drive.google.com/file/d/<id>/view" or
+# "drive.google.com/open?id=<id>") carries the same id that the Docs, Sheets
+# and Slides APIs take. Matched after "//" or at the start, so a wrapped
+# redirect link still matches once decoded.
+_DRIVE_FILE_LINK_RE = re.compile(
+    r"(?:^|//)drive\.google\.com/(?:file/(?:u/\d+/)?d/(?!e/)([a-zA-Z0-9_-]+)"
+    r"|open\?(?:[^#\s]*&)?id=([a-zA-Z0-9_-]+))",
+    re.IGNORECASE,
+)
+
 # A published-to-the-web link (".../d/e/<publish-id>/pub") carries a publish
 # token in place of the file id.
 _PUBLISHED_LINK_RE = re.compile(r"/d/e/")
@@ -2017,7 +2027,9 @@ def resolve_google_file_id(
     to get a usable link instead, without spending an API call. A
     percent-encoded link (for example one wrapped by a redirect URL) is
     decoded once before giving up, and a link to another kind of Google file
-    is named as such.
+    is named as such. A Drive link to the file (``drive.google.com/file/d/``
+    or ``drive.google.com/open?id=``) is accepted too, since it carries the
+    same id; if it points to another kind of file, the API call fails.
     """
     resolved = resolve_id_from_url(value, pattern, field_name)
     if _GOOGLE_FILE_ID_RE.fullmatch(resolved):
@@ -2027,6 +2039,9 @@ def resolve_google_file_id(
         match = pattern.search(decoded)
         if match:
             return match.group(1)
+    drive_match = _DRIVE_FILE_LINK_RE.search(decoded)
+    if drive_match:
+        return drive_match.group(1) or drive_match.group(2)
     shown = _shown_input(resolved)
     lowered = decoded.lower()
     if "docs.google.com" in lowered and _PUBLISHED_LINK_RE.search(lowered):
