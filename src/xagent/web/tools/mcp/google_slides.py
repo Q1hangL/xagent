@@ -635,7 +635,11 @@ def google_slides_create_presentation(title: str) -> str:
     until the first content slide is created: google_slides_add_slide removes
     it in the same batchUpdate after creating the real slide, so the API never
     has to delete the only page from the presentation. The response reports
-    the default slide id so callers can diagnose the initial state.
+    that page as default_slide_id; pass it to the first
+    google_slides_add_slide call, because each call may run in a separate
+    process that cannot recognize the default page on its own. Make that
+    first slide the deck's cover: layout="TITLE" with the deck title (and an
+    optional subtitle in body). The response's next_step repeats this.
     """
     try:
         service = get_slides_service()
@@ -662,17 +666,24 @@ def google_slides_create_presentation(title: str) -> str:
                 )
             _record_created_default_slide(pres_id, default_slide_id)
 
-        return json.dumps(
-            {
-                "status": "success",
-                "presentation_id": pres_id,
-                "title": presentation.get("title"),
-                "link": f"https://docs.google.com/presentation/d/{pres_id}/edit",
-                "slide_count": len(slides),
-                "default_slide_id": default_slide_id,
-            },
-            ensure_ascii=False,
-        )
+        response: dict[str, Any] = {
+            "status": "success",
+            "presentation_id": pres_id,
+            "title": presentation.get("title"),
+            "link": f"https://docs.google.com/presentation/d/{pres_id}/edit",
+            "slide_count": len(slides),
+            "default_slide_id": default_slide_id,
+        }
+        if default_slide_id:
+            response["next_step"] = (
+                "Add the cover next: call google_slides_add_slide with "
+                f"presentation_id={pres_id!r}, layout='TITLE', the deck title "
+                "as title, an optional subtitle as body, and "
+                f"default_slide_id={default_slide_id!r}. The id lets that call "
+                "replace Google's blank default page; without it the page can "
+                "remain as an empty first slide."
+            )
+        return json.dumps(response, ensure_ascii=False)
     except Exception as e:
         logger.error(f"Error creating presentation: {e}")
         return _error(str(e))
@@ -890,11 +901,15 @@ def google_slides_add_slide(
     non-standard theme.
 
     When the presentation was created with google_slides_create_presentation,
-    pass its returned default_slide_id when this call may run in another MCP
-    process. The known default page is removed even if other pages were added
-    before this call. Without an id, cleanup is limited to a presentation with
-    exactly one empty page; an empty page in a multi-page deck is preserved.
+    always pass its returned default_slide_id on the first call: each call may
+    run in a separate MCP process, and with the id the default page is removed
+    in the same batch, even if other pages were added before this call.
+    Without an id, only a sole page with no elements at all is removed, so a
+    default page that still has empty title/subtitle placeholders stays as a
+    blank first slide; an empty page in a multi-page deck is preserved.
     Set preserve_blank_slide=True when that sole empty page is intentional.
+    Make the first slide of a new deck its cover: layout="TITLE" with the deck
+    title as title and an optional subtitle as body.
 
     To fix a slide this call already created (wrong/missing text), use
     google_slides_update_slide with its slide_id — do NOT call

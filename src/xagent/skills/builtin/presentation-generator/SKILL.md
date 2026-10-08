@@ -31,11 +31,14 @@ Do not build a new outlined deck with repeated `google_slides_create_presentatio
 and `google_slides_add_slide` calls. Those tools are for explicitly requested
 simple text/layout edits and do not preserve visual design.
 
-For simple Google Slides layout edits, pass the `default_slide_id` returned by
-`google_slides_create_presentation` to the first `google_slides_add_slide` call
-when calls may cross MCP processes. Without the id, the connector removes the
-sole empty page as the default page; an empty page in a multi-page deck is
-preserved. Pass `preserve_blank_slide=true` when that sole page is intentional.
+For simple Google Slides layout edits, always pass the `default_slide_id`
+returned by `google_slides_create_presentation` to the first
+`google_slides_add_slide` call, and make that first slide the cover
+(`layout="TITLE"` with the deck title). Calls may run in separate MCP
+processes; without the id the connector only removes a sole page that has no
+elements at all, so a default page with empty placeholders would remain as a
+blank first slide. An empty page in a multi-page deck is preserved. Pass
+`preserve_blank_slide=true` when that sole page is intentional.
 `google_slides_add_slide` only supports layouts with title/body placeholders;
 use `google_slides_batch_update` directly for blank/custom slides.
 

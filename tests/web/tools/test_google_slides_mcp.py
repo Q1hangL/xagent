@@ -1908,6 +1908,143 @@ def test_add_slide_preserve_blank_slide_does_not_delete_it_on_next_call(monkeypa
     )
 
 
+def _default_page_with_empty_placeholders():
+    """A new presentation's first page as the Slides editor shows it: a
+    CENTERED_TITLE and a SUBTITLE placeholder, both still empty."""
+    return {
+        "objectId": "p",
+        "pageElements": [
+            _placeholder_element("p_title", "CENTERED_TITLE"),
+            _placeholder_element("p_subtitle", "SUBTITLE"),
+        ],
+    }
+
+
+def test_outline_deck_maps_cover_and_body_placeholders_and_replaces_default_page(
+    monkeypatch,
+):
+    """Create a deck from an outline the way the tool descriptions steer a
+    caller: create, then a TITLE cover that passes default_slide_id, then a
+    TITLE_AND_BODY slide with nested bullets. Each call is treated as its own
+    MCP process, so nothing is remembered between them."""
+    presentations = Mock()
+    presentations.create.return_value.execute.return_value = {
+        "presentationId": "pres1",
+        "title": "Q3 Review",
+        "slides": [_default_page_with_empty_placeholders()],
+    }
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    created = json.loads(google_slides.google_slides_create_presentation("Q3 Review"))
+
+    assert created["default_slide_id"] == "p"
+    assert "default_slide_id='p'" in created["next_step"]
+    assert "layout='TITLE'" in created["next_step"]
+
+    google_slides._CREATED_DEFAULT_SLIDES.clear()
+    presentations.get.return_value.execute.return_value = {
+        "slides": [_default_page_with_empty_placeholders()]
+    }
+    cover = json.loads(
+        google_slides.google_slides_add_slide(
+            "pres1",
+            title="Q3 Review",
+            body="Prepared for the leadership team",
+            layout="TITLE",
+            default_slide_id=created["default_slide_id"],
+        )
+    )
+
+    assert cover["status"] == "success"
+    assert cover["default_slide_removed"] is True
+    cover_requests = _batch_update_requests(presentations)
+    create_cover = cover_requests[0]["createSlide"]
+    assert create_cover["slideLayoutReference"] == {"predefinedLayout": "TITLE"}
+    cover_title_id = _placeholder_object_id(create_cover, "CENTERED_TITLE")
+    cover_subtitle_id = _placeholder_object_id(create_cover, "SUBTITLE")
+    assert cover_requests[1:] == [
+        {"insertText": {"objectId": cover_title_id, "text": "Q3 Review"}},
+        {
+            "insertText": {
+                "objectId": cover_subtitle_id,
+                "text": "Prepared for the leadership team",
+            }
+        },
+        {"deleteObject": {"objectId": "p"}},
+    ]
+
+    google_slides._CREATED_DEFAULT_SLIDES.clear()
+    presentations.get.return_value.execute.return_value = {
+        "slides": [
+            {
+                "objectId": cover["slide_id"],
+                "pageElements": [
+                    _placeholder_element(cover_title_id, "CENTERED_TITLE", "Q3 Review"),
+                    _placeholder_element(
+                        cover_subtitle_id,
+                        "SUBTITLE",
+                        "Prepared for the leadership team",
+                    ),
+                ],
+            }
+        ]
+    }
+    body_slide = json.loads(
+        google_slides.google_slides_add_slide(
+            "pres1",
+            title="Highlights",
+            body="- Revenue up 12%\n  - Driven by renewals\n- Two new regions",
+        )
+    )
+
+    assert body_slide["status"] == "success"
+    assert body_slide["default_slide_removed"] is False
+    body_requests = _batch_update_requests(presentations)
+    create_body = body_requests[0]["createSlide"]
+    assert create_body["slideLayoutReference"] == {"predefinedLayout": "TITLE_AND_BODY"}
+    title_id = _placeholder_object_id(create_body, "TITLE")
+    body_id = _placeholder_object_id(create_body, "BODY")
+    assert body_requests[1:] == [
+        {"insertText": {"objectId": title_id, "text": "Highlights"}},
+        {
+            "insertText": {
+                "objectId": body_id,
+                "text": "Revenue up 12%\n\tDriven by renewals\nTwo new regions",
+            }
+        },
+        {
+            "createParagraphBullets": {
+                "objectId": body_id,
+                "textRange": {"type": "ALL"},
+                "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE",
+            }
+        },
+    ]
+
+
+def test_create_presentation_omits_next_step_without_a_default_page(monkeypatch):
+    presentations = Mock()
+    presentations.create.return_value.execute.return_value = {
+        "presentationId": "pres1",
+        "title": "New Deck",
+        "slides": [
+            {
+                "objectId": "p",
+                "pageElements": [
+                    _placeholder_element("p_title", "CENTERED_TITLE", "Existing")
+                ],
+            }
+        ],
+    }
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(google_slides.google_slides_create_presentation("New Deck"))
+
+    assert result["default_slide_id"] is None
+    assert "next_step" not in result
+
+
 def test_import_pptx_converts_and_verifies_native_google_slides(monkeypatch, tmp_path):
     pptx_path = tmp_path / "designed-deck.pptx"
     pptx_path.write_bytes(b"pptx-bytes")
