@@ -13,6 +13,7 @@ from typing import Any, Dict, List
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ..builtin_identity import builtin_provenance_identity
 from ..config import (
     get_google_restricted_scopes,
     get_hubspot_mcp_client_id,
@@ -547,6 +548,39 @@ def _adopt_builtin_auth(server: Any, app_info: Mapping[str, Any]) -> None:
         server.auth = expected
 
 
+def _builtin_auth_is_canonical(auth: Any, app_info: Mapping[str, Any]) -> bool:
+    """Whether stored auth holds only this builtin app's identity metadata.
+
+    A row created by the regular catalog OAuth callback also carries the
+    catalog's builtin ownership marker (see ``_ensure_user_mcp_server``), which
+    seed migrations read to recognize the row as the official one. The marker
+    is identity metadata, never execution data, so it is accepted only when the
+    catalog app declares its own marker, both name this exact builtin app, and
+    the stored marker adds no keys the catalog marker does not have.
+    """
+    if not isinstance(auth, Mapping):
+        return False
+    identity_fields = dict(auth)
+    if "builtin_provenance" in identity_fields:
+        stored_marker = identity_fields.pop("builtin_provenance")
+        launch_config = app_info.get("launch_config")
+        catalog_marker = (
+            launch_config.get("builtin_provenance")
+            if isinstance(launch_config, Mapping)
+            else None
+        )
+        if not isinstance(stored_marker, dict) or not isinstance(catalog_marker, dict):
+            return False
+        if set(stored_marker) - set(catalog_marker):
+            return False
+        stored_identity = builtin_provenance_identity(stored_marker)
+        if stored_identity != ("xagent", str(app_info["id"])):
+            return False
+        if stored_identity != builtin_provenance_identity(catalog_marker):
+            return False
+    return identity_fields == _expected_builtin_auth(app_info)
+
+
 def _validate_canonical_builtin_oauth_server(
     server: Any, app_info: Mapping[str, Any]
 ) -> None:
@@ -574,8 +608,7 @@ def _validate_canonical_builtin_oauth_server(
     if getattr(server, "restart_policy", None) not in (None, "no"):
         failures.append("restart_policy")
 
-    auth = getattr(server, "auth", None)
-    if not isinstance(auth, Mapping) or dict(auth) != _expected_builtin_auth(app_info):
+    if not _builtin_auth_is_canonical(getattr(server, "auth", None), app_info):
         failures.append("auth")
 
     if failures:

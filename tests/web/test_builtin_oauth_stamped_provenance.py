@@ -1,0 +1,296 @@
+"""Builtin OAuth rows created by the catalog callback stay canonical.
+
+The regular catalog OAuth callback (``_ensure_user_mcp_server``) creates the
+shared ``MCPServer`` row with the catalog's ``builtin_provenance`` marker in
+``auth`` so seed migrations can recognize it as the official row. The trusted
+actor paths validate the same row with ``_validate_canonical_builtin_oauth_server``
+and must accept that marker, otherwise every actor connect for the app fails
+whenever a regular user happened to create the row first. The marker is
+accepted only when it names the app's own builtin identity.
+"""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from typing import Any
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+
+from xagent.web import mcp_apps
+from xagent.web.api.auth import (
+    _ensure_user_mcp_server,
+    _require_actor_oauth_personal_link,
+)
+from xagent.web.builtin_mcp_registry import seed_builtin_oauth_and_public_mcp_apps
+from xagent.web.models.database import Base
+from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.user import User
+
+# Builtin OAuth apps whose catalog rows declare a builtin_provenance marker,
+# mapped to their OAuth provider.
+STAMPED_BUILTIN_OAUTH_APPS = {
+    "word": "microsoft",
+    "excel": "microsoft",
+    "powerpoint": "microsoft",
+    "planner": "microsoft",
+    "sharepoint": "microsoft",
+    "whatsapp": "meta",
+}
+
+
+@pytest.fixture
+def seeded_db(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'stamped-provenance.db'}")
+    Base.metadata.create_all(engine)
+    with engine.begin() as connection:
+        seed_builtin_oauth_and_public_mcp_apps(connection)
+    factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    with factory() as db:
+        web_user = User(username="web-user", password_hash="hash")
+        account = User(username="workspace-account", password_hash="hash")
+        db.add_all([web_user, account])
+        db.commit()
+        db.refresh(web_user)
+        db.refresh(account)
+        yield db, web_user, account
+    engine.dispose()
+
+
+def _catalog_app(db: Session, app_id: str) -> dict[str, Any]:
+    app_info = mcp_apps.get_app_by_id(db, app_id)
+    assert app_info is not None
+    return app_info
+
+
+def _connect_from_catalog(db: Session, user: User, app_id: str) -> MCPServer:
+    """Create the shared row the way the regular catalog OAuth callback does."""
+    app_info = _catalog_app(db, app_id)
+    _ensure_user_mcp_server(db, int(user.id), app_info)
+    db.commit()
+    return db.query(MCPServer).filter(MCPServer.name == app_info["name"]).one()
+
+
+def _catalog_marker(db: Session, app_id: str) -> dict[str, Any]:
+    marker = _catalog_app(db, app_id)["launch_config"]["builtin_provenance"]
+    assert isinstance(marker, dict)
+    return dict(marker)
+
+
+def _set_auth(db: Session, server: MCPServer, auth: Any) -> None:
+    server.auth = deepcopy(auth)
+    db.commit()
+    db.refresh(server)
+
+
+@pytest.mark.parametrize("app_id", sorted(STAMPED_BUILTIN_OAUTH_APPS))
+def test_actor_paths_accept_row_created_by_catalog_callback(seeded_db, app_id) -> None:
+    db, web_user, account = seeded_db
+    provider = STAMPED_BUILTIN_OAUTH_APPS[app_id]
+    server = _connect_from_catalog(db, web_user, app_id)
+    stored_auth = deepcopy(server.auth)
+    assert stored_auth == {
+        "app_id": app_id,
+        "provider": provider,
+        "builtin_provenance": _catalog_marker(db, app_id),
+    }
+
+    ensured = mcp_apps.ensure_builtin_oauth_server_visibility_for_user(
+        db, user_id=int(account.id), app_id=app_id
+    )
+    db.commit()
+    required = mcp_apps.require_builtin_oauth_server_definition(
+        db, app_id=app_id, provider=provider
+    )
+    classified = mcp_apps.classify_actor_builtin_oauth_server(db, server)
+    _require_actor_oauth_personal_link(
+        db, user_id=int(account.id), provider=provider, app_id=app_id
+    )
+
+    assert ensured.id == server.id
+    assert required.id == server.id
+    assert classified is not None and classified["id"] == app_id
+    db.refresh(server)
+    assert server.auth == stored_auth
+    assert db.query(MCPServer).count() == 1
+    links = db.query(UserMCPServer).order_by(UserMCPServer.user_id).all()
+    assert [(link.user_id, link.is_owner) for link in links] == [
+        (int(web_user.id), True),
+        (int(account.id), False),
+    ]
+
+
+def test_actor_created_row_stays_canonical_after_catalog_connect(seeded_db) -> None:
+    db, web_user, account = seeded_db
+    server = mcp_apps.ensure_builtin_oauth_server_visibility_for_user(
+        db, user_id=int(account.id), app_id="word"
+    )
+    db.commit()
+    assert server.auth == {"app_id": "word", "provider": "microsoft"}
+
+    _connect_from_catalog(db, web_user, "word")
+
+    assert (
+        mcp_apps.require_builtin_oauth_server_definition(
+            db, app_id="word", provider="microsoft"
+        ).id
+        == server.id
+    )
+
+
+def test_stamped_marker_with_other_version_is_accepted(seeded_db) -> None:
+    db, web_user, _account = seeded_db
+    server = _connect_from_catalog(db, web_user, "word")
+    marker = _catalog_marker(db, "word")
+    marker["version"] = int(marker["version"]) + 1
+    _set_auth(
+        db,
+        server,
+        {"app_id": "word", "provider": "microsoft", "builtin_provenance": marker},
+    )
+
+    required = mcp_apps.require_builtin_oauth_server_definition(
+        db, app_id="word", provider="microsoft"
+    )
+
+    assert required.id == server.id
+
+
+def _word_auth_with_marker(marker: Any) -> dict[str, Any]:
+    return {"app_id": "word", "provider": "microsoft", "builtin_provenance": marker}
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [
+        pytest.param(
+            _word_auth_with_marker({"registry": "xagent", "app_id": "excel"}),
+            id="other-app-marker",
+        ),
+        pytest.param(
+            _word_auth_with_marker({"registry": "custom", "app_id": "word"}),
+            id="other-registry-marker",
+        ),
+        pytest.param(
+            _word_auth_with_marker({"app_id": "word", "version": 1}),
+            id="marker-without-registry",
+        ),
+        pytest.param(_word_auth_with_marker("xagent:word"), id="string-marker"),
+        pytest.param(_word_auth_with_marker(["xagent", "word"]), id="list-marker"),
+        pytest.param(_word_auth_with_marker(None), id="null-marker"),
+        pytest.param(
+            _word_auth_with_marker(
+                {
+                    "registry": "xagent",
+                    "app_id": "word",
+                    "version": 1,
+                    "command": "/bin/foreign",
+                }
+            ),
+            id="marker-with-extra-key",
+        ),
+        pytest.param(
+            {
+                **_word_auth_with_marker(
+                    {"registry": "xagent", "app_id": "word", "version": 1}
+                ),
+                "client_secret": "foreign",
+            },
+            id="extra-auth-key",
+        ),
+        pytest.param(
+            {
+                "app_id": "word",
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "word",
+                    "version": 1,
+                },
+            },
+            id="marker-without-provider",
+        ),
+        pytest.param(
+            {
+                "app_id": "word",
+                "provider": "google",
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "word",
+                    "version": 1,
+                },
+            },
+            id="marker-with-wrong-provider",
+        ),
+    ],
+)
+def test_noncanonical_stamped_auth_is_rejected_and_not_repaired(
+    seeded_db, auth
+) -> None:
+    db, web_user, account = seeded_db
+    server = _connect_from_catalog(db, web_user, "word")
+    _set_auth(db, server, auth)
+
+    with pytest.raises(mcp_apps.BuiltinOAuthServerDefinitionError, match="auth"):
+        mcp_apps.require_builtin_oauth_server_definition(
+            db, app_id="word", provider="microsoft"
+        )
+    with pytest.raises(mcp_apps.BuiltinOAuthServerDefinitionError, match="auth"):
+        mcp_apps.ensure_builtin_oauth_server_visibility_for_user(
+            db, user_id=int(account.id), app_id="word"
+        )
+    db.rollback()
+    db.refresh(server)
+
+    assert server.auth == auth
+    assert (
+        db.query(UserMCPServer).filter(UserMCPServer.user_id == int(account.id)).count()
+        == 0
+    )
+
+
+@pytest.mark.parametrize("app_id", ["outlook", "onedrive", "teams"])
+def test_marker_is_rejected_for_app_without_catalog_marker(seeded_db, app_id) -> None:
+    db, web_user, _account = seeded_db
+    server = _connect_from_catalog(db, web_user, app_id)
+    assert server.auth == {"app_id": app_id, "provider": "microsoft"}
+    _set_auth(
+        db,
+        server,
+        {
+            "app_id": app_id,
+            "provider": "microsoft",
+            "builtin_provenance": {
+                "registry": "xagent",
+                "app_id": app_id,
+                "version": 1,
+            },
+        },
+    )
+
+    with pytest.raises(mcp_apps.BuiltinOAuthServerDefinitionError, match="auth"):
+        mcp_apps.require_builtin_oauth_server_definition(
+            db, app_id=app_id, provider="microsoft"
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("managed", "internal"),
+        ("command", "/bin/foreign"),
+        ("url", "https://foreign.example"),
+        ("env", {"FOREIGN": "value"}),
+        ("allow_delegated_authorization", True),
+    ],
+)
+def test_stamped_row_keeps_other_canonical_checks(seeded_db, field_name, value) -> None:
+    db, web_user, _account = seeded_db
+    server = _connect_from_catalog(db, web_user, "word")
+    setattr(server, field_name, value)
+    db.commit()
+
+    with pytest.raises(mcp_apps.BuiltinOAuthServerDefinitionError, match=field_name):
+        mcp_apps.require_builtin_oauth_server_definition(
+            db, app_id="word", provider="microsoft"
+        )
