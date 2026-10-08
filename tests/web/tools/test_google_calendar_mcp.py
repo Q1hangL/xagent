@@ -2704,6 +2704,19 @@ def test_calendar_tool_descriptions_explain_external_meeting_links():
         assert "tell the user" in tool.description
 
 
+def test_calendar_tool_descriptions_say_a_present_link_is_not_appended_again():
+    """_attach_meeting_link skips a link the description already contains, so
+    neither tool may promise that the link is always appended."""
+    for tool_name in (
+        "google_calendar_create_events",
+        "google_calendar_update_events",
+    ):
+        tool = calendar.mcp._tool_manager.get_tool(tool_name)
+        description = " ".join(tool.description.split())
+        assert "unless already there" in description
+        assert "always appended" not in description
+
+
 def test_create_event_description_keeps_the_link_when_the_time_changes():
     """A conflict that moves the event must not lead to a second external
     meeting: the description tells the model to keep the same link."""

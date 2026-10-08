@@ -1292,13 +1292,14 @@ def google_calendar_create_events(
     can fail outright rather than just skipping the link.
     For a meeting on another provider (Zoom, Microsoft Teams, Webex, ...), create that meeting
     first with the provider's own connector, then pass the join URL it returned as meeting_link.
-    The link fills location when no location is given and is always appended to description, so
-    attendees see it in the invite. Never invent or guess a link. If the external meeting could
-    not be created, do not create an event without its link on your own: tell the user what
-    failed and let them decide. When retrying this call, reuse the same meeting_link instead of
-    creating another meeting. That includes retrying at a different time (for example after a
-    conflict): keep the link, and tell the user the external meeting itself still shows the time
-    it was created with. meeting_link cannot be combined with add_google_meet=True.
+    The link fills location when no location is given and is appended to description unless
+    already there, so attendees see it in the invite. Never invent or guess a link. If the
+    external meeting could not be created, do not create an event without its link on your own:
+    tell the user what failed and let them decide. When retrying this call, reuse the same
+    meeting_link instead of creating another meeting. That includes retrying at a different time
+    (for example after a conflict): keep the link, and tell the user the external meeting itself
+    still shows the time it was created with. meeting_link cannot be combined with
+    add_google_meet=True.
     """
     requested_conference = False
     try:
