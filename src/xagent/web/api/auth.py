@@ -2750,14 +2750,52 @@ def _actor_oauth_flow_used_response() -> HTMLResponse:
     )
 
 
-def _actor_oauth_flow_rejected_response() -> HTMLResponse:
-    """Explain an actor flow that failed its browser or connection checks."""
+# Actor checks that fail when the callback does not come back to the browser
+# that started the flow.
+_ACTOR_OAUTH_BROWSER_CHECK_REASONS = frozenset({"cookie_missing", "cookie_mismatch"})
+# Actor checks on the user, the personal link and the catalog definition.
+# Starting the flow requires all of them, so they only fail when one of them
+# changed while the member was signing in.
+_ACTOR_OAUTH_CONNECTION_CHECK_REASONS = frozenset(
+    {"user_missing", "link_invalid", "catalog_invalid", "link_changed_after_exchange"}
+)
+
+
+def _actor_oauth_flow_rejected_response(reason: str) -> HTMLResponse:
+    """Explain an actor flow that failed one of its checks.
+
+    Only a failed browser check is fixed by connecting again from the same
+    browser. A connection that changed during the sign-in must be available
+    again before a new Connect can succeed. The remaining checks (the flow's
+    own claims and owner) get a plain retry.
+    """
+    if reason in _ACTOR_OAUTH_BROWSER_CHECK_REASONS:
+        explanation = (
+            "This sign-in could not be matched to this browser, so the app was "
+            "not connected. This can happen when it was started in a different "
+            "browser or browser profile."
+        )
+        next_step = "Close this window and select Connect again from the same browser."
+    elif reason in _ACTOR_OAUTH_CONNECTION_CHECK_REASONS:
+        explanation = (
+            "The connection this sign-in was started for was turned off, "
+            "removed or changed while you were signing in, so the app was "
+            "not connected."
+        )
+        next_step = (
+            "Close this window. If the app is still available to you, select "
+            "Connect again. Otherwise, contact your administrator."
+        )
+    else:
+        explanation = (
+            "This sign-in could not be verified, so the app was not connected."
+        )
+        next_step = (
+            "Close this window and select Connect again. If it keeps "
+            "happening, contact your administrator."
+        )
     return _oauth_popup_feedback_response(
-        "This sign-in window can't finish connecting",
-        "The connection could not be verified. This can happen when the "
-        "sign-in was opened in a different browser, or when the connection "
-        "changed while you were signing in.",
-        "Close this window and select Connect again from the same browser.",
+        "This sign-in window can't finish connecting", explanation, next_step
     )
 
 
@@ -3904,7 +3942,7 @@ def generic_oauth_callback(
                 actor_flow=True,
                 provider_error=provider_error,
             )
-            return _actor_oauth_flow_rejected_response()
+            return _actor_oauth_flow_rejected_response(rejection_reason)
 
         deleted = (
             db.query(ActorOAuthFlowState)
@@ -4677,13 +4715,14 @@ def generic_oauth_callback(
                 )
             except ValueError:
                 db.rollback()
+                rejection_reason = "link_changed_after_exchange"
                 _log_oauth_callback_rejection(
                     provider,
-                    "link_changed_after_exchange",
+                    rejection_reason,
                     app_id=app_id,
                     actor_flow=True,
                 )
-                return _actor_oauth_flow_rejected_response()
+                return _actor_oauth_flow_rejected_response(rejection_reason)
 
         if user_id:
             if is_actor_flow:

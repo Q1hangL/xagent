@@ -11,6 +11,7 @@ itself.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 from cryptography.fernet import Fernet
+from jose import jwt
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -61,6 +63,25 @@ DECLINED_DESCRIPTION = (
     "Correlation ID: 5d1e9a7c-0000-0000-0000-000000000000"
 )
 DECLINED_URI = "https://login.microsoftonline.com/error?code=65004"
+REJECTED_TITLE = "This sign-in window can't finish connecting"
+# What a failed actor check says happened, and what to do next.
+OTHER_BROWSER_PAGE = (
+    "This sign-in could not be matched to this browser, so the app was not "
+    "connected. This can happen when it was started in a different browser or "
+    "browser profile.",
+    "Close this window and select Connect again from the same browser.",
+)
+CONNECTION_CHANGED_PAGE = (
+    "The connection this sign-in was started for was turned off, removed or "
+    "changed while you were signing in, so the app was not connected.",
+    "Close this window. If the app is still available to you, select Connect "
+    "again. Otherwise, contact your administrator.",
+)
+UNVERIFIED_PAGE = (
+    "This sign-in could not be verified, so the app was not connected.",
+    "Close this window and select Connect again. If it keeps happening, "
+    "contact your administrator.",
+)
 
 
 class _ProviderResponse:
@@ -276,6 +297,17 @@ def _expire(db: Session, flow: _Flow, **changes: object) -> str:
     return state
 
 
+def _claims(flow: _Flow) -> dict[str, object]:
+    payload = auth_api.verify_token(flow.state)
+    assert payload is not None
+    return payload
+
+
+def _sign(claims: dict[str, object]) -> str:
+    """Sign ``claims`` as given, without the expiry create_access_token adds."""
+    return jwt.encode(claims, auth_api.JWT_SECRET_KEY, algorithm=auth_api.JWT_ALGORITHM)
+
+
 def _open_flows(db: Session) -> int:
     return db.query(ActorOAuthFlowState).count()
 
@@ -295,6 +327,20 @@ def _assert_actionable(response) -> str:
     assert CLOSE_BUTTON in body
     assert "select Connect again" in body
     assert OLD_ACTOR_ERROR not in body
+    return body
+
+
+def _assert_rejected(response, page: tuple[str, str]) -> str:
+    """Assert the page of a failed actor check, and only that one."""
+    body = _assert_actionable(response)
+    assert f"<h1>{REJECTED_TITLE}</h1>" in body
+    assert "".join(f"<p>{paragraph}</p>" for paragraph in page) in body
+    for other in (OTHER_BROWSER_PAGE, CONNECTION_CHANGED_PAGE, UNVERIFIED_PAGE):
+        if other != page:
+            assert not any(paragraph in body for paragraph in other)
+    if page != OTHER_BROWSER_PAGE:
+        assert "same browser" not in body
+        assert "different browser" not in body
     return body
 
 
@@ -462,6 +508,50 @@ def test_unrecognized_provider_error_is_generic_and_never_echoed(
         assert error not in body
         assert error not in log
         assert "<script" not in body
+
+
+@pytest.mark.parametrize(
+    ("provider", "app_id"),
+    [
+        (
+            "microsoft\r\nOAuth callback did not connect: provider=microsoft",
+            "outlook\nreason=connected",
+        ),
+        ("micro soft", "out look"),
+        ("<script>", "outlook;drop"),
+        ("x" * 65, "x" * 65),
+        ("microsoft\t", ["outlook"]),
+        ("microsoft/../custom", 42),
+    ],
+)
+def test_unsafe_provider_and_app_id_are_logged_as_invalid(
+    oauth_db, token_endpoint, callback_logs, provider, app_id
+) -> None:
+    # `provider` is a URL path value and `app_id` a state claim: neither may
+    # add a line or a field to the log.
+    db, user = oauth_db
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": provider,
+            "app_id": app_id,
+            "redirect": None,
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = _request({"state": state, "error": "access_denied"})
+
+    response = generic_oauth_callback(provider, request, db, _db_provider("custom"))
+
+    assert response.status_code == 400
+    assert _body(response) == "<h1>Error: access_denied</h1>"
+    token_endpoint.assert_not_called()
+    (log,) = callback_logs()
+    assert log == (
+        f"{CALLBACK_LOG_PREFIX}: provider=invalid app_id=invalid actor_flow=false "
+        "reason=provider_error provider_error=access_denied provider_error_code=-"
+    )
 
 
 @pytest.mark.parametrize(
@@ -708,7 +798,17 @@ def test_consent_declined_after_the_window_expired_explains_how_to_retry(
     assert state not in log
 
 
-@pytest.mark.parametrize("mismatch", ["forged", "other_provider", "ordinary_flow"])
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "forged",
+        "other_provider",
+        "ordinary_flow",
+        "wrong_type",
+        "non_numeric_exp",
+        "numeric_string_exp",
+    ],
+)
 def test_expired_state_that_is_not_this_actor_flow_keeps_its_pages(
     oauth_db, token_endpoint, callback_logs, mismatch
 ) -> None:
@@ -721,8 +821,16 @@ def test_expired_state_that_is_not_this_actor_flow_keeps_its_pages(
         )
     elif mismatch == "other_provider":
         state = _expire(db, flow, provider="custom")
-    else:
+    elif mismatch == "ordinary_flow":
         state = _expire(db, flow, actor_flow_nonce=None, resource_owner_key=None)
+    elif mismatch == "wrong_type":
+        state = _expire(db, flow, type="access")
+    else:
+        # Both fail verify_token: one is not a number, the other is past.
+        _expire(db, flow)
+        exp = "soon" if mismatch == "non_numeric_exp" else "1700000000"
+        state = _sign({**_claims(flow), "exp": exp})
+        assert auth_api.verify_token(state) is None
 
     success = _callback(db, flow, state=state, without_cookie=True)
     declined = _callback(
@@ -740,6 +848,21 @@ def test_expired_state_that_is_not_this_actor_flow_keeps_its_pages(
         assert "actor_flow=unknown reason=state_invalid" in log
 
 
+@pytest.mark.parametrize("exp", ["missing", None, "soon"])
+def test_expired_actor_state_requires_a_numeric_expiry(oauth_db, exp) -> None:
+    # verify_token accepts a state without exp as live, so the callback never
+    # asks whether one has expired; the check itself must still refuse it.
+    db, user = oauth_db
+    claims = _claims(_start(db, user))
+    claims.pop("exp")
+    if exp != "missing":
+        claims["exp"] = exp
+    lapsed = _sign({**claims, "exp": int(time.time()) - 5})
+
+    assert auth_api._expired_actor_oauth_state(lapsed, "microsoft") is not None
+    assert auth_api._expired_actor_oauth_state(_sign(claims), "microsoft") is None
+
+
 @pytest.mark.parametrize(
     ("cookie_mode", "reason"),
     [("missing", "cookie_missing"), ("wrong", "cookie_mismatch")],
@@ -754,9 +877,7 @@ def test_sign_in_from_another_browser_cannot_finish(
     else:
         response = _callback(db, flow, cookie=(flow.cookie[0], "other-browser"))
 
-    body = _assert_actionable(response)
-    assert "This sign-in window can't finish connecting" in body
-    assert "from the same browser" in body
+    _assert_rejected(response, OTHER_BROWSER_PAGE)
     assert _open_flows(db) == 1
     token_endpoint.assert_not_called()
     (log,) = callback_logs()
@@ -779,7 +900,7 @@ def test_provider_error_with_failed_actor_check_logs_both(
         error_description=DECLINED_DESCRIPTION,
     )
 
-    assert "can't finish connecting" in _assert_actionable(response)
+    _assert_rejected(response, OTHER_BROWSER_PAGE)
     assert _open_flows(db) == 1
     (log,) = callback_logs()
     assert "reason=cookie_missing" in log
@@ -812,17 +933,17 @@ def _catalog_drift(db: Session, user: User, flow: _Flow) -> str:
 
 
 @pytest.mark.parametrize(
-    ("break_flow", "reason"),
+    ("break_flow", "reason", "page"),
     [
-        (_bad_claims, "claims_invalid"),
-        (_bad_owner, "owner_invalid"),
-        (_missing_user, "user_missing"),
-        (_inactive_link, "link_invalid"),
-        (_catalog_drift, "catalog_invalid"),
+        (_bad_claims, "claims_invalid", UNVERIFIED_PAGE),
+        (_bad_owner, "owner_invalid", UNVERIFIED_PAGE),
+        (_missing_user, "user_missing", CONNECTION_CHANGED_PAGE),
+        (_inactive_link, "link_invalid", CONNECTION_CHANGED_PAGE),
+        (_catalog_drift, "catalog_invalid", CONNECTION_CHANGED_PAGE),
     ],
 )
-def test_each_actor_check_logs_its_reason(
-    oauth_db, token_endpoint, callback_logs, break_flow, reason
+def test_each_actor_check_logs_its_reason_and_explains_it(
+    oauth_db, token_endpoint, callback_logs, break_flow, reason, page
 ) -> None:
     db, user = oauth_db
     flow = _start(db, user)
@@ -830,7 +951,7 @@ def test_each_actor_check_logs_its_reason(
 
     response = _callback(db, flow, state=state)
 
-    assert "can't finish connecting" in _assert_actionable(response)
+    _assert_rejected(response, page)
     assert _open_flows(db) == 1
     token_endpoint.assert_not_called()
     assert _actor_grants(db) == 0
@@ -855,7 +976,7 @@ def test_link_removed_during_exchange_cannot_finish(
 
     response = _callback(db, flow)
 
-    assert "can't finish connecting" in _assert_actionable(response)
+    _assert_rejected(response, CONNECTION_CHANGED_PAGE)
     assert token_endpoint.call_count == 1
     assert _actor_grants(db) == 0
     (log,) = callback_logs()
