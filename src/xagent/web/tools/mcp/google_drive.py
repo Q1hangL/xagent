@@ -1053,6 +1053,13 @@ _EMPTY_SEARCH_NOTE = (
     f"{_PER_FILE_ACCESS_NOTE} An empty result does not mean the file does "
     f"not exist. {_OPEN_BY_LINK_HINT}"
 )
+# files.list can return an empty page together with a nextPageToken, so an
+# empty page only means "nothing matched" when no token comes with it.
+_EMPTY_PAGE_NOTE = (
+    "Google Drive returned no files in this page of results but reported "
+    "that more results may exist, so files matching this query may still "
+    "exist. Retry with a larger max_results or a more specific query."
+)
 
 
 def _unavailable_file_message(exc: Exception) -> str:
@@ -1083,7 +1090,9 @@ def google_drive_search(query: str = "", max_results: int = 10) -> str:
     Results only include files this connection can access. With per-file
     Drive access (drive.file), that is only files created through this app
     or explicitly granted to it, so a file missing from the results may
-    still exist. An empty result carries a "note" field explaining this.
+    still exist. An empty result carries a "note" field explaining this; when
+    Google reports that more results may exist beyond an empty page, the note
+    says so instead.
     """
     try:
         page_size = clamp_limit(max_results, max_limit=1000)
@@ -1106,7 +1115,11 @@ def google_drive_search(query: str = "", max_results: int = 10) -> str:
                     "status": "success",
                     "files": [],
                     "truncated": False,
-                    "note": _EMPTY_SEARCH_NOTE,
+                    "note": (
+                        _EMPTY_PAGE_NOTE
+                        if results.get("nextPageToken")
+                        else _EMPTY_SEARCH_NOTE
+                    ),
                 },
                 ensure_ascii=False,
             )

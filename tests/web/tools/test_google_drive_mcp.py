@@ -662,9 +662,27 @@ def test_search_explains_an_empty_result(monkeypatch):
     assert result["files"] == []
     assert result["truncated"] is False
     note = result["note"]
+    assert note.startswith("No files matched.")
     assert "per-file Drive access" in note
     assert "does not mean the file does not exist" in note
     assert "ask the user for its link" in note
+
+
+def test_search_empty_page_with_next_page_token_says_more_may_exist(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.list.return_value.execute.return_value = {
+        "files": [],
+        "nextPageToken": "token-2",
+    }
+
+    result = json.loads(google_drive.google_drive_search("name contains 'plan'"))
+
+    assert result["status"] == "success"
+    assert result["files"] == []
+    note = result["note"]
+    assert "No files matched" not in note
+    assert "more results may exist" in note
+    assert "larger max_results" in note
 
 
 def test_search_adds_no_note_when_files_are_found(monkeypatch):
