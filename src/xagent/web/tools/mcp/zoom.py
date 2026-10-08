@@ -3,12 +3,15 @@ import logging
 import os
 import re
 import urllib.parse
+from datetime import UTC
 from typing import Any
 
 import requests
+from dateutil import parser as _date_parser
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
-from .utils import setup_proxy_env
+from .utils import offset_datetime_string, resolve_zoneinfo, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("zoom-mcp")
@@ -45,6 +48,34 @@ MEETING_LIST_TYPES = (
 # the hours group to be omitted (MM:SS.mmm) — match both so a cue-index
 # line preceding a short-form timestamp is still recognized as scaffolding.
 _VTT_TIMESTAMP_LINE = re.compile(r"^(?:\d{2}:)?\d{2}:\d{2}\.\d{3}\s+-->")
+
+# POST /users/{userId}/meetings `type` for a one-time meeting at a set time.
+_SCHEDULED_MEETING_TYPE = 2
+# RFC3339 date-time, with or without a UTC offset (a missing offset needs the
+# separate timezone argument). Bare dates are rejected: a meeting needs a time.
+_START_TIME_PATTERN = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?"
+)
+# Fields of the create-meeting response handed back to the model. Everything
+# else is dropped on purpose: start_url in particular lets whoever holds it
+# start the meeting as the host, so it must never reach a chat or an invite.
+_CREATED_MEETING_FIELDS = (
+    "id",
+    "topic",
+    "start_time",
+    "duration",
+    "timezone",
+    "join_url",
+    "password",
+)
+_NO_LINKLESS_EVENT_HINT = (
+    "Do not create a calendar event without a confirmed Zoom link; tell the "
+    "user what happened and let them decide how to proceed."
+)
+_CHECK_BEFORE_RETRY_HINT = (
+    "Before retrying, call zoom_list_meetings and look for a meeting with "
+    "this topic and start time, so a duplicate meeting is not created."
+)
 
 
 class _ZoomApiError(RuntimeError):
@@ -111,13 +142,18 @@ def _request(
     path: str,
     *,
     params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
 ) -> Any:
+    # Only pass json= when there is a body, so read requests keep exactly the
+    # call shape they always had.
+    body_kwargs: dict[str, Any] = {} if json_body is None else {"json": json_body}
     response = requests.request(
         method=method,
         url=f"{ZOOM_BASE_URL}{path}",
         headers=_headers(),
         params=params,
         timeout=DEFAULT_TIMEOUT_SECONDS,
+        **body_kwargs,
     )
     try:
         response.raise_for_status()
@@ -208,6 +244,65 @@ def _find_transcript_file(recording_files: list[Any]) -> dict[str, Any] | None:
     return None
 
 
+def _zoom_start_time(start_time: str, timezone: str | None) -> str:
+    """Return start_time as the UTC ``yyyy-MM-ddTHH:mm:ssZ`` form Zoom accepts.
+
+    Zoom reads a start_time without a trailing Z as wall-clock time in the
+    request's timezone field, or in the account's own zone when that field is
+    empty, and does not document UTC offsets at all. Converting to a UTC
+    instant here keeps the meeting at the moment the caller meant however
+    Zoom names its zones; timezone then only sets the zone shown on the
+    meeting. A local time with no offset and no timezone is rejected rather
+    than guessed.
+    """
+    value = start_time.strip()
+    if not _START_TIME_PATTERN.fullmatch(value):
+        raise ValueError(
+            "start_time must be an RFC3339 date-time such as "
+            "'2026-10-09T15:00:00+08:00' or '2026-10-09T07:00:00Z'"
+        )
+    zone_name = timezone.strip() if timezone else ""
+    if zone_name:
+        resolve_zoneinfo(zone_name)
+    parsed = _date_parser.isoparse(value)
+    if parsed.tzinfo is None:
+        if not zone_name:
+            raise ValueError(
+                "start_time has no UTC offset; add one (e.g. '+08:00' or 'Z') "
+                "or pass timezone with the IANA zone the time is in"
+            )
+        parsed = _date_parser.isoparse(offset_datetime_string(value, zone_name))
+    return parsed.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _is_missing_scope_error(exc: _ZoomApiError) -> bool:
+    # Zoom reports a token that lacks a granular scope as "Invalid access
+    # token, does not contain scopes:[...]". The exact HTTP status is not
+    # documented, so match the message on any auth-style status.
+    return exc.status_code in (400, 401, 403) and "scope" in str(exc).lower()
+
+
+def _create_meeting_failure(exc: _ZoomApiError) -> str:
+    if _is_missing_scope_error(exc):
+        return (
+            "Zoom refused to create the meeting because this Zoom connection "
+            "was authorized without permission to create meetings "
+            "(meeting:write:meeting). No Zoom meeting was created. Ask the user "
+            "to reconnect Zoom in the connector settings to grant it, then try "
+            f"again. {_NO_LINKLESS_EVENT_HINT}"
+        )
+    if exc.status_code >= 500:
+        return (
+            f"Zoom returned a server error while creating the meeting ({exc}), "
+            "so the meeting may or may not have been created. "
+            f"{_CHECK_BEFORE_RETRY_HINT} {_NO_LINKLESS_EVENT_HINT}"
+        )
+    return (
+        f"Zoom could not create the meeting: {exc}. No Zoom meeting was "
+        f"created. {_NO_LINKLESS_EVENT_HINT}"
+    )
+
+
 @mcp.tool()
 def zoom_list_meetings(meeting_type: str = "scheduled", page_token: str = "") -> str:
     """
@@ -272,6 +367,95 @@ def zoom_get_meeting(meeting_id: str) -> str:
     except Exception as e:
         logger.error(f"Error getting Zoom meeting {meeting_id}: {e}")
         return _error(str(e))
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False))
+def zoom_create_meeting(
+    topic: str,
+    start_time: str,
+    duration_minutes: int,
+    timezone: str | None = None,
+    agenda: str | None = None,
+) -> str:
+    """
+    Schedule a new Zoom meeting hosted by the connected Zoom user and return its join_url.
+    start_time is an RFC3339 date-time: include its UTC offset (e.g. '2026-10-09T15:00:00+08:00'
+    or '2026-10-09T07:00:00Z'), or pass a local time without an offset together with timezone.
+    timezone is an IANA name such as 'America/New_York'; it is also the zone shown on the meeting.
+    duration_minutes is the planned length in whole minutes. The meeting uses the account's
+    default Zoom settings (passcode, waiting room, ...).
+    This tool does not invite or email anyone. To put the meeting on a calendar, create this
+    meeting first, then pass the returned join_url to the calendar tool:
+    google_calendar_create_events and google_calendar_update_events take it as meeting_link;
+    for another calendar, put it in the event's location or description.
+    Each successful call creates another meeting. If a later calendar step fails, retry that step
+    with the same join_url instead of creating a new meeting.
+    If this tool returns an error, no usable Zoom link exists: do not create a calendar event
+    without one; tell the user what failed.
+    """
+    try:
+        clean_topic = topic.strip()
+        if not clean_topic:
+            raise ValueError("topic must not be empty")
+        zoom_start_time = _zoom_start_time(start_time, timezone)
+        if (
+            isinstance(duration_minutes, bool)
+            or not isinstance(duration_minutes, int)
+            or duration_minutes <= 0
+        ):
+            raise ValueError("duration_minutes must be a positive whole number")
+    except ValueError as e:
+        return _error(f"{str(e).rstrip('.')}. No Zoom meeting was created.")
+
+    body: dict[str, Any] = {
+        "topic": clean_topic,
+        "type": _SCHEDULED_MEETING_TYPE,
+        "start_time": zoom_start_time,
+        "duration": duration_minutes,
+    }
+    if timezone and timezone.strip():
+        body["timezone"] = timezone.strip()
+    if agenda and agenda.strip():
+        body["agenda"] = agenda.strip()
+
+    try:
+        result = _request("POST", "/users/me/meetings", json_body=body)
+    except _ZoomApiError as e:
+        logger.error(f"Error creating Zoom meeting: {e}")
+        return _error(_create_meeting_failure(e))
+    except requests.RequestException as e:
+        # A timeout or dropped connection can happen after Zoom already
+        # created the meeting, so this must not claim nothing was created.
+        logger.error(f"Error creating Zoom meeting: {type(e).__name__}")
+        return _error(
+            f"The request to Zoom did not complete ({type(e).__name__}), so the "
+            "meeting may or may not have been created. "
+            f"{_CHECK_BEFORE_RETRY_HINT} {_NO_LINKLESS_EVENT_HINT}"
+        )
+    except Exception as e:
+        logger.error(f"Error creating Zoom meeting: {e}")
+        return _error(
+            f"Creating the Zoom meeting failed: {e}. No Zoom meeting was created. "
+            f"{_NO_LINKLESS_EVENT_HINT}"
+        )
+
+    if not isinstance(result, dict) or not result.get("join_url"):
+        return _error(
+            "Zoom accepted the request but returned no join_url, so a meeting "
+            "may have been created without a usable link. "
+            f"{_CHECK_BEFORE_RETRY_HINT} {_NO_LINKLESS_EVENT_HINT}"
+        )
+    meeting = {
+        field: result[field] for field in _CREATED_MEETING_FIELDS if field in result
+    }
+    return _success(
+        meeting=meeting,
+        message=(
+            "Zoom meeting created. Zoom has not invited or emailed anyone; to put "
+            "it on a calendar, include meeting.join_url in the calendar event "
+            "(meeting_link for Google Calendar)."
+        ),
+    )
 
 
 @mcp.tool()

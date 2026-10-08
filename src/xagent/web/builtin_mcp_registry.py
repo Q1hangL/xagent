@@ -925,7 +925,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "zoom",
             "name": "Zoom",
-            "description": "Connect to Zoom to look up meetings, and read cloud recordings and transcripts.",
+            "description": "Connect to Zoom to schedule meetings, look up meetings, and read cloud recordings and transcripts.",
             "icon": "https://www.google.com/s2/favicons?domain=zoom.us&sz=128",
             "transport": "oauth",
             "provider_name": "zoom",
@@ -934,6 +934,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "meeting:read:meeting",
                 "meeting:read:list_meetings",
                 "meeting:read:past_meeting",
+                "meeting:write:meeting",
                 "cloud_recording:read:list_recording_files",
                 "cloud_recording:read:meeting_transcript",
                 "user:read:user",

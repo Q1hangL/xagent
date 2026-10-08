@@ -738,3 +738,357 @@ def test_zoom_app_registry_requests_past_meeting_scope():
         row for row in get_builtin_public_mcp_app_rows() if row["app_id"] == "zoom"
     )
     assert "meeting:read:past_meeting" in zoom_app["oauth_scopes"]
+
+
+_CREATED_MEETING_RESPONSE = {
+    "id": 85012345678,
+    "uuid": "aDYlohsHRtCd4ii1uC2+hA==",
+    "host_id": "host-1",
+    "host_email": "host@example.com",
+    "topic": "Roadmap sync",
+    "type": 2,
+    "start_time": "2026-10-09T07:00:00Z",
+    "duration": 30,
+    "timezone": "Asia/Singapore",
+    "agenda": "Q4 plan",
+    "join_url": "https://us02web.zoom.us/j/85012345678?pwd=abc",
+    "start_url": "https://us02web.zoom.us/s/85012345678?zak=host-secret",
+    "password": "123456",
+    "h323_password": "123456",
+    "settings": {"waiting_room": True},
+}
+
+
+def test_create_meeting_posts_a_scheduled_meeting_and_returns_join_url(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data=_CREATED_MEETING_RESPONSE, status_code=201)
+    )
+    monkeypatch.setattr(zoom.requests, "request", mock_request)
+
+    result = json.loads(
+        zoom.zoom_create_meeting(
+            topic=" Roadmap sync ",
+            start_time="2026-10-09T15:00:00+08:00",
+            duration_minutes=30,
+            timezone="Asia/Singapore",
+            agenda="Q4 plan",
+        )
+    )
+
+    assert result["status"] == "success"
+    mock_request.assert_called_once()
+    kwargs = mock_request.call_args.kwargs
+    assert kwargs["method"] == "POST"
+    assert kwargs["url"] == f"{zoom.ZOOM_BASE_URL}/users/me/meetings"
+    assert kwargs["headers"] == {"Authorization": "Bearer access-token"}
+    assert kwargs["json"] == {
+        "topic": "Roadmap sync",
+        "type": 2,
+        "start_time": "2026-10-09T07:00:00Z",
+        "duration": 30,
+        "timezone": "Asia/Singapore",
+        "agenda": "Q4 plan",
+    }
+    assert result["meeting"] == {
+        "id": 85012345678,
+        "topic": "Roadmap sync",
+        "start_time": "2026-10-09T07:00:00Z",
+        "duration": 30,
+        "timezone": "Asia/Singapore",
+        "join_url": "https://us02web.zoom.us/j/85012345678?pwd=abc",
+        "password": "123456",
+    }
+    # The host start link must never reach the model, a chat, or an invite.
+    assert "host-secret" not in json.dumps(result)
+    assert "meeting_link" in result["message"]
+
+
+def test_create_meeting_converts_a_local_time_in_timezone_to_utc(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data=_CREATED_MEETING_RESPONSE, status_code=201)
+    )
+    monkeypatch.setattr(zoom.requests, "request", mock_request)
+
+    zoom.zoom_create_meeting(
+        topic="Roadmap sync",
+        start_time="2026-10-09T15:00:00",
+        duration_minutes=45,
+        timezone="America/New_York",
+    )
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body["start_time"] == "2026-10-09T19:00:00Z"
+    assert body["timezone"] == "America/New_York"
+    assert body["duration"] == 45
+    assert "agenda" not in body
+
+
+def test_create_meeting_accepts_a_utc_time_without_timezone(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data=_CREATED_MEETING_RESPONSE, status_code=201)
+    )
+    monkeypatch.setattr(zoom.requests, "request", mock_request)
+
+    zoom.zoom_create_meeting(
+        topic="Roadmap sync", start_time="2026-10-09T07:00:00.250Z", duration_minutes=30
+    )
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body["start_time"] == "2026-10-09T07:00:00Z"
+    assert "timezone" not in body
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        (
+            {"start_time": "2026-10-09T15:00:00", "duration_minutes": 30},
+            "UTC offset",
+        ),
+        ({"start_time": "2026-10-09", "duration_minutes": 30}, "RFC3339"),
+        ({"start_time": "next Tuesday at 3pm", "duration_minutes": 30}, "RFC3339"),
+        ({"start_time": "2026-13-09T15:00:00Z", "duration_minutes": 30}, "month"),
+        ({"start_time": "2026-10-09T07:00:00Z", "duration_minutes": 0}, "positive"),
+        ({"start_time": "2026-10-09T07:00:00Z", "duration_minutes": -15}, "positive"),
+        ({"start_time": "2026-10-09T07:00:00Z", "duration_minutes": True}, "positive"),
+        (
+            {
+                "start_time": "2026-10-09T15:00:00",
+                "duration_minutes": 30,
+                "timezone": "Mars/Olympus_Mons",
+            },
+            "IANA",
+        ),
+        (
+            {
+                "topic": "   ",
+                "start_time": "2026-10-09T07:00:00Z",
+                "duration_minutes": 30,
+            },
+            "topic",
+        ),
+    ],
+)
+def test_create_meeting_rejects_invalid_input_without_calling_zoom(
+    monkeypatch, kwargs, expected
+):
+    mock_request = Mock()
+    monkeypatch.setattr(zoom.requests, "request", mock_request)
+    call_kwargs = {"topic": "Roadmap sync", **kwargs}
+
+    result = json.loads(zoom.zoom_create_meeting(**call_kwargs))
+
+    assert result["status"] == "error"
+    assert expected in result["message"]
+    assert "No Zoom meeting was created" in result["message"]
+    mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403])
+def test_create_meeting_missing_scope_asks_the_user_to_reconnect(
+    monkeypatch, status_code
+):
+    """A grant made before meeting:write:meeting was requested cannot create
+    meetings; the model must be told to get the user to reconnect, and must
+    not fall back to a calendar event without a link."""
+    monkeypatch.setattr(
+        zoom.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=status_code,
+                text=json.dumps(
+                    {
+                        "code": 4711,
+                        "message": "Invalid access token, does not contain "
+                        "scopes:[meeting:write:meeting, meeting:write:meeting:admin].",
+                    }
+                ),
+            )
+        ),
+    )
+
+    result = json.loads(
+        zoom.zoom_create_meeting(
+            topic="Roadmap sync",
+            start_time="2026-10-09T07:00:00Z",
+            duration_minutes=30,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "reconnect Zoom" in result["message"]
+    assert "meeting:write:meeting" in result["message"]
+    assert "No Zoom meeting was created" in result["message"]
+    assert (
+        "Do not create a calendar event without a confirmed Zoom link"
+        in result["message"]
+    )
+
+
+def test_create_meeting_client_error_says_no_meeting_was_created(monkeypatch):
+    monkeypatch.setattr(
+        zoom.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=429,
+                text='{"code": 429, "message": "You have reached the maximum '
+                "per-day number of 'Create a meeting' API requests\"}",
+            )
+        ),
+    )
+
+    result = json.loads(
+        zoom.zoom_create_meeting(
+            topic="Roadmap sync",
+            start_time="2026-10-09T07:00:00Z",
+            duration_minutes=30,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "maximum per-day number" in result["message"]
+    assert "No Zoom meeting was created" in result["message"]
+    assert "reconnect" not in result["message"]
+    assert (
+        "Do not create a calendar event without a confirmed Zoom link"
+        in result["message"]
+    )
+
+
+def test_create_meeting_server_error_says_the_meeting_may_exist(monkeypatch):
+    monkeypatch.setattr(
+        zoom.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=502, text="Bad Gateway")),
+    )
+
+    result = json.loads(
+        zoom.zoom_create_meeting(
+            topic="Roadmap sync",
+            start_time="2026-10-09T07:00:00Z",
+            duration_minutes=30,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "may or may not have been created" in result["message"]
+    assert "zoom_list_meetings" in result["message"]
+    assert "No Zoom meeting was created" not in result["message"]
+    assert (
+        "Do not create a calendar event without a confirmed Zoom link"
+        in (result["message"])
+    )
+
+
+@pytest.mark.parametrize(
+    "exc", [requests.Timeout("read timed out"), requests.ConnectionError("reset")]
+)
+def test_create_meeting_network_failure_says_the_meeting_may_exist(monkeypatch, exc):
+    """Zoom may already have created the meeting when the response is lost;
+    retrying blindly would create a second one."""
+    monkeypatch.setattr(zoom.requests, "request", Mock(side_effect=exc))
+
+    result = json.loads(
+        zoom.zoom_create_meeting(
+            topic="Roadmap sync",
+            start_time="2026-10-09T07:00:00Z",
+            duration_minutes=30,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "may or may not have been created" in result["message"]
+    assert "zoom_list_meetings" in result["message"]
+    assert "No Zoom meeting was created" not in result["message"]
+    assert (
+        "Do not create a calendar event without a confirmed Zoom link"
+        in result["message"]
+    )
+
+
+def test_create_meeting_without_join_url_in_response_is_an_error(monkeypatch):
+    monkeypatch.setattr(
+        zoom.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"id": 1}, status_code=201)),
+    )
+
+    result = json.loads(
+        zoom.zoom_create_meeting(
+            topic="Roadmap sync",
+            start_time="2026-10-09T07:00:00Z",
+            duration_minutes=30,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "no join_url" in result["message"]
+    assert "zoom_list_meetings" in result["message"]
+    assert (
+        "Do not create a calendar event without a confirmed Zoom link"
+        in (result["message"])
+    )
+
+
+def test_create_meeting_without_access_token_says_no_meeting_was_created(
+    monkeypatch,
+):
+    monkeypatch.delenv("ZOOM_ACCESS_TOKEN")
+    mock_request = Mock()
+    monkeypatch.setattr(zoom.requests, "request", mock_request)
+
+    result = json.loads(
+        zoom.zoom_create_meeting(
+            topic="Roadmap sync",
+            start_time="2026-10-09T07:00:00Z",
+            duration_minutes=30,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "No Zoom meeting was created" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_read_requests_do_not_send_a_json_body(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"meetings": [], "next_page_token": ""})
+    )
+    monkeypatch.setattr(zoom.requests, "request", mock_request)
+
+    zoom.zoom_list_meetings()
+
+    assert "json" not in mock_request.call_args.kwargs
+
+
+def test_create_meeting_is_annotated_as_non_idempotent_write():
+    """idempotentHint=False enrolls the tool in the ReAct duplicate-write
+    guard, so an identical repeat in the same turn returns the first
+    meeting instead of creating a second one."""
+    tool = zoom.mcp._tool_manager.get_tool("zoom_create_meeting")
+
+    assert tool.annotations is not None
+    assert tool.annotations.idempotentHint is False
+    assert tool.annotations.destructiveHint is False
+
+
+def test_create_meeting_description_explains_the_calendar_hand_off():
+    tool = zoom.mcp._tool_manager.get_tool("zoom_create_meeting")
+
+    assert "does not invite or email anyone" in tool.description
+    assert "meeting_link" in tool.description
+    assert "do not create a calendar event" in tool.description
+
+
+def test_zoom_app_registry_requests_meeting_write_scope():
+    """zoom_create_meeting calls POST /users/me/meetings, which needs the
+    user-level granular scope meeting:write:meeting."""
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+
+    zoom_app = next(
+        row for row in get_builtin_public_mcp_app_rows() if row["app_id"] == "zoom"
+    )
+    assert "meeting:write:meeting" in zoom_app["oauth_scopes"]
+    assert "meeting:write:meeting:admin" not in zoom_app["oauth_scopes"]
