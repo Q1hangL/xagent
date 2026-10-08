@@ -1739,15 +1739,37 @@ def _unavailable_move_destination_message(exc: Exception) -> str:
     )
 
 
-def _move_update_error_message(exc: Exception) -> str | None:
+def _move_update_error_message(exc: Exception, *, moving: bool) -> str | None:
     """An actionable message for a failed move/rename update, or ``None`` to
     keep the raw error (anything other than a 404 or a permission 403, such
-    as a rate limit, quota, a disabled API or a missing OAuth scope)."""
+    as a rate limit, quota, a disabled API or a missing OAuth scope).
+
+    ``moving`` is false for a rename-only update of an item that is already
+    in the destination folder; its message then leaves out the folder."""
     status = google_api_error_status(exc)
     reasons = google_api_error_reasons(exc)
     summary = google_api_error_summary(exc)
     if reasons:
         summary += f" (reason: {', '.join(sorted(reasons))})"
+    if not moving:
+        if _is_unavailable_file_error(exc):
+            return (
+                "Google Drive could not open the file while renaming it, or "
+                "this Drive connection cannot access it, so nothing was "
+                "renamed. If this connection uses per-file Drive access, it "
+                "can only use files created through this app or explicitly "
+                "granted to it. Ask the user to rename the file in Google "
+                f"Drive. Google API response: {summary}"
+            )
+        if status == 403 and not reasons & GOOGLE_NON_FILE_ACCESS_403_REASONS:
+            return (
+                "Google Drive refused this change, so nothing was renamed. The "
+                "connected Google account may not have permission to rename "
+                "it (for example, it has only view or comment access). Ask the "
+                "user to rename it in Google Drive or to ask the item's owner. "
+                f"Google API response: {summary}"
+            )
+        return None
     if _is_unavailable_file_error(exc):
         return (
             "Google Drive could not open the file or the destination folder "
@@ -1931,7 +1953,7 @@ def google_drive_move_file(
         try:
             updated_file = update_request.execute()
         except Exception as exc:
-            message = _move_update_error_message(exc)
+            message = _move_update_error_message(exc, moving=not already_in_destination)
             if message is None:
                 raise
             logger.error(f"Error moving file: {exc}")

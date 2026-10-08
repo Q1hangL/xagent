@@ -2061,6 +2061,51 @@ def test_move_file_renames_an_item_already_in_the_destination(monkeypatch):
     assert "removeParents" not in kwargs
 
 
+@pytest.mark.parametrize(
+    ("status", "api_message", "reason", "opening"),
+    [
+        (
+            *_unavailable_error_cases("deck1")[0],
+            "Google Drive could not open the file while renaming it",
+        ),
+        (
+            *_unavailable_error_cases("deck1")[1],
+            "Google Drive could not open the file while renaming it",
+        ),
+        (
+            403,
+            "The user does not have sufficient permissions for this file.",
+            "insufficientFilePermissions",
+            "Google Drive refused this change, so nothing was renamed.",
+        ),
+    ],
+)
+def test_move_file_rename_only_failure_does_not_mention_the_folder(
+    monkeypatch, status, api_message, reason, opening
+):
+    service = _mock_drive_service(monkeypatch)
+    _move_requests(
+        service,
+        source={**_MOVE_SOURCE, "parents": ["folder1"]},
+        destination=_MOVE_DESTINATION,
+        update=_drive_http_error(status, api_message, reason),
+    )
+
+    result = json.loads(
+        google_drive.google_drive_move_file("deck1", "folder1", new_name="Q3 deck")
+    )
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert message.startswith(opening)
+    assert "nothing was renamed" in message
+    assert "rename" in message
+    assert "folder" not in message
+    assert "moved" not in message
+    assert f"(reason: {reason})" in message
+    assert "addParents" not in service.files.return_value.update.call_args.kwargs
+
+
 def test_move_file_skips_the_update_when_name_and_folder_already_match(monkeypatch):
     service = _mock_drive_service(monkeypatch)
     _move_requests(
