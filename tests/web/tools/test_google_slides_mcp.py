@@ -2086,9 +2086,8 @@ def test_create_presentation_still_succeeds_when_the_title_write_fails(monkeypat
     assert "can remain as an empty first slide" in result["next_step"]
 
 
-@pytest.mark.parametrize("pass_id", [True, False], ids=["explicit-id", "tracked-id"])
 def test_add_slide_replaces_the_titled_default_page_for_a_different_first_slide(
-    monkeypatch, pass_id
+    monkeypatch,
 ):
     """The user asked for an agenda as the first slide: the default page that
     create titled is still replaced in the same batch, so no stray title page
@@ -2100,15 +2099,11 @@ def test_add_slide_replaces_the_titled_default_page_for_a_different_first_slide(
     }
     presentations.batchUpdate.return_value.execute.return_value = {}
     _mock_slides_service(monkeypatch, presentations)
-    if not pass_id:
-        google_slides._CREATED_DEFAULT_SLIDES["pres1"] = "p"
+    google_slides._CREATED_DEFAULT_SLIDES["pres1"] = "p"
 
     result = json.loads(
         google_slides.google_slides_add_slide(
-            "pres1",
-            title="Agenda",
-            body="Results\nPlans",
-            default_slide_id="p" if pass_id else "",
+            "pres1", title="Agenda", body="Results\nPlans", default_slide_id="p"
         )
     )
 
@@ -2120,9 +2115,15 @@ def test_add_slide_replaces_the_titled_default_page_for_a_different_first_slide(
     assert "pres1" not in google_slides._CREATED_DEFAULT_SLIDES
 
 
+@pytest.mark.parametrize(
+    "remembered", [False, True], ids=["new-process", "same-process"]
+)
 def test_add_slide_without_id_keeps_the_titled_default_page_as_the_cover(
-    monkeypatch,
+    monkeypatch, remembered
 ):
+    """Without default_slide_id the titled default page stays as the cover,
+    as next_step and the descriptions say, also when this process remembers
+    the page from create."""
     presentations = Mock()
     presentations.get.return_value.execute.return_value = {
         "title": "Q3 Review",
@@ -2130,9 +2131,47 @@ def test_add_slide_without_id_keeps_the_titled_default_page_as_the_cover(
     }
     presentations.batchUpdate.return_value.execute.return_value = {}
     _mock_slides_service(monkeypatch, presentations)
+    if remembered:
+        google_slides._CREATED_DEFAULT_SLIDES["pres1"] = "p"
 
     result = json.loads(
         google_slides.google_slides_add_slide("pres1", title="Highlights", body="Up")
+    )
+
+    assert result["status"] == "success"
+    assert result["default_slide_removed"] is False
+    assert not any(
+        "deleteObject" in request for request in _batch_update_requests(presentations)
+    )
+    assert "pres1" not in google_slides._CREATED_DEFAULT_SLIDES
+
+
+def test_add_slide_keeps_the_titled_default_page_once_other_pages_exist(
+    monkeypatch,
+):
+    """A first call without the id kept the titled default page as the cover;
+    passing the id on a later call must not delete the deck's only cover."""
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "title": "Q3 Review",
+        "slides": [
+            _titled_default_page("Q3 Review"),
+            {
+                "objectId": "s1",
+                "pageElements": [
+                    _placeholder_element("s1_title", "TITLE", "Highlights"),
+                    _placeholder_element("s1_body", "BODY", "Up"),
+                ],
+            },
+        ],
+    }
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide(
+            "pres1", title="Plans", body="Next", default_slide_id="p"
+        )
     )
 
     assert result["status"] == "success"

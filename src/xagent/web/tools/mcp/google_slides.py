@@ -606,7 +606,9 @@ def _slide_is_titled_default(slide: dict[str, Any], deck_title: object) -> bool:
 
     Only used for a page already known to be the default (by its id), so
     that writing the deck title into it at create time does not make it
-    look like user content to google_slides_add_slide.
+    look like user content to google_slides_add_slide. The comparison uses
+    the deck's current title: if the deck was renamed after create, the page
+    shows the old title and is kept like a page the user edited.
     """
     if not isinstance(deck_title, str):
         return False
@@ -1006,12 +1008,14 @@ def google_slides_add_slide(
 
     When google_slides_create_presentation returned a default_slide_id, pass
     it on the first call: each call may run in a separate MCP process, and
-    with the id the default page is removed in the same batch (also when it
-    only shows the deck title that create wrote into it), even if other pages
-    were added before this call. Without an id, only a sole page with no
-    elements at all is removed, so a default page with title/subtitle
-    placeholders stays as the first slide (showing the deck title when create
-    wrote it); an empty page in a multi-page deck is preserved.
+    with the id the default page is removed in the same batch. An empty
+    default page is removed even if other pages were added before this call;
+    one that only shows the deck title that create wrote into it is removed
+    only while it is the only page, and is kept as the cover once other pages
+    exist. Without an id, only a sole page with no elements at all is
+    removed, so a default page with title/subtitle placeholders stays as the
+    first slide (showing the deck title when create wrote it); an empty page
+    in a multi-page deck is preserved.
     Set preserve_blank_slide=True when that sole empty page is intentional.
     Unless the user specified a different first slide, make the first slide
     of a new deck its cover: layout="TITLE" with the deck title as title and
@@ -1120,8 +1124,17 @@ def google_slides_add_slide(
                     None,
                 )
                 if candidate_slide is not None:
-                    if _slide_is_empty(candidate_slide) or _slide_is_titled_default(
-                        candidate_slide, existing.get("title")
+                    # A default page that create titled is already a usable
+                    # cover. Replace it only on a call that passes its id while
+                    # it is still the only page, as the descriptions ask for
+                    # the first call. With only the id remembered in this
+                    # process, or once other pages exist, it stays the cover.
+                    if _slide_is_empty(candidate_slide) or (
+                        requested_default_slide_id
+                        and len(existing_slides) == 1
+                        and _slide_is_titled_default(
+                            candidate_slide, existing.get("title")
+                        )
                     ):
                         slide_to_remove = candidate_default_slide_id
                     else:
