@@ -2704,6 +2704,130 @@ def test_calendar_tool_descriptions_explain_external_meeting_links():
         assert "tell the user" in tool.description
 
 
+def test_create_event_description_keeps_the_link_when_the_time_changes():
+    """A conflict that moves the event must not lead to a second external
+    meeting: the description tells the model to keep the same link."""
+    tool = calendar.mcp._tool_manager.get_tool("google_calendar_create_events")
+
+    assert "retrying at a different time" in tool.description
+    assert "keep the link" in tool.description
+
+
+def test_update_event_meeting_link_replaces_an_old_link_as_documented(monkeypatch):
+    """The update description says how to swap in a new link: pass a
+    description without the old one and the new link as location. Following
+    it must leave the old meeting's link nowhere in the event."""
+    old_link = "https://us02web.zoom.us/j/81111111111?pwd=old"
+    existing_event = {
+        "id": "evt1",
+        "location": old_link,
+        "description": f"Agenda\n\nJoin the meeting: {old_link}",
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1",
+            description="Agenda",
+            location=_ZOOM_JOIN_URL,
+            meeting_link=_ZOOM_JOIN_URL,
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["location"] == _ZOOM_JOIN_URL
+    assert body["description"] == f"Agenda\n\nJoin the meeting: {_ZOOM_JOIN_URL}"
+    assert old_link not in json.dumps(body)
+
+
+def test_update_event_empty_location_does_not_clear_an_old_link(monkeypatch):
+    """An empty location is ignored rather than cleared, which is why the
+    description points callers at passing the new link as location."""
+    old_link = "https://us02web.zoom.us/j/81111111111?pwd=old"
+    existing_event = {"id": "evt1", "location": old_link, "description": "Agenda"}
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(
+        event_id="evt1", location="", meeting_link=_ZOOM_JOIN_URL
+    )
+
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["location"] == old_link
+    assert body["description"] == f"Agenda\n\nJoin the meeting: {_ZOOM_JOIN_URL}"
+    tool = calendar.mcp._tool_manager.get_tool("google_calendar_update_events")
+    assert "pass the new link as" in tool.description
+    assert "an empty location is ignored" in tool.description
+
+
+@pytest.mark.parametrize(
+    ("description", "meeting_link"),
+    [
+        # A longer meeting id that merely starts with the new one.
+        ("Old: https://zoom.us/j/850123456789", "https://zoom.us/j/85012345678"),
+        # The same meeting id, but a different full join URL.
+        (
+            "Old: https://zoom.us/j/85012345678?pwd=old",
+            "https://zoom.us/j/85012345678",
+        ),
+        # The new link only as the tail of another URL.
+        (
+            "See https://example.com/redirect?to=https://zoom.us/j/85012345678",
+            "https://zoom.us/j/85012345678",
+        ),
+    ],
+)
+def test_meeting_link_is_appended_when_only_a_different_url_contains_it(
+    monkeypatch, description, meeting_link
+):
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_create_events(
+        summary="Sync",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+        description=description,
+        location="Room 4",
+        meeting_link=meeting_link,
+    )
+
+    body = service.events.return_value.insert.call_args.kwargs["body"]
+    assert body["location"] == "Room 4"
+    assert body["description"] == (f"{description}\n\nJoin the meeting: {meeting_link}")
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        f"Join at {_ZOOM_JOIN_URL}.",
+        f"Join at {_ZOOM_JOIN_URL}, passcode in the invite",
+        f"Zoom ({_ZOOM_JOIN_URL})",
+        f"Zoom: <{_ZOOM_JOIN_URL}>",
+        f'<a href="{_ZOOM_JOIN_URL}">Join</a>',
+        f"{_ZOOM_JOIN_URL}\nAgenda",
+    ],
+)
+def test_meeting_link_already_in_the_description_is_not_repeated(
+    monkeypatch, description
+):
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_create_events(
+        summary="Sync",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+        description=description,
+        meeting_link=_ZOOM_JOIN_URL,
+    )
+
+    body = service.events.return_value.insert.call_args.kwargs["body"]
+    assert body["description"] == description
+
+
 def test_event_response_caps_a_large_event_like_other_tools_in_this_package(
     monkeypatch,
 ):
