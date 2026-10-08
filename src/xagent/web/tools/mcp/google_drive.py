@@ -1777,7 +1777,8 @@ def google_drive_move_file(
 
     ``file_id`` and ``destination_folder_id`` may be bare IDs or trusted
     Google Drive/Docs/Slides URLs.  The operation preserves the file's
-    presentation/document ID; it only changes its parent folder.  The source
+    presentation/document ID; it changes its parent folder and, optionally,
+    its name.  The source
     and destination are read before the update so malformed inputs and
     non-folder destinations fail without mutating anything. The update response
     is validated before reporting success.
