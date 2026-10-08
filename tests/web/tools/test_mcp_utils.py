@@ -2290,6 +2290,29 @@ def test_google_file_error_message_names_the_file_permission_reason(reason, edit
     assert message.endswith(f"Google API response: HTTP 403 Denied. (reason: {reason})")
 
 
+@pytest.mark.parametrize(
+    ("status", "reason", "unavailable", "access"),
+    [
+        (404, "notFound", True, True),
+        (403, "appNotAuthorizedToFile", True, True),
+        (403, "insufficientFilePermissions", False, True),
+        (403, None, False, True),
+        (403, "storageQuotaExceeded", False, False),
+        (500, "backendError", False, False),
+    ],
+)
+def test_google_file_error_classifiers_share_one_definition(
+    status, reason, unavailable, access
+):
+    body: dict = {"error": {"message": "Denied."}}
+    if reason:
+        body["error"]["errors"] = [{"reason": reason}]
+    error = _google_http_error(status, json.dumps(body).encode("utf-8"))
+
+    assert utils.is_google_file_unavailable_error(error) is unavailable
+    assert utils.is_google_file_access_error(error) is access
+
+
 def test_google_api_error_summary_appends_reasons_only_when_asked():
     error = _google_http_error(
         403,

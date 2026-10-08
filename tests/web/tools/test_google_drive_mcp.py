@@ -728,11 +728,23 @@ def test_get_file_content_explains_a_file_this_connection_cannot_see(
     assert text.endswith(f"Google API response: HTTP {status} {message}")
 
 
-def test_get_file_content_keeps_raw_error_for_other_403(monkeypatch):
+@pytest.mark.parametrize(
+    ("api_message", "reason"),
+    [
+        ("Export size limit exceeded.", "exportSizeLimitExceeded"),
+        # The app can see this file but the account may not read it; Drive's
+        # own text names that, and the per-file note would be wrong for it.
+        (
+            "The user does not have sufficient permissions for file f1.",
+            "insufficientFilePermissions",
+        ),
+    ],
+)
+def test_get_file_content_keeps_raw_error_for_other_403(
+    monkeypatch, api_message, reason
+):
     files = Mock()
-    error = _drive_http_error(
-        403, "Export size limit exceeded.", "exportSizeLimitExceeded"
-    )
+    error = _drive_http_error(403, api_message, reason)
     files.get.return_value.execute.side_effect = error
     _mock_drive_service_with_files(monkeypatch, files)
 

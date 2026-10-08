@@ -26,6 +26,7 @@ from .utils import (
     google_api_error_reasons,
     google_api_error_status,
     google_api_error_summary,
+    is_google_file_unavailable_error,
     require_clean_identifier,
     setup_proxy_env,
 )
@@ -1072,8 +1073,14 @@ def _unavailable_file_message(exc: Exception) -> str:
 
 
 def _file_read_error(exc: Exception) -> str:
+    # Only a missing or invisible file is rewritten. A 403 about the
+    # account's own permission on a file this app can see keeps Drive's raw
+    # error, which already names the missing permission; see
+    # is_google_file_unavailable_error.
     message = (
-        _unavailable_file_message(exc) if _is_unavailable_file_error(exc) else str(exc)
+        _unavailable_file_message(exc)
+        if is_google_file_unavailable_error(exc)
+        else str(exc)
     )
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
 
@@ -1752,7 +1759,7 @@ def _move_update_error_message(exc: Exception, *, moving: bool) -> str | None:
     if reasons:
         summary += f" (reason: {', '.join(sorted(reasons))})"
     if not moving:
-        if _is_unavailable_file_error(exc):
+        if is_google_file_unavailable_error(exc):
             return (
                 "Google Drive could not open the file while renaming it, or "
                 "this Drive connection cannot access it, so nothing was "
@@ -1770,7 +1777,7 @@ def _move_update_error_message(exc: Exception, *, moving: bool) -> str | None:
                 f"Google API response: {summary}"
             )
         return None
-    if _is_unavailable_file_error(exc):
+    if is_google_file_unavailable_error(exc):
         return (
             "Google Drive could not open the file or the destination folder "
             "while updating it, or this Drive connection cannot access one of "
@@ -1858,7 +1865,7 @@ def google_drive_move_file(
         try:
             source = source_get.execute()
         except Exception as exc:
-            if _is_unavailable_file_error(exc):
+            if is_google_file_unavailable_error(exc):
                 logger.error(f"Error moving file: {exc}")
                 return _move_error(_unavailable_move_source_message(exc))
             raise
@@ -1880,7 +1887,7 @@ def google_drive_move_file(
         try:
             destination = destination_get.execute()
         except Exception as exc:
-            if _is_unavailable_file_error(exc):
+            if is_google_file_unavailable_error(exc):
                 logger.error(f"Error moving file: {exc}")
                 return _move_error(_unavailable_move_destination_message(exc))
             raise
@@ -2014,20 +2021,6 @@ def _is_confirmed_gone(verify_err: Exception) -> bool:
         except (TypeError, ValueError):
             pass
     return "404" in str(verify_err) or "not found" in str(verify_err).lower()
-
-
-def _is_unavailable_file_error(exc: Exception) -> bool:
-    """Whether ``exc`` means Drive will not show a file to this connection.
-
-    That is a 404 (the file is missing, or invisible to a per-file
-    drive.file grant) or a 403 ``appNotAuthorizedToFile`` (the app was
-    never granted the file). Other 403s, such as missing edit permission or
-    rate limits, are not included.
-    """
-    status = google_api_error_status(exc)
-    if status == 404:
-        return True
-    return status == 403 and "appNotAuthorizedToFile" in google_api_error_reasons(exc)
 
 
 def _execute_ignoring_204_ssl_eof(

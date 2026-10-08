@@ -2051,16 +2051,33 @@ def resolve_google_file_id(
     )
 
 
-def is_google_file_access_error(exc: BaseException) -> bool:
-    """Whether ``exc`` means the file does not exist or the connected
-    account cannot open or change it: an HTTP 404, or a 403 with one of
-    ``GOOGLE_FILE_PERMISSION_403_REASONS`` or no reason at all. A 403 with
-    any of ``GOOGLE_NON_FILE_ACCESS_403_REASONS`` (rate limits, quota, a
-    disabled API, a missing OAuth scope) never counts."""
+def is_google_file_unavailable_error(exc: BaseException) -> bool:
+    """Whether ``exc`` means the file is missing or this app cannot see it:
+    an HTTP 404 (missing, or invisible to a per-file drive.file grant) or a
+    403 ``appNotAuthorizedToFile`` (the app was never granted the file).
+
+    This is the part of ``is_google_file_access_error`` that is not about
+    the account's own permission on the file. The Drive read tools and the
+    Drive move lookups map only this part: their message explains what a
+    per-file Drive connection can see, which would be wrong for a file the
+    app can see but the account may not read, so that 403 keeps Drive's raw
+    error, which names the missing permission.
+    """
     status = google_api_error_status(exc)
     if status == 404:
         return True
-    if status != 403:
+    return status == 403 and "appNotAuthorizedToFile" in google_api_error_reasons(exc)
+
+
+def is_google_file_access_error(exc: BaseException) -> bool:
+    """Whether ``exc`` means the file does not exist or the connected
+    account cannot open or change it: ``is_google_file_unavailable_error``,
+    or a 403 with one of ``GOOGLE_FILE_PERMISSION_403_REASONS`` or no reason
+    at all. A 403 with any of ``GOOGLE_NON_FILE_ACCESS_403_REASONS`` (rate
+    limits, quota, a disabled API, a missing OAuth scope) never counts."""
+    if is_google_file_unavailable_error(exc):
+        return True
+    if google_api_error_status(exc) != 403:
         return False
     reasons = google_api_error_reasons(exc)
     if reasons & GOOGLE_NON_FILE_ACCESS_403_REASONS:
