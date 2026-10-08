@@ -2717,6 +2717,18 @@ def test_calendar_tool_descriptions_say_a_present_link_is_not_appended_again():
         assert "always appended" not in description
 
 
+def test_create_event_description_checks_the_window_before_the_external_meeting():
+    """An external meeting may not be movable once created, so the window is
+    checked before it is created, not only by this tool's conflict check."""
+    tool = calendar.mcp._tool_manager.get_tool("google_calendar_create_events")
+    description = " ".join(tool.description.split())
+
+    assert (
+        "check that window with google_calendar_search_events before creating "
+        "the external meeting"
+    ) in description
+
+
 def test_create_event_description_keeps_the_link_when_the_time_changes():
     """A conflict that moves the event must not lead to a second external
     meeting: the description tells the model to keep the same link."""

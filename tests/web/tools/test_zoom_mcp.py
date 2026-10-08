@@ -1237,6 +1237,20 @@ def test_create_meeting_description_explains_the_calendar_hand_off():
     assert "keep this join_url" in tool.description
 
 
+def test_create_meeting_description_says_to_check_the_calendar_first():
+    """The calendar's conflict check runs only after the Zoom meeting exists,
+    and the meeting cannot be moved or deleted here, so the description asks
+    for the window to be checked before creating it."""
+    tool = _meeting_write_server()._tool_manager.get_tool("zoom_create_meeting")
+    description = " ".join(tool.description.split())
+
+    assert "check the time before calling this" in description
+    assert "google_calendar_search_events" in description
+    assert "attendees are still checked when the calendar event is created" in (
+        description
+    )
+
+
 _READ_TOOLS = {
     "zoom_list_meetings",
     "zoom_get_meeting",

@@ -399,6 +399,10 @@ def zoom_create_meeting(
     meeting first, then pass the returned join_url to the calendar tool:
     google_calendar_create_events and google_calendar_update_events take it as meeting_link;
     for another calendar, put it in the event's location or description.
+    There is no tool to move or delete a Zoom meeting, so check the time before calling this:
+    when the user gave a time, look at that window with google_calendar_search_events (or the
+    connected calendar's own search) and settle a clash with the user first. That only covers
+    the user's own calendar; attendees are still checked when the calendar event is created.
     Each successful call creates another meeting. If a later calendar step fails, retry that step
     with the same join_url instead of creating a new meeting. That includes a calendar conflict
     after which the user picks another time: keep this join_url, and tell the user the Zoom
