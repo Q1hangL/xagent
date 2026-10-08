@@ -1824,6 +1824,289 @@ def test_move_file_rejects_non_folder_destination(monkeypatch):
     service.files.return_value.update.assert_not_called()
 
 
+def _move_requests(service, *, source=None, destination=None, update=None):
+    """Wire files().get() to return the source then the destination request,
+    and files().update() to return the update request. Each argument is a
+    response dict or an exception for that request's execute()."""
+
+    def _request(outcome):
+        request = Mock()
+        request.headers = {}
+        if isinstance(outcome, Exception):
+            request.execute.side_effect = outcome
+        else:
+            request.execute.return_value = outcome
+        return request
+
+    service.files.return_value.get.side_effect = [
+        _request(outcome) for outcome in (source, destination) if outcome is not None
+    ]
+    if update is not None:
+        service.files.return_value.update.return_value = _request(update)
+
+
+_MOVE_SOURCE = {
+    "id": "deck1",
+    "name": "deck",
+    "mimeType": "application/vnd.google-apps.presentation",
+    "parents": ["root"],
+    "trashed": False,
+}
+_MOVE_DESTINATION = {
+    "id": "folder1",
+    "name": "Client decks",
+    "mimeType": "application/vnd.google-apps.folder",
+    "trashed": False,
+}
+
+
+# Example texts for these errors. The code keys on the status and the reason,
+# never on the message.
+def _unavailable_error_cases(file_id):
+    return [
+        (404, f"File not found: {file_id}.", "notFound"),
+        (
+            403,
+            f"The user has not granted the app 123456 read access to the file "
+            f"{file_id}.",
+            "appNotAuthorizedToFile",
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status", "api_message", "reason"), _unavailable_error_cases("folder1")
+)
+def test_move_file_explains_a_destination_this_connection_cannot_see(
+    monkeypatch, status, api_message, reason
+):
+    service = _mock_drive_service(monkeypatch)
+    _move_requests(
+        service,
+        source=_MOVE_SOURCE,
+        destination=_drive_http_error(status, api_message, reason),
+    )
+
+    result = json.loads(google_drive.google_drive_move_file("deck1", "folder1"))
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert message.startswith("Google Drive could not open destination_folder_id")
+    assert "nothing was moved" in message
+    assert "created directly in Google Drive cannot be a destination" in message
+    assert "Ask the user to move the file in Google Drive" in message
+    assert "offer to create a new folder with google_drive_create_folder" in message
+    assert "ask the user first" in message
+    assert message.endswith(f"Google API response: HTTP {status} {api_message}")
+    service.files.return_value.update.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("status", "api_message", "reason"), _unavailable_error_cases("deck1")
+)
+def test_move_file_explains_an_update_that_cannot_see_the_items(
+    monkeypatch, status, api_message, reason
+):
+    service = _mock_drive_service(monkeypatch)
+    _move_requests(
+        service,
+        source=_MOVE_SOURCE,
+        destination=_MOVE_DESTINATION,
+        update=_drive_http_error(status, api_message, reason),
+    )
+
+    result = json.loads(google_drive.google_drive_move_file("deck1", "folder1"))
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert message.startswith(
+        "Google Drive could not open the file or the destination folder"
+    )
+    assert "nothing was moved or renamed" in message
+    assert "offer to create a new folder" in message
+    assert f"(reason: {reason})" in message
+    assert "refused this change" not in message
+
+
+def test_move_file_explains_a_source_this_connection_cannot_see(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    _move_requests(
+        service,
+        source=_drive_http_error(404, "File not found: deck1.", "notFound"),
+        destination=_MOVE_DESTINATION,
+    )
+
+    result = json.loads(google_drive.google_drive_move_file("deck1", "folder1"))
+
+    assert result["status"] == "error"
+    assert result["message"].startswith("Google Drive could not open file_id")
+    assert "nothing was moved" in result["message"]
+    assert service.files.return_value.get.call_count == 1
+    service.files.return_value.update.assert_not_called()
+
+
+def test_move_file_explains_an_update_refused_for_permissions(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    _move_requests(
+        service,
+        source=_MOVE_SOURCE,
+        destination=_MOVE_DESTINATION,
+        update=_drive_http_error(
+            403,
+            "The user does not have sufficient permissions for this file.",
+            "insufficientFilePermissions",
+        ),
+    )
+
+    result = json.loads(google_drive.google_drive_move_file("deck1", "folder1"))
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert message.startswith("Google Drive refused this change")
+    assert "nothing was moved or renamed" in message
+    assert "(reason: insufficientFilePermissions)" in message
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "rateLimitExceeded",
+        "userRateLimitExceeded",
+        "dailyLimitExceeded",
+        "sharingRateLimitExceeded",
+        "quotaExceeded",
+        "RATE_LIMIT_EXCEEDED",
+        "accessNotConfigured",
+        "SERVICE_DISABLED",
+        "insufficientPermissions",
+        "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+    ],
+)
+def test_move_file_keeps_raw_error_for_a_non_permission_403_update(monkeypatch, reason):
+    service = _mock_drive_service(monkeypatch)
+    error = _drive_http_error(403, "Request refused.", reason)
+    _move_requests(
+        service, source=_MOVE_SOURCE, destination=_MOVE_DESTINATION, update=error
+    )
+
+    result = json.loads(google_drive.google_drive_move_file("deck1", "folder1"))
+
+    assert result == {"status": "error", "message": str(error)}
+
+
+def test_move_file_renames_in_the_same_update(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    _move_requests(
+        service,
+        source=_MOVE_SOURCE,
+        destination=_MOVE_DESTINATION,
+        update={**_MOVE_SOURCE, "name": "Q3 deck", "parents": ["folder1"]},
+    )
+
+    result = json.loads(
+        google_drive.google_drive_move_file("deck1", "folder1", new_name=" Q3 deck ")
+    )
+
+    assert result["status"] == "success"
+    assert result["file"]["name"] == "Q3 deck"
+    assert result["already_in_destination"] is False
+    kwargs = service.files.return_value.update.call_args.kwargs
+    assert kwargs["body"] == {"name": "Q3 deck"}
+    assert kwargs["addParents"] == "folder1"
+    assert kwargs["removeParents"] == "root"
+
+
+def test_move_file_renames_an_item_already_in_the_destination(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    source = {**_MOVE_SOURCE, "parents": ["folder1"]}
+    _move_requests(
+        service,
+        source=source,
+        destination=_MOVE_DESTINATION,
+        update={**source, "name": "Q3 deck"},
+    )
+
+    result = json.loads(
+        google_drive.google_drive_move_file("deck1", "folder1", new_name="Q3 deck")
+    )
+
+    assert result["status"] == "success"
+    assert result["already_in_destination"] is True
+    assert result["file"]["name"] == "Q3 deck"
+    kwargs = service.files.return_value.update.call_args.kwargs
+    assert kwargs["body"] == {"name": "Q3 deck"}
+    assert "addParents" not in kwargs
+    assert "removeParents" not in kwargs
+
+
+def test_move_file_skips_the_update_when_name_and_folder_already_match(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    _move_requests(
+        service,
+        source={**_MOVE_SOURCE, "parents": ["folder1"]},
+        destination=_MOVE_DESTINATION,
+    )
+
+    result = json.loads(
+        google_drive.google_drive_move_file("deck1", "folder1", new_name="deck")
+    )
+
+    assert result["status"] == "success"
+    assert result["already_in_destination"] is True
+    service.files.return_value.update.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param({**_MOVE_SOURCE, "parents": []}, id="empty"),
+        pytest.param(
+            {key: value for key, value in _MOVE_SOURCE.items() if key != "parents"},
+            id="missing",
+        ),
+    ],
+)
+def test_move_file_explains_a_source_without_a_visible_parent(monkeypatch, source):
+    service = _mock_drive_service(monkeypatch)
+    _move_requests(service, source=source, destination=_MOVE_DESTINATION)
+
+    result = json.loads(google_drive.google_drive_move_file("deck1", "folder1"))
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert message.startswith("Drive did not return the parent folder that holds")
+    assert "nothing was moved" in message
+    assert "per-file Drive access" in message
+    assert "Ask the user to move the file in Google Drive" in message
+    service.files.return_value.update.assert_not_called()
+
+
+async def test_move_file_is_registered_with_an_optional_new_name():
+    tools = {tool.name: tool for tool in await google_drive.mcp.list_tools()}
+
+    tool = tools["google_drive_move_file"]
+    schema = tool.inputSchema
+    assert set(schema["properties"]) == {"file_id", "destination_folder_id", "new_name"}
+    assert sorted(schema["required"]) == ["destination_folder_id", "file_id"]
+    assert schema["properties"]["new_name"]["default"] == ""
+    description = " ".join(tool.description.split())
+    assert "cannot be a destination" in description
+    assert "offer to create a new folder" in description
+
+
+def test_move_file_rejects_a_blank_new_name_before_any_lookup(monkeypatch):
+    get_service = Mock()
+    monkeypatch.setattr(google_drive, "get_drive_service", get_service)
+
+    result = json.loads(
+        google_drive.google_drive_move_file("deck1", "folder1", new_name="   ")
+    )
+
+    assert result["status"] == "error"
+    assert "new_name must not be blank" in result["message"]
+    get_service.assert_not_called()
+
+
 def test_list_permissions_returns_permissions(monkeypatch):
     service = _mock_drive_service(monkeypatch)
     service.permissions.return_value.list.return_value.execute.return_value = {
