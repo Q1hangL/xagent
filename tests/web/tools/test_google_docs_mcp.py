@@ -85,6 +85,15 @@ def test_get_document_rejects_a_title_without_calling_the_api(monkeypatch):
     get_service.assert_not_called()
 
 
+def test_get_document_error_keeps_non_ascii_input_readable(monkeypatch):
+    _mock_docs_service(monkeypatch)
+
+    raw = google_docs.google_docs_get_document("季度预算 报告")
+
+    assert "'季度预算 报告' is not a Google Docs link" in raw
+    assert "\\u" not in raw
+
+
 def test_get_document_names_a_link_to_another_kind_of_google_file(monkeypatch):
     _, get_service = _mock_docs_service(monkeypatch)
 

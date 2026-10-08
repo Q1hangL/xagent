@@ -87,7 +87,8 @@ def _document_error(exc: Exception, *, editing: bool = False) -> str:
         {
             "status": "error",
             "message": google_file_error_message(exc, _DOCUMENT_KIND, editing=editing),
-        }
+        },
+        ensure_ascii=False,
     )
 
 
