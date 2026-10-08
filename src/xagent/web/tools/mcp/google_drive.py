@@ -1787,6 +1787,13 @@ def google_drive_move_file(
     when it is already in the destination folder. Leave it empty to keep the
     current name.
 
+    On success the response holds ``file`` (the item after the call),
+    ``destination_folder_id``, ``already_in_destination`` (true when the item
+    was already in that folder, so it was not moved) and ``renamed`` (true
+    when ``new_name`` changed its name). When the item is already in the
+    folder with the requested name, nothing is updated: ``already_in_destination``
+    is true and ``renamed`` is false.
+
     Moving can change who can access the item because it may inherit permissions
     from the destination folder or shared drive. Confirm the destination and this
     access change with the user before calling this tool. This also requires the
@@ -1892,6 +1899,7 @@ def google_drive_move_file(
                     "file": source,
                     "destination_folder_id": resolved_destination_id,
                     "already_in_destination": True,
+                    "renamed": False,
                 },
                 ensure_ascii=False,
             )
@@ -1947,6 +1955,7 @@ def google_drive_move_file(
                 "file": updated_file,
                 "destination_folder_id": resolved_destination_id,
                 "already_in_destination": already_in_destination,
+                "renamed": "name" in update_body,
             },
             ensure_ascii=False,
         )

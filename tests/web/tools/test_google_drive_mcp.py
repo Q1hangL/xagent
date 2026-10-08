@@ -1476,6 +1476,7 @@ def test_move_file_updates_parents(monkeypatch):
     assert result["status"] == "success"
     assert result["file"]["parents"] == ["folder1"]
     assert result["already_in_destination"] is False
+    assert result["renamed"] is False
     assert files.update_request.kwargs["addParents"] == "folder1"
     assert files.update_request.kwargs["removeParents"] == "root"
     assert files.update_request.kwargs["supportsAllDrives"] is True
@@ -1741,6 +1742,7 @@ def test_move_file_is_idempotent_when_already_in_destination(monkeypatch):
 
     assert result["status"] == "success"
     assert result["already_in_destination"] is True
+    assert result["renamed"] is False
     service.files.return_value.update.assert_not_called()
 
 
@@ -2028,6 +2030,7 @@ def test_move_file_renames_in_the_same_update(monkeypatch):
     assert result["status"] == "success"
     assert result["file"]["name"] == "Q3 deck"
     assert result["already_in_destination"] is False
+    assert result["renamed"] is True
     kwargs = service.files.return_value.update.call_args.kwargs
     assert kwargs["body"] == {"name": "Q3 deck"}
     assert kwargs["addParents"] == "folder1"
@@ -2050,6 +2053,7 @@ def test_move_file_renames_an_item_already_in_the_destination(monkeypatch):
 
     assert result["status"] == "success"
     assert result["already_in_destination"] is True
+    assert result["renamed"] is True
     assert result["file"]["name"] == "Q3 deck"
     kwargs = service.files.return_value.update.call_args.kwargs
     assert kwargs["body"] == {"name": "Q3 deck"}
@@ -2071,6 +2075,7 @@ def test_move_file_skips_the_update_when_name_and_folder_already_match(monkeypat
 
     assert result["status"] == "success"
     assert result["already_in_destination"] is True
+    assert result["renamed"] is False
     service.files.return_value.update.assert_not_called()
 
 
