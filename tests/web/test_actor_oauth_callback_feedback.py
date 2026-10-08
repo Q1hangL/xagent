@@ -333,8 +333,14 @@ def _assert_actionable(response) -> str:
 def _assert_rejected(response, page: tuple[str, str]) -> str:
     """Assert the page of a failed actor check, and only that one."""
     body = _assert_actionable(response)
-    assert f"<h1>{REJECTED_TITLE}</h1>" in body
-    assert "".join(f"<p>{paragraph}</p>" for paragraph in page) in body
+    assert f"<title>{REJECTED_TITLE}</title>" in body
+    assert (
+        f"<body><h1>{REJECTED_TITLE}</h1>"
+        + "".join(f"<p>{paragraph}</p>" for paragraph in page)
+        + f"<p>{CLOSE_BUTTON}Close this window</button></p>"
+        + "<p>If this window doesn't close, close it from your browser.</p>"
+        + "</body>"
+    ) in body
     for other in (OTHER_BROWSER_PAGE, CONNECTION_CHANGED_PAGE, UNVERIFIED_PAGE):
         if other != page:
             assert not any(paragraph in body for paragraph in other)
