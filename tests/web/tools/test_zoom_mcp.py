@@ -17,14 +17,18 @@ MEETING_WRITE_FLAG = "XAGENT_ZOOM_MEETING_WRITE_ENABLED"
 
 class MockResponse:
     def __init__(self, json_data=None, text="", status_code=200, url=""):
-        self._json_data = json_data if json_data is not None else {}
-        self.text = text or (json.dumps(self._json_data) if json_data else "")
+        self._json_data = json_data
+        self.text = text or (json.dumps(json_data) if json_data else "")
         self.status_code = status_code
         self.content = self.text.encode()
         self.url = url
 
     def json(self):
-        return self._json_data
+        # Like requests.Response.json(): without explicit json_data the body
+        # text is parsed, and a non-JSON body raises ValueError.
+        if self._json_data is not None:
+            return self._json_data
+        return json.loads(self.text)
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -76,6 +80,27 @@ def test_request_wraps_http_error_with_message_and_status(monkeypatch):
     with pytest.raises(zoom._ZoomApiError, match="bad id") as excinfo:
         zoom._request("GET", "/users/me/meetings")
     assert excinfo.value.status_code == 400
+
+
+def test_request_uses_only_the_message_of_a_json_error_body(monkeypatch):
+    """Zoom errors are {"code": ..., "message": ...}; only the message is
+    kept, not the raw body."""
+    monkeypatch.setattr(
+        zoom.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=404,
+                json_data={"code": 3001, "message": "Meeting does not exist: 1."},
+            )
+        ),
+    )
+
+    with pytest.raises(zoom._ZoomApiError) as excinfo:
+        zoom._request("GET", "/meetings/1")
+
+    assert str(excinfo.value).endswith(" - Meeting does not exist: 1.")
+    assert "3001" not in str(excinfo.value)
 
 
 def test_request_falls_back_to_raw_text_for_unstructured_error_body(monkeypatch):
@@ -919,29 +944,28 @@ def test_create_meeting_rejects_invalid_input_without_calling_zoom(
     mock_request.assert_not_called()
 
 
+_MISSING_SCOPE_BODY = {
+    "code": 4711,
+    "message": "Invalid access token, does not contain "
+    "scopes:[meeting:write:meeting, meeting:write:meeting:admin].",
+}
+
+
+@pytest.mark.parametrize("body", ["json", "text"])
 @pytest.mark.parametrize("status_code", [400, 401, 403])
 def test_create_meeting_missing_scope_asks_the_user_to_reconnect(
-    monkeypatch, status_code
+    monkeypatch, status_code, body
 ):
     """A grant made before meeting:write:meeting was requested cannot create
     meetings; the model must be told to get the user to reconnect, and must
-    not fall back to a calendar event without a link."""
-    monkeypatch.setattr(
-        zoom.requests,
-        "request",
-        Mock(
-            return_value=MockResponse(
-                status_code=status_code,
-                text=json.dumps(
-                    {
-                        "code": 4711,
-                        "message": "Invalid access token, does not contain "
-                        "scopes:[meeting:write:meeting, meeting:write:meeting:admin].",
-                    }
-                ),
-            )
-        ),
+    not fall back to a calendar event without a link. Zoom's own error body
+    is JSON, read through _extract_error_detail."""
+    response = (
+        MockResponse(status_code=status_code, json_data=_MISSING_SCOPE_BODY)
+        if body == "json"
+        else MockResponse(status_code=status_code, text=json.dumps(_MISSING_SCOPE_BODY))
     )
+    monkeypatch.setattr(zoom.requests, "request", Mock(return_value=response))
 
     message = _create_meeting_error(
         topic="Roadmap sync",
@@ -954,6 +978,39 @@ def test_create_meeting_missing_scope_asks_the_user_to_reconnect(
     assert "disconnect Zoom and connect it again" in message
     assert "meeting:write:meeting" in message
     assert "No Zoom meeting was created" in message
+    assert _NO_LINKLESS_EVENT in message
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+def test_create_meeting_auth_error_without_scope_is_not_a_reconnect_hint(
+    monkeypatch, status_code
+):
+    """An expired or revoked token is not a missing scope: it gets the
+    generic message with Zoom's own reason, not the reconnect steps."""
+    monkeypatch.setattr(
+        zoom.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=status_code,
+                json_data={"code": 124, "message": "Access token is expired."},
+            )
+        ),
+    )
+
+    message = _create_meeting_error(
+        topic="Roadmap sync",
+        start_time="2026-10-09T07:00:00Z",
+        duration_minutes=30,
+    )
+
+    assert message.startswith("Zoom could not create the meeting: ")
+    assert "Access token is expired." in message
+    # Only the message of Zoom's JSON error body is used, not the raw body.
+    assert '"code"' not in message
+    assert "No Zoom meeting was created" in message
+    assert "connect it again" not in message
+    assert "meeting:write:meeting" not in message
     assert _NO_LINKLESS_EVENT in message
 
 
