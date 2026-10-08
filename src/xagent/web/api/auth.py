@@ -34,7 +34,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from ...builtin_identity import builtin_provenance_identity
+from ...builtin_identity import owned_catalog_marker
 from ...config import (
     get_app_base_url,
     get_google_restricted_scopes,
@@ -3321,17 +3321,8 @@ def _ensure_user_mcp_server(
         provider = app_info.get("provider")
         if provider:
             metadata["provider"] = str(provider)
-        launch_config = app_info.get("launch_config")
-        provenance = (
-            launch_config.get("builtin_provenance")
-            if isinstance(launch_config, dict)
-            else None
-        )
-        provenance_identity = builtin_provenance_identity(provenance)
-        if isinstance(provenance, dict) and provenance_identity == (
-            "xagent",
-            str(app_info["id"]),
-        ):
+        provenance = owned_catalog_marker(app_info)
+        if provenance is not None:
             metadata["builtin_provenance"] = dict(provenance)
         return metadata
 

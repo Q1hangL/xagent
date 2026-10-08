@@ -13,7 +13,7 @@ from typing import Any, Dict, List
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ..builtin_identity import builtin_provenance_identity
+from ..builtin_identity import builtin_provenance_identity, owned_catalog_marker
 from ..config import (
     get_google_restricted_scopes,
     get_hubspot_mcp_client_id,
@@ -555,28 +555,23 @@ def _builtin_auth_is_canonical(auth: Any, app_info: Mapping[str, Any]) -> bool:
     catalog's builtin ownership marker (see ``_ensure_user_mcp_server``), which
     seed migrations read to recognize the row as the official one. The marker
     is identity metadata, never execution data, so it is accepted only when the
-    catalog app declares its own marker, both name this exact builtin app, and
-    the stored marker adds no keys the catalog marker does not have.
+    catalog app declares its own marker (``owned_catalog_marker``, which the
+    callback also uses to stamp it), the stored marker names the same builtin
+    app, and it adds no keys the catalog marker does not have.
     """
     if not isinstance(auth, Mapping):
         return False
     identity_fields = dict(auth)
     if "builtin_provenance" in identity_fields:
         stored_marker = identity_fields.pop("builtin_provenance")
-        launch_config = app_info.get("launch_config")
-        catalog_marker = (
-            launch_config.get("builtin_provenance")
-            if isinstance(launch_config, Mapping)
-            else None
-        )
-        if not isinstance(stored_marker, dict) or not isinstance(catalog_marker, dict):
+        catalog_marker = owned_catalog_marker(app_info)
+        if not isinstance(stored_marker, dict) or catalog_marker is None:
             return False
         if set(stored_marker) - set(catalog_marker):
             return False
-        stored_identity = builtin_provenance_identity(stored_marker)
-        if stored_identity != ("xagent", str(app_info["id"])):
-            return False
-        if stored_identity != builtin_provenance_identity(catalog_marker):
+        if builtin_provenance_identity(stored_marker) != builtin_provenance_identity(
+            catalog_marker
+        ):
             return False
     return identity_fields == _expected_builtin_auth(app_info)
 

@@ -35,6 +35,7 @@ from xagent.web.api.auth import (
 from xagent.web.builtin_mcp_registry import seed_builtin_oauth_and_public_mcp_apps
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 
@@ -129,6 +130,28 @@ def test_actor_paths_accept_row_created_by_catalog_callback(seeded_db, app_id) -
         (int(web_user.id), True),
         (int(account.id), False),
     ]
+
+
+def test_catalog_callback_auth_is_canonical_for_every_builtin_oauth_app(
+    seeded_db,
+) -> None:
+    """The callback and the canonical check agree on the whole catalog.
+
+    Both take the app's own marker from ``owned_catalog_marker``. The apps that
+    get one are exactly the ones the actor path cases above cover.
+    """
+    db, web_user, _account = seeded_db
+    stamped: set[str] = set()
+    for app in db.query(PublicMCPApp).order_by(PublicMCPApp.app_id).all():
+        app_info = _catalog_app(db, app.app_id)
+        if app_info["auth_type"] != "builtin_oauth":
+            continue
+        server = _connect_from_catalog(db, web_user, app.app_id)
+        assert mcp_apps._builtin_auth_is_canonical(server.auth, app_info), app.app_id
+        if "builtin_provenance" in server.auth:
+            stamped.add(app.app_id)
+
+    assert stamped == set(STAMPED_BUILTIN_OAUTH_APPS)
 
 
 @pytest.mark.parametrize("marker_persisted", [False, True])
