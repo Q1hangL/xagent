@@ -4,6 +4,7 @@ from unittest.mock import Mock
 
 import pytest
 import requests
+from mcp.server.fastmcp.exceptions import ToolError
 
 from xagent.web.tools.mcp import zoom
 
@@ -758,6 +759,19 @@ _CREATED_MEETING_RESPONSE = {
     "settings": {"waiting_room": True},
 }
 
+_NO_LINKLESS_EVENT = "Do not create a calendar event without a confirmed Zoom link"
+
+
+def _create_meeting_error(**kwargs) -> str:
+    """Call zoom_create_meeting expecting a failure and return its message.
+
+    Failures are raised as ToolError so they reach the agent as MCP isError
+    results rather than as a successful call carrying an error payload.
+    """
+    with pytest.raises(ToolError) as excinfo:
+        zoom.zoom_create_meeting(**kwargs)
+    return str(excinfo.value)
+
 
 def test_create_meeting_posts_a_scheduled_meeting_and_returns_join_url(monkeypatch):
     mock_request = Mock(
@@ -867,6 +881,20 @@ def test_create_meeting_accepts_a_utc_time_without_timezone(monkeypatch):
             },
             "topic",
         ),
+        # 02:30 does not exist in New York on the day clocks spring forward.
+        (
+            {
+                "start_time": "2026-03-08T02:30:00",
+                "duration_minutes": 30,
+                "timezone": "America/New_York",
+            },
+            "daylight-saving",
+        ),
+        # A valid RFC3339 value whose UTC equivalent is past year 9999.
+        (
+            {"start_time": "9999-12-31T23:00:00-05:00", "duration_minutes": 30},
+            "supported date range",
+        ),
     ],
 )
 def test_create_meeting_rejects_invalid_input_without_calling_zoom(
@@ -876,11 +904,12 @@ def test_create_meeting_rejects_invalid_input_without_calling_zoom(
     monkeypatch.setattr(zoom.requests, "request", mock_request)
     call_kwargs = {"topic": "Roadmap sync", **kwargs}
 
-    result = json.loads(zoom.zoom_create_meeting(**call_kwargs))
+    message = _create_meeting_error(**call_kwargs)
 
-    assert result["status"] == "error"
-    assert expected in result["message"]
-    assert "No Zoom meeting was created" in result["message"]
+    assert expected in message
+    assert "No Zoom meeting was created" in message
+    assert "Correct the arguments" in message
+    assert _NO_LINKLESS_EVENT in message
     mock_request.assert_not_called()
 
 
@@ -908,22 +937,18 @@ def test_create_meeting_missing_scope_asks_the_user_to_reconnect(
         ),
     )
 
-    result = json.loads(
-        zoom.zoom_create_meeting(
-            topic="Roadmap sync",
-            start_time="2026-10-09T07:00:00Z",
-            duration_minutes=30,
-        )
+    message = _create_meeting_error(
+        topic="Roadmap sync",
+        start_time="2026-10-09T07:00:00Z",
+        duration_minutes=30,
     )
 
-    assert result["status"] == "error"
-    assert "reconnect Zoom" in result["message"]
-    assert "meeting:write:meeting" in result["message"]
-    assert "No Zoom meeting was created" in result["message"]
-    assert (
-        "Do not create a calendar event without a confirmed Zoom link"
-        in result["message"]
-    )
+    # A connected Zoom offers no separate reconnect action, so the message
+    # spells out the steps.
+    assert "disconnect Zoom and connect it again" in message
+    assert "meeting:write:meeting" in message
+    assert "No Zoom meeting was created" in message
+    assert _NO_LINKLESS_EVENT in message
 
 
 def test_create_meeting_client_error_says_no_meeting_was_created(monkeypatch):
@@ -939,22 +964,16 @@ def test_create_meeting_client_error_says_no_meeting_was_created(monkeypatch):
         ),
     )
 
-    result = json.loads(
-        zoom.zoom_create_meeting(
-            topic="Roadmap sync",
-            start_time="2026-10-09T07:00:00Z",
-            duration_minutes=30,
-        )
+    message = _create_meeting_error(
+        topic="Roadmap sync",
+        start_time="2026-10-09T07:00:00Z",
+        duration_minutes=30,
     )
 
-    assert result["status"] == "error"
-    assert "maximum per-day number" in result["message"]
-    assert "No Zoom meeting was created" in result["message"]
-    assert "reconnect" not in result["message"]
-    assert (
-        "Do not create a calendar event without a confirmed Zoom link"
-        in result["message"]
-    )
+    assert "maximum per-day number" in message
+    assert "No Zoom meeting was created" in message
+    assert "connect it again" not in message
+    assert _NO_LINKLESS_EVENT in message
 
 
 def test_create_meeting_server_error_says_the_meeting_may_exist(monkeypatch):
@@ -964,22 +983,16 @@ def test_create_meeting_server_error_says_the_meeting_may_exist(monkeypatch):
         Mock(return_value=MockResponse(status_code=502, text="Bad Gateway")),
     )
 
-    result = json.loads(
-        zoom.zoom_create_meeting(
-            topic="Roadmap sync",
-            start_time="2026-10-09T07:00:00Z",
-            duration_minutes=30,
-        )
+    message = _create_meeting_error(
+        topic="Roadmap sync",
+        start_time="2026-10-09T07:00:00Z",
+        duration_minutes=30,
     )
 
-    assert result["status"] == "error"
-    assert "may or may not have been created" in result["message"]
-    assert "zoom_list_meetings" in result["message"]
-    assert "No Zoom meeting was created" not in result["message"]
-    assert (
-        "Do not create a calendar event without a confirmed Zoom link"
-        in (result["message"])
-    )
+    assert "may or may not have been created" in message
+    assert "zoom_list_meetings" in message
+    assert "No Zoom meeting was created" not in message
+    assert _NO_LINKLESS_EVENT in message
 
 
 @pytest.mark.parametrize(
@@ -990,22 +1003,16 @@ def test_create_meeting_network_failure_says_the_meeting_may_exist(monkeypatch, 
     retrying blindly would create a second one."""
     monkeypatch.setattr(zoom.requests, "request", Mock(side_effect=exc))
 
-    result = json.loads(
-        zoom.zoom_create_meeting(
-            topic="Roadmap sync",
-            start_time="2026-10-09T07:00:00Z",
-            duration_minutes=30,
-        )
+    message = _create_meeting_error(
+        topic="Roadmap sync",
+        start_time="2026-10-09T07:00:00Z",
+        duration_minutes=30,
     )
 
-    assert result["status"] == "error"
-    assert "may or may not have been created" in result["message"]
-    assert "zoom_list_meetings" in result["message"]
-    assert "No Zoom meeting was created" not in result["message"]
-    assert (
-        "Do not create a calendar event without a confirmed Zoom link"
-        in result["message"]
-    )
+    assert "may or may not have been created" in message
+    assert "zoom_list_meetings" in message
+    assert "No Zoom meeting was created" not in message
+    assert _NO_LINKLESS_EVENT in message
 
 
 def test_create_meeting_without_join_url_in_response_is_an_error(monkeypatch):
@@ -1015,21 +1022,15 @@ def test_create_meeting_without_join_url_in_response_is_an_error(monkeypatch):
         Mock(return_value=MockResponse(json_data={"id": 1}, status_code=201)),
     )
 
-    result = json.loads(
-        zoom.zoom_create_meeting(
-            topic="Roadmap sync",
-            start_time="2026-10-09T07:00:00Z",
-            duration_minutes=30,
-        )
+    message = _create_meeting_error(
+        topic="Roadmap sync",
+        start_time="2026-10-09T07:00:00Z",
+        duration_minutes=30,
     )
 
-    assert result["status"] == "error"
-    assert "no join_url" in result["message"]
-    assert "zoom_list_meetings" in result["message"]
-    assert (
-        "Do not create a calendar event without a confirmed Zoom link"
-        in (result["message"])
-    )
+    assert "no join_url" in message
+    assert "zoom_list_meetings" in message
+    assert _NO_LINKLESS_EVENT in message
 
 
 def test_create_meeting_without_access_token_says_no_meeting_was_created(
@@ -1039,17 +1040,97 @@ def test_create_meeting_without_access_token_says_no_meeting_was_created(
     mock_request = Mock()
     monkeypatch.setattr(zoom.requests, "request", mock_request)
 
-    result = json.loads(
-        zoom.zoom_create_meeting(
-            topic="Roadmap sync",
-            start_time="2026-10-09T07:00:00Z",
-            duration_minutes=30,
-        )
+    message = _create_meeting_error(
+        topic="Roadmap sync",
+        start_time="2026-10-09T07:00:00Z",
+        duration_minutes=30,
     )
 
-    assert result["status"] == "error"
-    assert "No Zoom meeting was created" in result["message"]
+    assert "No Zoom meeting was created" in message
+    assert _NO_LINKLESS_EVENT in message
     mock_request.assert_not_called()
+
+
+_CREATE_MEETING_ARGS = {
+    "topic": "Roadmap sync",
+    "start_time": "2026-10-09T07:00:00Z",
+    "duration_minutes": 30,
+}
+
+
+async def _call_create_meeting_over_mcp(arguments):
+    """Call the tool through a real MCP client session, as the agent does,
+    and return the CallToolResult the client receives."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    async with create_connected_server_and_client_session(
+        zoom.mcp._mcp_server
+    ) as session:
+        return await session.call_tool("zoom_create_meeting", arguments)
+
+
+@pytest.mark.parametrize(
+    ("response", "arguments", "expected"),
+    [
+        (
+            MockResponse(status_code=503, text="Service unavailable"),
+            _CREATE_MEETING_ARGS,
+            "may or may not have been created",
+        ),
+        (
+            MockResponse(status_code=400, text='{"code": 300, "message": "Bad"}'),
+            _CREATE_MEETING_ARGS,
+            "No Zoom meeting was created",
+        ),
+        (None, {**_CREATE_MEETING_ARGS, "duration_minutes": 0}, "positive"),
+    ],
+)
+async def test_create_meeting_failure_reaches_the_agent_as_a_failed_call(
+    monkeypatch, response, arguments, expected
+):
+    """A failure must be an MCP isError result. As a successful call with an
+    error payload, the agent would record it as completed, and the same-turn
+    duplicate-write guard would answer an identical retry with "already
+    succeeded" without running it."""
+    from xagent.core.agent.result import tool_result_succeeded
+    from xagent.core.tools.adapters.vibe.mcp_adapter import (
+        _normalized_mcp_call_result,
+    )
+
+    mock_request = Mock(return_value=response)
+    monkeypatch.setattr(zoom.requests, "request", mock_request)
+
+    result = await _call_create_meeting_over_mcp(arguments)
+
+    assert result.isError is True
+    assert expected in result.content[0].text
+    assert _NO_LINKLESS_EVENT in result.content[0].text
+    assert tool_result_succeeded(_normalized_mcp_call_result(result)) is False
+
+
+async def test_created_meeting_reaches_the_agent_as_a_successful_call(monkeypatch):
+    from xagent.core.agent.result import tool_result_succeeded
+    from xagent.core.tools.adapters.vibe.mcp_adapter import (
+        _normalized_mcp_call_result,
+    )
+
+    monkeypatch.setattr(
+        zoom.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data=_CREATED_MEETING_RESPONSE, status_code=201
+            )
+        ),
+    )
+
+    result = await _call_create_meeting_over_mcp(_CREATE_MEETING_ARGS)
+
+    assert result.isError is False
+    payload = json.loads(result.content[0].text)
+    assert payload["status"] == "success"
+    assert payload["meeting"]["join_url"] == _CREATED_MEETING_RESPONSE["join_url"]
+    assert tool_result_succeeded(_normalized_mcp_call_result(result)) is True
 
 
 def test_read_requests_do_not_send_a_json_body(monkeypatch):
@@ -1065,8 +1146,9 @@ def test_read_requests_do_not_send_a_json_body(monkeypatch):
 
 def test_create_meeting_is_annotated_as_non_idempotent_write():
     """idempotentHint=False enrolls the tool in the ReAct duplicate-write
-    guard, so an identical repeat in the same turn returns the first
-    meeting instead of creating a second one."""
+    guard, so an identical repeat after a successful create in the same turn
+    returns the first meeting instead of creating a second one. Failures are
+    MCP errors, so a retry after one still runs."""
     tool = zoom.mcp._tool_manager.get_tool("zoom_create_meeting")
 
     assert tool.annotations is not None
@@ -1080,6 +1162,9 @@ def test_create_meeting_description_explains_the_calendar_hand_off():
     assert "does not invite or email anyone" in tool.description
     assert "meeting_link" in tool.description
     assert "do not create a calendar event" in tool.description
+    # A calendar conflict that moves the meeting must not lead to a second
+    # Zoom meeting; there is no tool to delete the first one.
+    assert "keep this join_url" in tool.description
 
 
 def test_zoom_app_registry_requests_meeting_write_scope():

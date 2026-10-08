@@ -9,6 +9,7 @@ from typing import Any
 import requests
 from dateutil import parser as _date_parser
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from .utils import offset_datetime_string, resolve_zoneinfo, setup_proxy_env
@@ -75,6 +76,10 @@ _NO_LINKLESS_EVENT_HINT = (
 _CHECK_BEFORE_RETRY_HINT = (
     "Before retrying, call zoom_list_meetings and look for a meeting with "
     "this topic and start time, so a duplicate meeting is not created."
+)
+_FIX_ARGUMENTS_HINT = (
+    "Correct the arguments and call this tool again. Do not create a calendar "
+    "event without a confirmed Zoom link."
 )
 
 
@@ -272,7 +277,13 @@ def _zoom_start_time(start_time: str, timezone: str | None) -> str:
                 "or pass timezone with the IANA zone the time is in"
             )
         parsed = _date_parser.isoparse(offset_datetime_string(value, zone_name))
-    return parsed.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        utc_start = parsed.astimezone(UTC)
+    except OverflowError as exc:
+        # A year at the very edge of the calendar (e.g. 9999-12-31 with a
+        # negative offset) has no UTC equivalent.
+        raise ValueError("start_time is outside the supported date range") from exc
+    return utc_start.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _is_missing_scope_error(exc: _ZoomApiError) -> bool:
@@ -288,8 +299,8 @@ def _create_meeting_failure(exc: _ZoomApiError) -> str:
             "Zoom refused to create the meeting because this Zoom connection "
             "was authorized without permission to create meetings "
             "(meeting:write:meeting). No Zoom meeting was created. Ask the user "
-            "to reconnect Zoom in the connector settings to grant it, then try "
-            f"again. {_NO_LINKLESS_EVENT_HINT}"
+            "to disconnect Zoom and connect it again, which grants the new "
+            f"permission, then try again. {_NO_LINKLESS_EVENT_HINT}"
         )
     if exc.status_code >= 500:
         return (
@@ -389,9 +400,11 @@ def zoom_create_meeting(
     google_calendar_create_events and google_calendar_update_events take it as meeting_link;
     for another calendar, put it in the event's location or description.
     Each successful call creates another meeting. If a later calendar step fails, retry that step
-    with the same join_url instead of creating a new meeting.
-    If this tool returns an error, no usable Zoom link exists: do not create a calendar event
-    without one; tell the user what failed.
+    with the same join_url instead of creating a new meeting. That includes a calendar conflict
+    after which the user picks another time: keep this join_url, and tell the user the Zoom
+    meeting itself still shows the original time (this tool cannot change it).
+    If this tool returns an error, do not create a calendar event without a confirmed join_url;
+    tell the user what failed.
     """
     try:
         clean_topic = topic.strip()
@@ -405,7 +418,9 @@ def zoom_create_meeting(
         ):
             raise ValueError("duration_minutes must be a positive whole number")
     except ValueError as e:
-        return _error(f"{str(e).rstrip('.')}. No Zoom meeting was created.")
+        raise ToolError(
+            f"{str(e).rstrip('.')}. No Zoom meeting was created. {_FIX_ARGUMENTS_HINT}"
+        ) from e
 
     body: dict[str, Any] = {
         "topic": clean_topic,
@@ -418,29 +433,34 @@ def zoom_create_meeting(
     if agenda and agenda.strip():
         body["agenda"] = agenda.strip()
 
+    # Every failure below is raised as ToolError, which reaches the client as
+    # an MCP isError result. A JSON status=error string would be classified as
+    # a successful call, and the same-turn duplicate-write guard this tool
+    # opts into would then answer an identical retry with "already succeeded"
+    # instead of running it.
     try:
         result = _request("POST", "/users/me/meetings", json_body=body)
     except _ZoomApiError as e:
         logger.error(f"Error creating Zoom meeting: {e}")
-        return _error(_create_meeting_failure(e))
+        raise ToolError(_create_meeting_failure(e)) from e
     except requests.RequestException as e:
         # A timeout or dropped connection can happen after Zoom already
         # created the meeting, so this must not claim nothing was created.
         logger.error(f"Error creating Zoom meeting: {type(e).__name__}")
-        return _error(
+        raise ToolError(
             f"The request to Zoom did not complete ({type(e).__name__}), so the "
             "meeting may or may not have been created. "
             f"{_CHECK_BEFORE_RETRY_HINT} {_NO_LINKLESS_EVENT_HINT}"
-        )
+        ) from e
     except Exception as e:
         logger.error(f"Error creating Zoom meeting: {e}")
-        return _error(
+        raise ToolError(
             f"Creating the Zoom meeting failed: {e}. No Zoom meeting was created. "
             f"{_NO_LINKLESS_EVENT_HINT}"
-        )
+        ) from e
 
     if not isinstance(result, dict) or not result.get("join_url"):
-        return _error(
+        raise ToolError(
             "Zoom accepted the request but returned no join_url, so a meeting "
             "may have been created without a usable link. "
             f"{_CHECK_BEFORE_RETRY_HINT} {_NO_LINKLESS_EVENT_HINT}"

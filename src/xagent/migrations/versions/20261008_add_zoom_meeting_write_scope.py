@@ -108,9 +108,10 @@ def _set_zoom_description_if_unchanged(
 
 # Existing user_oauth grants are deliberately left alone. Zoom's read tools
 # keep working on them, and a connection that lacks meeting:write:meeting
-# gets an explicit "reconnect Zoom" error from zoom_create_meeting when it is
-# first used to create a meeting. Clearing the grants here would disconnect
-# every Zoom user, readers included, and could not be undone by downgrade().
+# gets an explicit error from zoom_create_meeting, asking the user to
+# disconnect Zoom and connect it again, when it is first used to create a
+# meeting. Clearing the grants here would disconnect every Zoom user, readers
+# included, and could not be undone by downgrade().
 
 
 def upgrade() -> None:
