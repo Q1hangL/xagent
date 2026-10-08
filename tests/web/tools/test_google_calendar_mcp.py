@@ -2443,6 +2443,267 @@ def test_create_event_error_message_has_no_hint_without_add_google_meet(monkeypa
     assert result["message"] == "Bad Request"
 
 
+_ZOOM_JOIN_URL = "https://us02web.zoom.us/j/85012345678?pwd=abcDEF123"
+
+
+def test_create_event_meeting_link_fills_location_and_description(monkeypatch):
+    """An external meeting's join URL must end up in the invite itself, with
+    no Google Meet conference requested alongside it."""
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Sync",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+            meeting_link=f"  {_ZOOM_JOIN_URL}  ",
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.insert.call_args.kwargs["body"]
+    assert body["location"] == _ZOOM_JOIN_URL
+    assert body["description"] == f"Join the meeting: {_ZOOM_JOIN_URL}"
+    assert "conferenceData" not in body
+
+
+def test_create_event_meeting_link_keeps_location_and_appends_to_description(
+    monkeypatch,
+):
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_create_events(
+        summary="Sync",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+        description="Agenda: roadmap",
+        location="Room 4",
+        meeting_link=_ZOOM_JOIN_URL,
+    )
+
+    body = service.events.return_value.insert.call_args.kwargs["body"]
+    assert body["location"] == "Room 4"
+    assert body["description"] == (
+        f"Agenda: roadmap\n\nJoin the meeting: {_ZOOM_JOIN_URL}"
+    )
+
+
+def test_create_event_meeting_link_is_not_repeated_in_description(monkeypatch):
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+    description = f"Zoom: {_ZOOM_JOIN_URL}"
+
+    calendar.google_calendar_create_events(
+        summary="Sync",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+        description=description,
+        meeting_link=_ZOOM_JOIN_URL,
+    )
+
+    body = service.events.return_value.insert.call_args.kwargs["body"]
+    assert body["description"] == description
+
+
+def test_create_event_blank_meeting_link_is_treated_as_absent(monkeypatch):
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Sync",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+            meeting_link="   ",
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.insert.call_args.kwargs["body"]
+    assert "location" not in body
+    assert "description" not in body
+
+
+def test_create_event_rejects_meeting_link_with_add_google_meet(monkeypatch):
+    """Two conference entry points in one invite is never what the caller
+    wants, and dropping the Meet request also keeps a Meet provisioning
+    failure from taking down an event that already has its link."""
+    get_service = Mock(return_value=_fake_service({"id": "evt1"}))
+    monkeypatch.setattr(calendar, "get_calendar_service", get_service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Sync",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+            add_google_meet=True,
+            meeting_link=_ZOOM_JOIN_URL,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "add_google_meet=False" in result["message"]
+    get_service.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "meeting_link",
+    [
+        "zoom.us/j/85012345678",
+        "javascript:alert(1)",
+        "ftp://zoom.us/j/85012345678",
+        "https:///j/85012345678",
+        "https://[zoom.us/j/85012345678",
+        f"{_ZOOM_JOIN_URL}\nPasscode: 123",
+        f"{_ZOOM_JOIN_URL} (passcode 123)",
+        "https://zoom.us/j/" + "1" * 2100,
+    ],
+)
+def test_create_event_rejects_invalid_meeting_link_before_any_api_call(
+    monkeypatch, meeting_link
+):
+    get_service = Mock(return_value=_fake_service({"id": "evt1"}))
+    monkeypatch.setattr(calendar, "get_calendar_service", get_service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Sync",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+            meeting_link=meeting_link,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "meeting_link" in result["message"]
+    get_service.assert_not_called()
+
+
+def test_update_event_meeting_link_appends_to_existing_description(monkeypatch):
+    """A link-only update must not wipe the description the event already
+    has, and, as a metadata-only edit, must not run an availability check."""
+    existing_event = {"id": "evt1", "description": "Agenda: roadmap"}
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1", meeting_link=_ZOOM_JOIN_URL
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["description"] == (
+        f"Agenda: roadmap\n\nJoin the meeting: {_ZOOM_JOIN_URL}"
+    )
+    assert body["location"] == _ZOOM_JOIN_URL
+    service.freebusy.assert_not_called()
+
+
+def test_update_event_meeting_link_appends_to_the_new_description(monkeypatch):
+    existing_event = {"id": "evt1", "description": "Old agenda"}
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(
+        event_id="evt1",
+        description="New agenda",
+        meeting_link=_ZOOM_JOIN_URL,
+    )
+
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["description"] == f"New agenda\n\nJoin the meeting: {_ZOOM_JOIN_URL}"
+
+
+def test_update_event_meeting_link_keeps_location_and_existing_conference(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "evt1",
+        "location": "Room 4",
+        "description": f"Dial in: {_ZOOM_JOIN_URL}",
+        "conferenceData": {
+            "conferenceId": "abc-defg-hij",
+            "conferenceSolution": {"key": {"type": "hangoutsMeet"}},
+            "entryPoints": [
+                {
+                    "entryPointType": "video",
+                    "uri": "https://meet.google.com/abc-defg-hij",
+                }
+            ],
+        },
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(event_id="evt1", meeting_link=_ZOOM_JOIN_URL)
+
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["location"] == "Room 4"
+    assert body["description"] == existing_event["description"]
+    assert body["conferenceData"] == existing_event["conferenceData"]
+
+
+def test_update_event_meeting_link_does_not_override_explicit_location(monkeypatch):
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(
+        event_id="evt1", location="Room 4", meeting_link=_ZOOM_JOIN_URL
+    )
+
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["location"] == "Room 4"
+    assert body["description"] == f"Join the meeting: {_ZOOM_JOIN_URL}"
+
+
+def test_update_event_rejects_meeting_link_with_add_google_meet(monkeypatch):
+    get_service = Mock(return_value=_fake_service({"id": "evt1"}))
+    monkeypatch.setattr(calendar, "get_calendar_service", get_service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1", add_google_meet=True, meeting_link=_ZOOM_JOIN_URL
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "add_google_meet=False" in result["message"]
+    get_service.assert_not_called()
+
+
+def test_update_event_rejects_invalid_meeting_link_before_any_api_call(monkeypatch):
+    get_service = Mock(return_value=_fake_service({"id": "evt1"}))
+    monkeypatch.setattr(calendar, "get_calendar_service", get_service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1", meeting_link="javascript:alert(1)"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "meeting_link" in result["message"]
+    get_service.assert_not_called()
+
+
+def test_calendar_tool_descriptions_explain_external_meeting_links():
+    """The model only learns the create-the-meeting-first order, and that a
+    failed external meeting must be reported rather than papered over with a
+    link-less event, from these descriptions."""
+    for tool_name in (
+        "google_calendar_create_events",
+        "google_calendar_update_events",
+    ):
+        tool = calendar.mcp._tool_manager.get_tool(tool_name)
+        assert "meeting_link" in tool.parameters["properties"]
+        assert "Never invent" in tool.description
+        assert "tell the user" in tool.description
+
+
 def test_event_response_caps_a_large_event_like_other_tools_in_this_package(
     monkeypatch,
 ):
