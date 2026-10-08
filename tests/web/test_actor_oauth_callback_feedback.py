@@ -1,9 +1,11 @@
 """Actor OAuth callback pages tell the member what to do next.
 
-Every page an actor flow's callback renders when it does not connect must be
-actionable (what happened, what to do, a way to close the window), must keep
-the single-use flow semantics, and must log a reason code without any value
-of the flow itself.
+When an actor flow's callback carries a provider error, fails an actor check,
+or comes back after its sign-in window was used or expired, the page must be
+actionable (what happened, what to do, a way to close the window) and must
+keep the single-use flow semantics. Every callback that does not connect
+before the token exchange logs a reason code without any value of the flow
+itself.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from unittest.mock import Mock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from cryptography.fernet import Fernet
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -246,11 +249,31 @@ def _callback(
     )
 
 
-def _resign(flow: _Flow, **changes: object) -> str:
+def _resign(
+    flow: _Flow, *, lifetime: timedelta = timedelta(minutes=10), **changes: object
+) -> str:
     payload = auth_api.verify_token(flow.state)
     assert payload is not None
     payload.update(changes)
-    return create_access_token(data=payload, expires_delta=timedelta(minutes=10))
+    return create_access_token(data=payload, expires_delta=lifetime)
+
+
+def _expire(db: Session, flow: _Flow, **changes: object) -> str:
+    """Let the whole flow lapse, as it does in a browser after 10 minutes.
+
+    The flow row, the state token and the browser cookie share one lifetime,
+    so the returned state is past its expiry and callers drop the cookie.
+    """
+    db.query(ActorOAuthFlowState).update(
+        {
+            ActorOAuthFlowState.expires_at: datetime.now(timezone.utc)
+            - timedelta(seconds=5)
+        }
+    )
+    db.commit()
+    state = _resign(flow, lifetime=timedelta(seconds=-5), **changes)
+    assert auth_api.verify_token(state) is None
+    return state
 
 
 def _open_flows(db: Session) -> int:
@@ -441,6 +464,127 @@ def test_unrecognized_provider_error_is_generic_and_never_echoed(
         assert "<script" not in body
 
 
+@pytest.mark.parametrize(
+    ("error", "description", "title", "codes"),
+    [
+        # Entra ID redirects carry AADSTS codes in error_description; any
+        # code it sends that is not a known category is a rejected request.
+        (
+            "interaction_required",
+            "AADSTS50076: Due to a configuration change made by your "
+            "administrator, you must use multi-factor authentication.",
+            "The sign-in request was rejected",
+            "interaction_required, AADSTS50076",
+        ),
+        # The not-granted codes decide the category whatever the error is.
+        (
+            "invalid_request",
+            "AADSTS65004: User declined to consent to access the app.",
+            "Permission was not granted",
+            "invalid_request, AADSTS65004",
+        ),
+        (
+            "invalid_request",
+            "AADSTS90095: Admin consent is required for the permissions.",
+            "Permission was not granted",
+            "invalid_request, AADSTS90095",
+        ),
+        # A temporary error stays temporary even with a code attached.
+        (
+            "server_error",
+            "AADSTS90033: A transient error has occurred. Please try again.",
+            "The sign-in service is temporarily unavailable",
+            "server_error, AADSTS90033",
+        ),
+        (
+            "server_error",
+            None,
+            "The sign-in service is temporarily unavailable",
+            "server_error",
+        ),
+    ],
+)
+def test_microsoft_error_category_follows_its_codes(
+    oauth_db, token_endpoint, error, description, title, codes
+) -> None:
+    db, user = oauth_db
+    flow = _start(db, user)
+    query = {"error": error}
+    if description is not None:
+        query["error_description"] = description
+
+    response = _callback(db, flow, **query)
+
+    body = _assert_actionable(response)
+    assert title in body
+    assert f"<code>{codes}</code>" in body
+    if description is not None:
+        assert description.split(": ", 1)[1] not in body
+    token_endpoint.assert_not_called()
+
+
+def test_rejected_request_from_other_providers_names_no_microsoft_admin(
+    oauth_db, token_endpoint
+) -> None:
+    db, user = oauth_db
+    flow = _start(db, user, app_id="calendar")
+
+    response = _callback(db, flow, error="invalid_client")
+
+    body = _assert_actionable(response)
+    assert "The sign-in request was rejected" in body
+    assert "contact your administrator or support" in body
+    assert "Microsoft" not in body
+    assert "<code>invalid_client</code>" in body
+
+
+def test_only_the_first_three_distinct_microsoft_codes_are_shown(
+    oauth_db, token_endpoint, callback_logs
+) -> None:
+    db, user = oauth_db
+    flow = _start(db, user)
+
+    response = _callback(
+        db,
+        flow,
+        error="invalid_client",
+        error_description=(
+            "AADSTS700016 and aadsts700016, then AADSTS7000215, AADSTS50011 "
+            "and AADSTS50020."
+        ),
+    )
+
+    body = _assert_actionable(response)
+    assert "<code>invalid_client, AADSTS700016, AADSTS7000215, AADSTS50011</code>" in (
+        body
+    )
+    assert "AADSTS50020" not in body
+    (log,) = callback_logs()
+    assert "provider_error_code=AADSTS700016,AADSTS7000215,AADSTS50011" in log
+    assert "AADSTS50020" not in log
+
+
+def test_microsoft_codes_are_only_ascii_digits(
+    oauth_db, token_endpoint, callback_logs
+) -> None:
+    db, user = oauth_db
+    flow = _start(db, user)
+    description = "AADSTS\u0666\u0665\u0660\u0660\u0664 and AADSTS\uff11\uff12"
+
+    response = _callback(
+        db, flow, error="invalid_client", error_description=description
+    )
+    unauthenticated = _callback(
+        db, flow, state="not-a-state", error="x", error_description=description
+    )
+
+    assert "<code>invalid_client</code>" in _assert_actionable(response)
+    assert unauthenticated.status_code == 400
+    first, second = callback_logs()
+    assert "provider_error=invalid_client provider_error_code=-" in first
+    assert "reason=state_invalid provider_error=x provider_error_code=-" in second
+
+
 def test_reloading_a_declined_sign_in_window_says_it_was_used(
     oauth_db, token_endpoint, callback_logs
 ) -> None:
@@ -487,7 +631,7 @@ def test_replaying_a_completed_sign_in_keeps_the_grant(
     _assert_no_flow_values(log, flow)
 
 
-def test_expired_sign_in_window_says_it_was_used(
+def test_flow_row_expired_before_its_state_says_it_was_used(
     oauth_db, token_endpoint, callback_logs
 ) -> None:
     db, user = oauth_db
@@ -506,6 +650,94 @@ def test_expired_sign_in_window_says_it_was_used(
     token_endpoint.assert_not_called()
     (log,) = callback_logs()
     assert "reason=flow_used_or_expired" in log
+
+
+def test_sign_in_window_loaded_after_it_expired_says_it_was_used(
+    oauth_db, token_endpoint, callback_logs
+) -> None:
+    db, user = oauth_db
+    flow = _start(db, user)
+    state = _expire(db, flow)
+
+    response = _callback(db, flow, state=state, without_cookie=True)
+
+    body = _assert_actionable(response)
+    assert "This sign-in window has already been used" in body
+    _assert_no_flow_values(body, flow)
+    token_endpoint.assert_not_called()
+    assert _open_flows(db) == 1
+    assert _actor_grants(db) == 0
+    (log,) = callback_logs()
+    assert (
+        "provider=microsoft app_id=outlook actor_flow=true reason=state_expired "
+        "provider_error=- provider_error_code=-"
+    ) in log
+    _assert_no_flow_values(log, flow)
+    assert state not in log
+
+
+def test_consent_declined_after_the_window_expired_explains_how_to_retry(
+    oauth_db, token_endpoint, callback_logs
+) -> None:
+    db, user = oauth_db
+    flow = _start(db, user)
+    state = _expire(db, flow)
+
+    response = _callback(
+        db,
+        flow,
+        state=state,
+        without_cookie=True,
+        error="consent_required",
+        error_description=DECLINED_DESCRIPTION,
+        error_uri=DECLINED_URI,
+    )
+
+    body = _assert_actionable(response)
+    assert "Permission was not granted" in body
+    assert "choose Accept" in body
+    assert "Microsoft 365 admin" in body
+    assert "<code>consent_required, AADSTS65004</code>" in body
+    for raw in ("User declined", "Trace ID", DECLINED_URI):
+        assert raw not in body
+    token_endpoint.assert_not_called()
+    assert _open_flows(db) == 1
+    (log,) = callback_logs()
+    assert "actor_flow=true reason=state_expired" in log
+    assert "provider_error=consent_required provider_error_code=AADSTS65004" in log
+    assert state not in log
+
+
+@pytest.mark.parametrize("mismatch", ["forged", "other_provider", "ordinary_flow"])
+def test_expired_state_that_is_not_this_actor_flow_keeps_its_pages(
+    oauth_db, token_endpoint, callback_logs, mismatch
+) -> None:
+    db, user = oauth_db
+    flow = _start(db, user)
+    if mismatch == "forged":
+        header, payload, signature = _expire(db, flow).split(".")
+        state = ".".join(
+            (header, payload, ("a" if signature[0] != "a" else "b") + signature[1:])
+        )
+    elif mismatch == "other_provider":
+        state = _expire(db, flow, provider="custom")
+    else:
+        state = _expire(db, flow, actor_flow_nonce=None, resource_owner_key=None)
+
+    success = _callback(db, flow, state=state, without_cookie=True)
+    declined = _callback(
+        db, flow, state=state, without_cookie=True, error="consent_required"
+    )
+
+    assert success.status_code == 400
+    assert _body(success) == "<h1>Error: Invalid or expired state</h1>"
+    assert declined.status_code == 400
+    assert _body(declined) == "<h1>Error: consent_required</h1>"
+    token_endpoint.assert_not_called()
+    logs = callback_logs()
+    assert len(logs) == 2
+    for log in logs:
+        assert "actor_flow=unknown reason=state_invalid" in log
 
 
 @pytest.mark.parametrize(
@@ -713,3 +945,211 @@ def test_invalid_state_keeps_its_page_and_logs_reason(
     (log,) = callback_logs()
     assert "actor_flow=unknown reason=state_invalid" in log
     assert tampered not in log
+
+
+def test_malformed_user_claim_on_an_actor_state_logs_its_reason(
+    oauth_db, token_endpoint, callback_logs
+) -> None:
+    db, user = oauth_db
+    flow = _start(db, user)
+    state = _resign(flow, user_id=2**31)
+
+    response = _callback(db, flow, state=state)
+
+    assert response.status_code == 400
+    assert _body(response) == "<h1>Error: Invalid or expired state</h1>"
+    assert _open_flows(db) == 1
+    token_endpoint.assert_not_called()
+    (log,) = callback_logs()
+    assert "app_id=outlook actor_flow=true reason=state_invalid" in log
+    assert state not in log
+    _assert_no_flow_values(log, flow)
+
+
+def _request(query: dict[str, str], cookies: dict[str, str] | None = None):
+    return SimpleNamespace(query_params=query, cookies=cookies or {})
+
+
+def _no_state_provider_error(db, user, monkeypatch):
+    return "microsoft", _request({"error": "access_denied"}), _db_provider("microsoft")
+
+
+def _no_state(db, user, monkeypatch):
+    return "microsoft", _request({"code": "x"}), _db_provider("microsoft")
+
+
+def _no_code(db, user, monkeypatch):
+    flow = _start(db, user)
+    request = _request({"state": flow.state}, dict([flow.cookie]))
+    return "microsoft", request, _db_provider("microsoft")
+
+
+def _restricted_gmail(db, user, monkeypatch):
+    monkeypatch.setattr(auth_api, "get_google_restricted_scopes", lambda: False)
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "google",
+            "app_id": "gmail",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = _request({"state": state, "code": "x"})
+    return "google", request, _db_provider("custom")
+
+
+def _unreadable_verifier(db, user, monkeypatch):
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "microsoft",
+            "app_id": "outlook",
+            # Token-shaped, but sealed under a key this deployment never had.
+            "code_verifier": Fernet(Fernet.generate_key()).encrypt(b"v").decode(),
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = _request({"state": state, "code": "x"})
+    return "microsoft", request, _db_provider("microsoft")
+
+
+def _bare_scoped_grant(db, user, monkeypatch):
+    state = create_access_token(
+        data={"type": "oauth_state", "user_id": user.id, "provider": "github"},
+        expires_delta=timedelta(minutes=10),
+    )
+    return "github", _request({"state": state, "code": "x"}), _db_provider("custom")
+
+
+def _actor_flow_with(db, user, db_provider):
+    flow = _start(db, user)
+    request = _request({"state": flow.state, "code": "x"}, dict([flow.cookie]))
+    return "microsoft", request, db_provider
+
+
+def _hidden_app(db, user, monkeypatch):
+    # An actor flow already stops at its catalog check for a hidden app.
+    app = db.query(PublicMCPApp).filter_by(app_id="outlook").one()
+    app.is_visible_in_connector = False
+    db.commit()
+    request = _request({"state": _ordinary_state(user), "code": "x"})
+    return "microsoft", request, _db_provider("microsoft")
+
+
+def _unconfigured_provider(db, user, monkeypatch):
+    return _actor_flow_with(db, user, None)
+
+
+def _missing_client_config(db, user, monkeypatch):
+    monkeypatch.delenv("MICROSOFT_CLIENT_ID", raising=False)
+    monkeypatch.delenv("MICROSOFT_CLIENT_SECRET", raising=False)
+    db_provider = _db_provider("microsoft")
+    db_provider.client_id = None
+    db_provider.client_secret = None
+    return _actor_flow_with(db, user, db_provider)
+
+
+def _missing_business_id(db, user, monkeypatch):
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "myob",
+            "app_id": "myob",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    return "myob", _request({"state": state, "code": "x"}), _db_provider("custom")
+
+
+@pytest.mark.parametrize(
+    ("callback", "status_code", "page", "logged"),
+    [
+        (
+            _no_state_provider_error,
+            400,
+            "Error: access_denied",
+            "app_id=- actor_flow=unknown reason=provider_error "
+            "provider_error=access_denied",
+        ),
+        (
+            _no_state,
+            400,
+            "Missing code or state",
+            "app_id=- actor_flow=unknown reason=state_missing",
+        ),
+        (
+            _no_code,
+            400,
+            "Missing code or state",
+            "app_id=- actor_flow=unknown reason=code_missing",
+        ),
+        (
+            _restricted_gmail,
+            404,
+            "This app is not currently available",
+            "app_id=gmail actor_flow=false reason=app_restricted",
+        ),
+        (
+            _unreadable_verifier,
+            400,
+            "Session expired",
+            "app_id=outlook actor_flow=false reason=verifier_invalid",
+        ),
+        (
+            _bare_scoped_grant,
+            404,
+            "must be started from its catalog entry",
+            "app_id=- actor_flow=false reason=app_id_missing",
+        ),
+        (
+            _hidden_app,
+            404,
+            "This app is not currently available",
+            "app_id=outlook actor_flow=false reason=app_hidden",
+        ),
+        (
+            _unconfigured_provider,
+            500,
+            "Provider not configured",
+            "app_id=outlook actor_flow=true reason=provider_not_configured",
+        ),
+        (
+            _missing_client_config,
+            500,
+            "OAuth provider not configured",
+            "app_id=outlook actor_flow=true reason=provider_config_missing",
+        ),
+        (
+            _missing_business_id,
+            400,
+            "did not return a businessId",
+            "app_id=myob actor_flow=false reason=business_id_missing",
+        ),
+    ],
+)
+def test_callbacks_stopped_before_the_token_exchange_log_their_reason(
+    oauth_db,
+    token_endpoint,
+    callback_logs,
+    monkeypatch,
+    callback,
+    status_code,
+    page,
+    logged,
+) -> None:
+    db, user = oauth_db
+    provider, request, db_provider = callback(db, user, monkeypatch)
+
+    response = generic_oauth_callback(provider, request, db, db_provider)
+
+    assert response.status_code == status_code
+    assert page in _body(response)
+    token_endpoint.assert_not_called()
+    (log,) = callback_logs()
+    assert f"provider={provider} {logged}" in log
+    for value in (request.query_params.get("state"), *request.cookies.values()):
+        if value:
+            assert value not in log
