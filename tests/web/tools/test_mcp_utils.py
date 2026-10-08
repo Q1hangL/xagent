@@ -2240,6 +2240,76 @@ def test_google_file_error_message_keeps_raw_error_for_non_file_access_403(
     ) == str(error)
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "storageQuotaExceeded",
+        "domainPolicy",
+        "teamDriveFileLimitExceeded",
+        "teamDrivesParentLimit",
+        "cannotMoveTrashedItemIntoTeamDrive",
+    ],
+)
+@pytest.mark.parametrize("editing", [False, True])
+def test_google_file_error_message_keeps_raw_error_for_unlisted_403_reasons(
+    reason, editing
+):
+    error = _google_http_error(
+        403,
+        json.dumps(
+            {"error": {"message": "Denied.", "errors": [{"reason": reason}]}}
+        ).encode("utf-8"),
+    )
+
+    assert not utils.is_google_file_access_error(error)
+    assert utils.google_file_error_message(
+        error, _TEST_FILE_KIND, editing=editing
+    ) == str(error)
+
+
+@pytest.mark.parametrize(
+    "reason", ["insufficientFilePermissions", "appNotAuthorizedToFile", "forbidden"]
+)
+@pytest.mark.parametrize("editing", [False, True])
+def test_google_file_error_message_names_the_file_permission_reason(reason, editing):
+    error = _google_http_error(
+        403,
+        json.dumps(
+            {"error": {"message": "Denied.", "errors": [{"reason": reason}]}}
+        ).encode("utf-8"),
+    )
+
+    message = utils.google_file_error_message(error, _TEST_FILE_KIND, editing=editing)
+
+    assert utils.is_google_file_access_error(error)
+    assert message.startswith(
+        "Google Docs could not make this change"
+        if editing
+        else "Google Docs could not open this document"
+    )
+    assert message.endswith(f"Google API response: HTTP 403 Denied. (reason: {reason})")
+
+
+def test_google_api_error_summary_appends_reasons_only_when_asked():
+    error = _google_http_error(
+        403,
+        b'{"error": {"message": "Denied.", "errors": [{"reason": "forbidden"}]}}',
+    )
+
+    assert utils.google_api_error_summary(error) == "HTTP 403 Denied."
+    assert (
+        utils.google_api_error_summary(error, with_reasons=True)
+        == "HTTP 403 Denied. (reason: forbidden)"
+    )
+    assert (
+        utils.google_api_error_summary(
+            _google_http_error(404, b'{"error": {"message": "Gone."}}'),
+            with_reasons=True,
+        )
+        == "HTTP 404 Gone."
+    )
+
+
 def test_google_file_error_message_describes_a_refused_edit():
     denied = _google_http_error(
         403, b'{"error": {"message": "The caller does not have permission"}}'

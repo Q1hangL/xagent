@@ -1829,19 +1829,26 @@ def google_api_error_reasons(exc: BaseException) -> frozenset[str]:
     return frozenset(reasons)
 
 
-def google_api_error_summary(exc: BaseException) -> str:
+def google_api_error_summary(exc: BaseException, *, with_reasons: bool = False) -> str:
     """Return "HTTP <status> <message>" for a Google API error.
 
     Unlike ``str(exc)``, this leaves out the request URI. Falls back to
-    ``str(exc)`` for an exception that carries no HTTP status.
+    ``str(exc)`` for an exception that carries no HTTP status. With
+    ``with_reasons=True``, the API's machine-readable reasons are appended
+    as " (reason: <a>, <b>)" when there are any.
     """
     status = google_api_error_status(exc)
     if status is None:
         return str(exc)
+    summary = f"HTTP {status}"
     detail = getattr(exc, "reason", "")
     if isinstance(detail, str) and detail:
-        return f"HTTP {status} {detail}"
-    return f"HTTP {status}"
+        summary += f" {detail}"
+    if with_reasons:
+        reasons = google_api_error_reasons(exc)
+        if reasons:
+            summary += f" (reason: {', '.join(sorted(reasons))})"
+    return summary
 
 
 # 403 reasons about the request or the token (rate limits, quota, a disabled
@@ -1859,6 +1866,20 @@ GOOGLE_NON_FILE_ACCESS_403_REASONS = frozenset(
         "SERVICE_DISABLED",
         "insufficientPermissions",
         "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+    }
+)
+
+# 403 reasons that mean the connected account, or this app, may not open or
+# change one file. A 403 is described as a file-access problem only when it
+# has one of these reasons or no reason at all (the Docs, Sheets and Slides
+# APIs answer a file the account cannot open with a bare PERMISSION_DENIED).
+# Any other reason, such as storageQuotaExceeded, domainPolicy or a shared
+# drive limit, is about something else, so its raw error is kept.
+GOOGLE_FILE_PERMISSION_403_REASONS = frozenset(
+    {
+        "insufficientFilePermissions",
+        "appNotAuthorizedToFile",
+        "forbidden",
     }
 )
 
@@ -2032,15 +2053,19 @@ def resolve_google_file_id(
 
 def is_google_file_access_error(exc: BaseException) -> bool:
     """Whether ``exc`` means the file does not exist or the connected
-    account cannot open or change it: an HTTP 404, or a 403 whose reasons
-    are not about rate limits, quota, a disabled API or a missing OAuth
-    scope."""
+    account cannot open or change it: an HTTP 404, or a 403 with one of
+    ``GOOGLE_FILE_PERMISSION_403_REASONS`` or no reason at all. A 403 with
+    any of ``GOOGLE_NON_FILE_ACCESS_403_REASONS`` (rate limits, quota, a
+    disabled API, a missing OAuth scope) never counts."""
     status = google_api_error_status(exc)
     if status == 404:
         return True
-    return status == 403 and not (
-        google_api_error_reasons(exc) & GOOGLE_NON_FILE_ACCESS_403_REASONS
-    )
+    if status != 403:
+        return False
+    reasons = google_api_error_reasons(exc)
+    if reasons & GOOGLE_NON_FILE_ACCESS_403_REASONS:
+        return False
+    return not reasons or bool(reasons & GOOGLE_FILE_PERMISSION_403_REASONS)
 
 
 def google_file_error_message(
@@ -2061,7 +2086,7 @@ def google_file_error_message(
     """
     if not is_google_file_access_error(exc):
         return str(exc)
-    summary = google_api_error_summary(exc)
+    summary = google_api_error_summary(exc, with_reasons=True)
     status = google_api_error_status(exc)
     if editing and status == 403:
         return (
