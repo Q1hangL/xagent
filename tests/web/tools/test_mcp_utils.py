@@ -2307,6 +2307,10 @@ def test_google_file_error_message_names_the_file_permission_reason(reason, edit
         (403, None, False, True),
         (403, "storageQuotaExceeded", False, False),
         (500, "backendError", False, False),
+        # The unavailable check runs first, so appNotAuthorizedToFile counts
+        # even next to a non-file reason; a permission reason does not.
+        (403, ("appNotAuthorizedToFile", "rateLimitExceeded"), True, True),
+        (403, ("insufficientFilePermissions", "rateLimitExceeded"), False, False),
     ],
 )
 def test_google_file_error_classifiers_share_one_definition(
@@ -2314,7 +2318,8 @@ def test_google_file_error_classifiers_share_one_definition(
 ):
     body: dict = {"error": {"message": "Denied."}}
     if reason:
-        body["error"]["errors"] = [{"reason": reason}]
+        reasons = (reason,) if isinstance(reason, str) else reason
+        body["error"]["errors"] = [{"reason": r} for r in reasons]
     error = _google_http_error(status, json.dumps(body).encode("utf-8"))
 
     assert utils.is_google_file_unavailable_error(error) is unavailable

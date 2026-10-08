@@ -2082,10 +2082,13 @@ def is_google_file_unavailable_error(exc: BaseException) -> bool:
 
 def is_google_file_access_error(exc: BaseException) -> bool:
     """Whether ``exc`` means the file does not exist or the connected
-    account cannot open or change it: ``is_google_file_unavailable_error``,
-    or a 403 with one of ``GOOGLE_FILE_PERMISSION_403_REASONS`` or no reason
-    at all. A 403 with any of ``GOOGLE_NON_FILE_ACCESS_403_REASONS`` (rate
-    limits, quota, a disabled API, a missing OAuth scope) never counts."""
+    account cannot open or change it.
+
+    ``is_google_file_unavailable_error`` is checked first, so a 404 or a 403
+    with ``appNotAuthorizedToFile`` always counts. Any other 403 counts when
+    it has none of ``GOOGLE_NON_FILE_ACCESS_403_REASONS`` (rate limits,
+    quota, a disabled API, a missing OAuth scope) and either one of
+    ``GOOGLE_FILE_PERMISSION_403_REASONS`` or no reason at all."""
     if is_google_file_unavailable_error(exc):
         return True
     if google_api_error_status(exc) != 403:
