@@ -959,12 +959,16 @@ def test_create_meeting_missing_scope_asks_the_user_to_reconnect(
     """A grant made before meeting:write:meeting was requested cannot create
     meetings; the model must be told to get the user to reconnect, and must
     not fall back to a calendar event without a link. Zoom's own error body
-    is JSON, read through _extract_error_detail."""
+    is JSON, read through _extract_error_detail; a body that is not JSON
+    falls back to the raw text and must be recognized the same way."""
     response = (
         MockResponse(status_code=status_code, json_data=_MISSING_SCOPE_BODY)
         if body == "json"
-        else MockResponse(status_code=status_code, text=json.dumps(_MISSING_SCOPE_BODY))
+        else MockResponse(status_code=status_code, text=_MISSING_SCOPE_BODY["message"])
     )
+    if body == "text":
+        # Keep this case on the raw-text fallback, not the JSON branch.
+        assert zoom._extract_error_detail(response) is None
     monkeypatch.setattr(zoom.requests, "request", Mock(return_value=response))
 
     message = _create_meeting_error(
