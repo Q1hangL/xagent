@@ -117,9 +117,12 @@ def test_upgrade_is_idempotent(tmp_path):
         assert provider_count == 1
 
 
-def test_seed_rows_match_registry(tmp_path):
+def test_seed_rows_match_registry(tmp_path, monkeypatch):
     """The migration snapshot and the runtime registry must define the same
     zoom rows (the migration is a frozen copy; this catches drift)."""
+    # The seed is the read-only row; with meeting creation enabled the
+    # registry row differs on purpose, so compare against the default.
+    monkeypatch.delenv("XAGENT_ZOOM_MEETING_WRITE_ENABLED", raising=False)
     from xagent.web.builtin_mcp_registry import (
         get_builtin_oauth_provider_rows,
         get_builtin_public_mcp_app_rows,
