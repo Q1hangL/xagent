@@ -12,21 +12,31 @@ accepted only when it names the app's own builtin identity.
 from __future__ import annotations
 
 from copy import deepcopy
+from http.cookies import SimpleCookie
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm.attributes import flag_modified
 
+from xagent.core.utils.encryption import encrypt_value
 from xagent.web import mcp_apps
+from xagent.web.api import auth as auth_api
 from xagent.web.api.auth import (
     _ensure_user_mcp_server,
     _require_actor_oauth_personal_link,
+    generic_oauth_callback,
+    start_builtin_oauth_for_resource_owner,
 )
 from xagent.web.builtin_mcp_registry import seed_builtin_oauth_and_public_mcp_apps
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.user import User
+from xagent.web.models.user_oauth import UserOAuth
 
 # Builtin OAuth apps whose catalog rows declare a builtin_provenance marker,
 # mapped to their OAuth provider.
@@ -121,7 +131,17 @@ def test_actor_paths_accept_row_created_by_catalog_callback(seeded_db, app_id) -
     ]
 
 
-def test_actor_created_row_stays_canonical_after_catalog_connect(seeded_db) -> None:
+@pytest.mark.parametrize("marker_persisted", [False, True])
+def test_actor_created_row_stays_canonical_after_catalog_connect(
+    seeded_db, marker_persisted
+) -> None:
+    """A catalog connect on an actor-created row keeps the actor paths working.
+
+    The catalog callback merges its metadata, marker included, into the
+    existing ``auth`` dict in place. Today that in-place change is not
+    persisted, so the stored row keeps the actor's shape; the second case
+    persists the merged metadata, the shape a row gets once that write lands.
+    """
     db, web_user, account = seeded_db
     server = mcp_apps.ensure_builtin_oauth_server_visibility_for_user(
         db, user_id=int(account.id), app_id="word"
@@ -129,13 +149,27 @@ def test_actor_created_row_stays_canonical_after_catalog_connect(seeded_db) -> N
     db.commit()
     assert server.auth == {"app_id": "word", "provider": "microsoft"}
 
-    _connect_from_catalog(db, web_user, "word")
+    app_info = _catalog_app(db, "word")
+    _ensure_user_mcp_server(db, int(web_user.id), app_info)
+    if marker_persisted:
+        flag_modified(server, "auth")
+    db.commit()
+    db.expire_all()
 
+    expected_auth: dict[str, Any] = {"app_id": "word", "provider": "microsoft"}
+    if marker_persisted:
+        expected_auth["builtin_provenance"] = _catalog_marker(db, "word")
+    assert server.auth == expected_auth
     assert (
         mcp_apps.require_builtin_oauth_server_definition(
             db, app_id="word", provider="microsoft"
         ).id
         == server.id
+    )
+    classified = mcp_apps.classify_actor_builtin_oauth_server(db, server)
+    assert classified is not None and classified["id"] == "word"
+    _require_actor_oauth_personal_link(
+        db, user_id=int(account.id), provider="microsoft", app_id="word"
     )
 
 
@@ -294,3 +328,120 @@ def test_stamped_row_keeps_other_canonical_checks(seeded_db, field_name, value) 
         mcp_apps.require_builtin_oauth_server_definition(
             db, app_id="word", provider="microsoft"
         )
+
+
+ACTOR_OWNER = "workspace:member:actor-one"
+
+
+class _ProviderResponse:
+    def __init__(self, data: dict[str, object]) -> None:
+        self._data = data
+        self.status_code = 200
+
+    def json(self) -> dict[str, object]:
+        return self._data
+
+
+def _oauth_provider(provider: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        client_id=encrypt_value("client-id"),
+        client_secret=encrypt_value("client-secret"),
+        auth_url="https://provider.example/authorize",
+        token_url="https://provider.example/token",
+        userinfo_url="https://provider.example/me",
+        redirect_uri=f"https://xagent.example/api/auth/{provider}/callback",
+        default_scopes=["profile.read"],
+        user_id_path="id",
+        email_path="email",
+    )
+
+
+def _actor_flow_cookie(response) -> tuple[str, str]:
+    parsed = SimpleCookie()
+    parsed.load(response.headers["set-cookie"])
+    (cookie,) = [
+        (name, morsel.value)
+        for name, morsel in parsed.items()
+        if name.startswith("xagent_actor_oauth_")
+    ]
+    return cookie
+
+
+@pytest.mark.parametrize(
+    "app_id",
+    sorted(
+        app_id
+        for app_id, provider in STAMPED_BUILTIN_OAUTH_APPS.items()
+        if provider == "microsoft"
+    ),
+)
+def test_actor_oauth_completes_on_row_created_by_catalog_callback(
+    seeded_db, monkeypatch, app_id
+) -> None:
+    """Start and callback of an actor OAuth flow both accept the stamped row."""
+    db, web_user, account = seeded_db
+    provider = STAMPED_BUILTIN_OAUTH_APPS[app_id]
+    server = _connect_from_catalog(db, web_user, app_id)
+    stored_auth = deepcopy(server.auth)
+    assert "builtin_provenance" in stored_auth
+    mcp_apps.ensure_builtin_oauth_server_visibility_for_user(
+        db, user_id=int(account.id), app_id=app_id
+    )
+    db.commit()
+
+    start = start_builtin_oauth_for_resource_owner(
+        provider=provider,
+        app_id=app_id,
+        user=account,
+        resource_owner_key=ACTOR_OWNER,
+        redirect="https://actor.example/settings",
+        db=db,
+        db_provider=_oauth_provider(provider),
+    )
+    db.commit()
+    assert start.status_code == 307
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    cookie_name, cookie_value = _actor_flow_cookie(start)
+
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=_ProviderResponse(
+                {
+                    "access_token": "actor-access",
+                    "refresh_token": "actor-refresh",
+                    "expires_in": 3600,
+                    "scope": "profile.read",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=_ProviderResponse(
+                {"id": "member-account", "email": "member@example.com"}
+            )
+        ),
+    )
+    response = generic_oauth_callback(
+        provider,
+        SimpleNamespace(
+            query_params={"state": state, "code": "code"},
+            cookies={cookie_name: cookie_value},
+        ),
+        db,
+        _oauth_provider(provider),
+    )
+
+    assert response.status_code == 200
+    (credential,) = (
+        db.query(UserOAuth).filter(UserOAuth.resource_owner_key == ACTOR_OWNER).all()
+    )
+    assert (credential.user_id, credential.provider) == (int(account.id), app_id)
+    assert credential.access_token
+    db.refresh(server)
+    assert server.auth == stored_auth
+    assert db.query(MCPServer).count() == 1
