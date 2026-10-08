@@ -1,12 +1,18 @@
 import json
+import os
+import sys
 import urllib.parse
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import requests
+from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
 from xagent.web.tools.mcp import zoom
+
+MEETING_WRITE_FLAG = "XAGENT_ZOOM_MEETING_WRITE_ENABLED"
 
 
 class MockResponse:
@@ -1058,13 +1064,20 @@ _CREATE_MEETING_ARGS = {
 }
 
 
+def _meeting_write_server() -> FastMCP:
+    """A server with the tools zoom.py registers when meeting writes are on."""
+    server = FastMCP("zoom-mcp-meeting-write")
+    zoom._register_meeting_write_tools(server)
+    return server
+
+
 async def _call_create_meeting_over_mcp(arguments):
     """Call the tool through a real MCP client session, as the agent does,
     and return the CallToolResult the client receives."""
     from mcp.shared.memory import create_connected_server_and_client_session
 
     async with create_connected_server_and_client_session(
-        zoom.mcp._mcp_server
+        _meeting_write_server()._mcp_server
     ) as session:
         return await session.call_tool("zoom_create_meeting", arguments)
 
@@ -1149,7 +1162,7 @@ def test_create_meeting_is_annotated_as_non_idempotent_write():
     guard, so an identical repeat after a successful create in the same turn
     returns the first meeting instead of creating a second one. Failures are
     MCP errors, so a retry after one still runs."""
-    tool = zoom.mcp._tool_manager.get_tool("zoom_create_meeting")
+    tool = _meeting_write_server()._tool_manager.get_tool("zoom_create_meeting")
 
     assert tool.annotations is not None
     assert tool.annotations.idempotentHint is False
@@ -1157,7 +1170,7 @@ def test_create_meeting_is_annotated_as_non_idempotent_write():
 
 
 def test_create_meeting_description_explains_the_calendar_hand_off():
-    tool = zoom.mcp._tool_manager.get_tool("zoom_create_meeting")
+    tool = _meeting_write_server()._tool_manager.get_tool("zoom_create_meeting")
 
     assert "does not invite or email anyone" in tool.description
     assert "meeting_link" in tool.description
@@ -1167,13 +1180,54 @@ def test_create_meeting_description_explains_the_calendar_hand_off():
     assert "keep this join_url" in tool.description
 
 
-def test_zoom_app_registry_requests_meeting_write_scope():
-    """zoom_create_meeting calls POST /users/me/meetings, which needs the
-    user-level granular scope meeting:write:meeting."""
-    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+_READ_TOOLS = {
+    "zoom_list_meetings",
+    "zoom_get_meeting",
+    "zoom_list_recordings",
+    "zoom_get_meeting_transcript",
+    "zoom_get_current_user",
+}
 
-    zoom_app = next(
-        row for row in get_builtin_public_mcp_app_rows() if row["app_id"] == "zoom"
+
+@pytest.mark.parametrize("value", [None, "false", "true"])
+async def test_create_meeting_is_offered_only_when_meeting_write_is_enabled(
+    monkeypatch, value
+):
+    """Launch the Zoom MCP server the way the host does (registry launch
+    config, host-built environment) and list its tools over stdio. Without
+    the flag, the scope is not requested, so the tool must not be offered."""
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
+    from xagent.web.tools.config import WebToolConfig
+
+    if value is None:
+        monkeypatch.delenv(MEETING_WRITE_FLAG, raising=False)
+    else:
+        monkeypatch.setenv(MEETING_WRITE_FLAG, value)
+    app_info = get_builtin_public_mcp_app("zoom")
+    transport = WebToolConfig(
+        db=None, request=None
+    )._build_oauth_mcp_stdio_transport_config(
+        server=SimpleNamespace(name="Zoom"),
+        app_info={"launch_config": app_info["launch_config"]},
+        access_token="access-token",
     )
-    assert "meeting:write:meeting" in zoom_app["oauth_scopes"]
-    assert "meeting:write:meeting:admin" not in zoom_app["oauth_scopes"]
+    env = dict(transport["env"])
+    # Only what the test process needs to import xagent; the flag itself
+    # must come from the host-built environment above.
+    for name in ("PATH", "PYTHONPATH"):
+        if os.environ.get(name):
+            env[name] = os.environ[name]
+    params = StdioServerParameters(
+        command=sys.executable, args=transport["args"], env=env
+    )
+
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools = {tool.name for tool in (await session.list_tools()).tools}
+
+    assert _READ_TOOLS <= tools
+    assert ("zoom_create_meeting" in tools) is (value == "true")

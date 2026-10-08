@@ -14,7 +14,11 @@ from ..builtin_identity import (
     builtin_provenance_identity,
     canonicalize_builtin_identity,
 )
-from ..config import get_google_restricted_scopes
+from ..config import (
+    ZOOM_MEETING_WRITE_ENABLED,
+    get_google_restricted_scopes,
+    get_zoom_meeting_write_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +26,17 @@ GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 GOOGLE_DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 GOOGLE_GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 GOOGLE_RESTRICTED_SCOPES = frozenset({GOOGLE_DRIVE_SCOPE, GOOGLE_GMAIL_SCOPE})
+
+# Requested, and zoom_create_meeting offered, only when
+# XAGENT_ZOOM_MEETING_WRITE_ENABLED is on (see get_zoom_meeting_write_enabled).
+ZOOM_MEETING_WRITE_SCOPE = "meeting:write:meeting"
+ZOOM_READ_ONLY_DESCRIPTION = (
+    "Connect to Zoom to look up meetings, and read cloud recordings and transcripts."
+)
+ZOOM_MEETING_WRITE_DESCRIPTION = (
+    "Connect to Zoom to schedule meetings, look up meetings, and read cloud "
+    "recordings and transcripts."
+)
 
 OAUTH_PROVIDERS_TABLE = sa.table(
     "oauth_providers",
@@ -430,6 +445,7 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
 
 def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
     restricted_scopes = get_google_restricted_scopes()
+    zoom_meeting_write = get_zoom_meeting_write_enabled()
     return [
         {
             "app_id": "linkedin",
@@ -925,16 +941,24 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "zoom",
             "name": "Zoom",
-            "description": "Connect to Zoom to schedule meetings, look up meetings, and read cloud recordings and transcripts.",
+            "description": (
+                ZOOM_MEETING_WRITE_DESCRIPTION
+                if zoom_meeting_write
+                else ZOOM_READ_ONLY_DESCRIPTION
+            ),
             "icon": "https://www.google.com/s2/favicons?domain=zoom.us&sz=128",
             "transport": "oauth",
             "provider_name": "zoom",
             "category": "Scheduling",
+            # Every scope here is requested at authorization time, and a Zoom
+            # app that lacks one may reject the whole request, read-only
+            # connections included. So the write scope is opt-in; with the
+            # flag off this row is exactly the frozen seed row.
             "oauth_scopes": [
                 "meeting:read:meeting",
                 "meeting:read:list_meetings",
                 "meeting:read:past_meeting",
-                "meeting:write:meeting",
+                *([ZOOM_MEETING_WRITE_SCOPE] if zoom_meeting_write else []),
                 "cloud_recording:read:list_recording_files",
                 "cloud_recording:read:meeting_transcript",
                 "user:read:user",
@@ -944,6 +968,18 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.zoom"],
                 "env_mapping": {"ZOOM_ACCESS_TOKEN": "access_token"},
+                # The MCP subprocess does not inherit this process's
+                # environment; zoom.py registers zoom_create_meeting only
+                # when the forwarded flag is on.
+                **(
+                    {
+                        "static_env": {
+                            ZOOM_MEETING_WRITE_ENABLED: ZOOM_MEETING_WRITE_ENABLED
+                        }
+                    }
+                    if zoom_meeting_write
+                    else {}
+                ),
             },
         },
         {
@@ -2136,6 +2172,66 @@ def sync_google_scope_policy(bind: Connection) -> None:
             ",".join(changes),
             get_google_restricted_scopes(),
         )
+
+
+def sync_zoom_meeting_write_policy(bind: Connection) -> None:
+    """Sync the environment-owned fields of an existing Zoom catalog row.
+
+    XAGENT_ZOOM_MEETING_WRITE_ENABLED decides the Zoom row's oauth_scopes,
+    launch_config and default description, so changing it must converge a
+    row written under the other value, as sync_google_scope_policy does for
+    Google. oauth_scopes and launch_config are code-owned and follow the
+    registry. description is admin-editable, so only the other setting's
+    default is replaced, re-checked inside the UPDATE itself.
+    """
+    expected = get_builtin_public_mcp_app("zoom")
+    if expected is None:
+        return
+    enabled = get_zoom_meeting_write_enabled()
+    other_description = (
+        ZOOM_READ_ONLY_DESCRIPTION if enabled else ZOOM_MEETING_WRITE_DESCRIPTION
+    )
+
+    row = (
+        bind.execute(
+            sa.select(
+                PUBLIC_MCP_APPS_TABLE.c.oauth_scopes,
+                PUBLIC_MCP_APPS_TABLE.c.launch_config,
+                PUBLIC_MCP_APPS_TABLE.c.description,
+            ).where(PUBLIC_MCP_APPS_TABLE.c.app_id == "zoom")
+        )
+        .mappings()
+        .first()
+    )
+    if row is None:
+        return
+
+    changes: dict[str, Any] = {
+        field: expected[field]
+        for field in ("oauth_scopes", "launch_config")
+        if row[field] != expected[field]
+    }
+    if row["description"] == other_description:
+        changes["description"] = sa.case(
+            (
+                PUBLIC_MCP_APPS_TABLE.c.description == other_description,
+                expected["description"],
+            ),
+            else_=PUBLIC_MCP_APPS_TABLE.c.description,
+        )
+    if not changes:
+        return
+
+    bind.execute(
+        sa.update(PUBLIC_MCP_APPS_TABLE)
+        .where(PUBLIC_MCP_APPS_TABLE.c.app_id == "zoom")
+        .values(**changes)
+    )
+    logger.info(
+        "Synced Zoom meeting write policy: fields=%s meeting_write=%s",
+        ",".join(changes),
+        enabled,
+    )
 
 
 def _filter_row(row: dict[str, Any], allowed_columns: set[str]) -> dict[str, Any]:

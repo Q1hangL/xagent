@@ -253,6 +253,7 @@ PUBLIC_API_BASE_URL = "XAGENT_PUBLIC_API_BASE_URL"
 S2S_API_BASE_URL = "XAGENT_S2S_API_BASE_URL"
 TRIGGER_CALLBACK_BASE_URL = "XAGENT_TRIGGER_CALLBACK_BASE_URL"
 GOOGLE_RESTRICTED_SCOPES_ENABLED = "XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED"
+ZOOM_MEETING_WRITE_ENABLED = "XAGENT_ZOOM_MEETING_WRITE_ENABLED"
 GMAIL_WATCH_ENABLED = "XAGENT_GMAIL_WATCH_ENABLED"
 GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS"
 GMAIL_WATCH_RENEWAL_LEAD_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_LEAD_SECONDS"
@@ -2032,6 +2033,17 @@ def get_gmail_callback_base_url() -> str | None:
 def get_google_restricted_scopes() -> bool:
     """Enable Gmail and full Drive authorization only in the review environment."""
     return _get_bool_env(GOOGLE_RESTRICTED_SCOPES_ENABLED, False)
+
+
+def get_zoom_meeting_write_enabled() -> bool:
+    """Whether the Zoom connector may request meeting:write:meeting.
+
+    Off by default: every scope in the Zoom catalog row is requested at
+    authorization time, and a Zoom app that has not been granted this scope
+    can reject the whole request, read-only connections included. When on,
+    the scope is requested and zoom_create_meeting is offered to the model.
+    """
+    return _get_bool_env(ZOOM_MEETING_WRITE_ENABLED, False)
 
 
 def get_gmail_watch_enabled() -> bool:

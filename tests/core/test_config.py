@@ -291,6 +291,18 @@ def test_google_scope_config(monkeypatch, value):
     assert config.get_google_restricted_scopes() is (value in {"true", "1", "ON"})
 
 
+@pytest.mark.parametrize("value", [None, "false", "", "invalid", "true", "1", "ON"])
+def test_zoom_meeting_write_config(monkeypatch, value):
+    flag = "XAGENT_ZOOM_MEETING_WRITE_ENABLED"
+    if value is None:
+        monkeypatch.delenv(flag, raising=False)
+    else:
+        monkeypatch.setenv(flag, value)
+
+    assert flag == config.ZOOM_MEETING_WRITE_ENABLED
+    assert config.get_zoom_meeting_write_enabled() is (value in {"true", "1", "ON"})
+
+
 class TestEnvironmentVariableConstants:
     """Test environment variable constant names."""
 

@@ -12,6 +12,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
+from ....config import get_zoom_meeting_write_enabled
 from .utils import offset_datetime_string, resolve_zoneinfo, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
@@ -380,7 +381,6 @@ def zoom_get_meeting(meeting_id: str) -> str:
         return _error(str(e))
 
 
-@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False))
 def zoom_create_meeting(
     topic: str,
     start_time: str,
@@ -476,6 +476,23 @@ def zoom_create_meeting(
             "(meeting_link for Google Calendar)."
         ),
     )
+
+
+def _register_meeting_write_tools(server: FastMCP) -> None:
+    """Register the tools that need the meeting:write:meeting scope.
+
+    The catalog requests that scope only when XAGENT_ZOOM_MEETING_WRITE_ENABLED
+    is on, and only then forwards the flag to this process (see the zoom row
+    in builtin_mcp_registry). Without it the tool is not offered at all, so
+    the model cannot pick a create that every connection would refuse.
+    """
+    server.tool(
+        annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False)
+    )(zoom_create_meeting)
+
+
+if get_zoom_meeting_write_enabled():
+    _register_meeting_write_tools(mcp)
 
 
 @mcp.tool()
