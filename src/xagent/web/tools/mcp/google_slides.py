@@ -35,8 +35,10 @@ setup_proxy_env()
 
 mcp = FastMCP("google-slides-mcp")
 
+# "(?!e/)" skips a published-to-the-web link (".../d/e/<publish-id>/pub"),
+# whose "e" segment is not the presentation id.
 _PRESENTATION_URL_ID_PATTERN = re.compile(
-    r"/presentation/(?:u/\d+/)?d/([a-zA-Z0-9_-]+)"
+    r"/presentation/(?:u/\d+/)?d/(?!e/)([a-zA-Z0-9_-]+)"
 )
 _PRESENTATION_KIND = GoogleFileKind(
     product="Google Slides",

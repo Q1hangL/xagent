@@ -94,6 +94,24 @@ def test_get_document_error_keeps_non_ascii_input_readable(monkeypatch):
     assert "\\u" not in raw
 
 
+def test_get_document_rejects_a_published_link_instead_of_reading_e_as_the_id(
+    monkeypatch,
+):
+    _, get_service = _mock_docs_service(monkeypatch)
+
+    result = json.loads(
+        google_docs.google_docs_get_document(
+            "https://docs.google.com/document/d/e/2PACX-1vTabc123/pub"
+        )
+    )
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert "is a published-to-the-web link" in message
+    assert "https://docs.google.com/document/d/..." in message
+    get_service.assert_not_called()
+
+
 def test_get_document_names_a_link_to_another_kind_of_google_file(monkeypatch):
     _, get_service = _mock_docs_service(monkeypatch)
 

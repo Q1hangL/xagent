@@ -2712,6 +2712,23 @@ def test_get_presentation_rejects_a_title_without_calling_the_api(monkeypatch):
     get_service.assert_not_called()
 
 
+def test_get_presentation_rejects_a_published_link_instead_of_reading_e_as_the_id(
+    monkeypatch,
+):
+    get_service = Mock()
+    monkeypatch.setattr(google_slides, "get_slides_service", get_service)
+
+    result = json.loads(
+        google_slides.google_slides_get_presentation(
+            "https://docs.google.com/presentation/d/e/2PACX-1vRabc123/pub?start=false"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "is a published-to-the-web link" in result["message"]
+    get_service.assert_not_called()
+
+
 def test_get_presentation_resolves_multi_account_presentation_url(monkeypatch):
     presentations = Mock()
     presentations.get.return_value.execute.return_value = {

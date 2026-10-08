@@ -579,6 +579,23 @@ def test_id_taking_tools_reject_a_title_without_calling_the_api(monkeypatch, inv
     get_service.assert_not_called()
 
 
+def test_get_spreadsheet_rejects_a_published_link_instead_of_reading_e_as_the_id(
+    monkeypatch,
+):
+    get_service = Mock()
+    monkeypatch.setattr(google_sheets, "get_sheets_service", get_service)
+
+    result = json.loads(
+        google_sheets.google_sheets_get_spreadsheet(
+            "https://docs.google.com/spreadsheets/d/e/2PACX-1vQabc123/pubhtml"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "is a published-to-the-web link" in result["message"]
+    get_service.assert_not_called()
+
+
 _VIEW_ONLY_403 = {
     "error": {
         "code": 403,

@@ -25,7 +25,9 @@ setup_proxy_env()
 
 mcp = FastMCP("google-docs-mcp")
 
-_DOCUMENT_URL_ID_PATTERN = re.compile(r"/document/(?:u/\d+/)?d/([a-zA-Z0-9_-]+)")
+# "(?!e/)" skips a published-to-the-web link (".../d/e/<publish-id>/pub"),
+# whose "e" segment is not the document id.
+_DOCUMENT_URL_ID_PATTERN = re.compile(r"/document/(?:u/\d+/)?d/(?!e/)([a-zA-Z0-9_-]+)")
 _DOCUMENT_KIND = GoogleFileKind(
     product="Google Docs",
     noun="document",

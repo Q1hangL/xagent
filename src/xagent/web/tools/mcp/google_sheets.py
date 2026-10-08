@@ -22,7 +22,11 @@ setup_proxy_env()
 
 mcp = FastMCP("google-sheets-mcp")
 
-_SPREADSHEET_URL_ID_PATTERN = re.compile(r"/spreadsheets/(?:u/\d+/)?d/([a-zA-Z0-9_-]+)")
+# "(?!e/)" skips a published-to-the-web link (".../d/e/<publish-id>/pubhtml"),
+# whose "e" segment is not the spreadsheet id.
+_SPREADSHEET_URL_ID_PATTERN = re.compile(
+    r"/spreadsheets/(?:u/\d+/)?d/(?!e/)([a-zA-Z0-9_-]+)"
+)
 _SPREADSHEET_KIND = GoogleFileKind(
     product="Google Sheets",
     noun="spreadsheet",

@@ -1941,6 +1941,10 @@ _GOOGLE_EDITOR_LINK_PRODUCTS = (
     ("/presentation/", "Google Slides"),
 )
 
+# A published-to-the-web link (".../d/e/<publish-id>/pub") carries a publish
+# token in place of the file id.
+_PUBLISHED_LINK_RE = re.compile(r"/d/e/")
+
 _LINK_PREFIX_RE = re.compile(
     r"^(?:[a-z][a-z0-9+.-]*://|www\.|[a-z0-9-]+\.google\.com/)"
 )
@@ -1991,6 +1995,12 @@ def resolve_google_file_id(
             return match.group(1)
     shown = _shown_input(resolved)
     lowered = decoded.lower()
+    if "docs.google.com" in lowered and _PUBLISHED_LINK_RE.search(lowered):
+        raise ValueError(
+            f"{field_name} {shown!r} is a published-to-the-web link, which "
+            "does not contain the file's id. Ask the user for the "
+            f"{kind.noun}'s own link ({kind.link_example})."
+        )
     if "docs.google.com" in lowered:
         for segment, product in _GOOGLE_EDITOR_LINK_PRODUCTS:
             if segment in lowered and product != kind.product:
