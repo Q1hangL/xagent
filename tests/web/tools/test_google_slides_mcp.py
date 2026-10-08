@@ -1939,8 +1939,11 @@ def test_outline_deck_maps_cover_and_body_placeholders_and_replaces_default_page
     created = json.loads(google_slides.google_slides_create_presentation("Q3 Review"))
 
     assert created["default_slide_id"] == "p"
-    assert "default_slide_id='p'" in created["next_step"]
-    assert "layout='TITLE'" in created["next_step"]
+    next_step = created["next_step"]
+    assert next_step.startswith("When you add slides to this presentation")
+    assert "default_slide_id='p'" in next_step
+    assert "Unless the user asked for a different first slide" in next_step
+    assert "layout='TITLE'" in next_step
 
     google_slides._CREATED_DEFAULT_SLIDES.clear()
     presentations.get.return_value.execute.return_value = {
@@ -2021,6 +2024,19 @@ def test_outline_deck_maps_cover_and_body_placeholders_and_replaces_default_page
             }
         },
     ]
+
+
+async def test_first_slide_steering_defers_to_the_users_own_first_slide():
+    tools = {tool.name: tool for tool in await google_slides.mcp.list_tools()}
+
+    for name, phrase in (
+        ("google_slides_create_presentation", "Unless the user asked for"),
+        ("google_slides_add_slide", "Unless the user specified"),
+    ):
+        description = " ".join(tools[name].description.split())
+        assert "default_slide_id" in description
+        assert f"{phrase} a different first slide" in description
+        assert 'layout="TITLE"' in description
 
 
 def test_create_presentation_omits_next_step_without_a_default_page(monkeypatch):

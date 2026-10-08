@@ -637,9 +637,11 @@ def google_slides_create_presentation(title: str) -> str:
     has to delete the only page from the presentation. The response reports
     that page as default_slide_id; pass it to the first
     google_slides_add_slide call, because each call may run in a separate
-    process that cannot recognize the default page on its own. Make that
-    first slide the deck's cover: layout="TITLE" with the deck title (and an
-    optional subtitle in body). The response's next_step repeats this.
+    process that cannot recognize the default page on its own. Unless the
+    user asked for a different first slide, make that first slide the deck's
+    cover: layout="TITLE" with the deck title (and an optional subtitle in
+    body). The response's next_step repeats this; it does not ask for slides
+    the user did not request.
     """
     try:
         service = get_slides_service()
@@ -676,12 +678,14 @@ def google_slides_create_presentation(title: str) -> str:
         }
         if default_slide_id:
             response["next_step"] = (
-                "Add the cover next: call google_slides_add_slide with "
-                f"presentation_id={pres_id!r}, layout='TITLE', the deck title "
-                "as title, an optional subtitle as body, and "
-                f"default_slide_id={default_slide_id!r}. The id lets that call "
-                "replace Google's blank default page; without it the page can "
-                "remain as an empty first slide."
+                "When you add slides to this presentation, pass "
+                f"default_slide_id={default_slide_id!r} on the first "
+                f"google_slides_add_slide call for presentation_id={pres_id!r}. "
+                "The id lets that call replace Google's blank default page; "
+                "without it the page can remain as an empty first slide. "
+                "Unless the user asked for a different first slide, make it "
+                "the cover: layout='TITLE' with the deck title as title and an "
+                "optional subtitle as body."
             )
         return json.dumps(response, ensure_ascii=False)
     except Exception as e:
@@ -908,8 +912,9 @@ def google_slides_add_slide(
     default page that still has empty title/subtitle placeholders stays as a
     blank first slide; an empty page in a multi-page deck is preserved.
     Set preserve_blank_slide=True when that sole empty page is intentional.
-    Make the first slide of a new deck its cover: layout="TITLE" with the deck
-    title as title and an optional subtitle as body.
+    Unless the user specified a different first slide, make the first slide
+    of a new deck its cover: layout="TITLE" with the deck title as title and
+    an optional subtitle as body.
 
     To fix a slide this call already created (wrong/missing text), use
     google_slides_update_slide with its slide_id — do NOT call
