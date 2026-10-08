@@ -2168,7 +2168,15 @@ def test_resolve_google_file_id_accepts_ids_and_links():
 
 @pytest.mark.parametrize(
     "value",
-    ["", "Quarterly plan", "https://drive.google.com/drive/folders/abc123", "../x"],
+    [
+        "",
+        "Quarterly plan",
+        "https://drive.google.com/open?id=abc123",
+        # Drive gives this link shape mostly for uploaded Office or PDF files,
+        # which the Docs/Sheets/Slides APIs cannot open.
+        "https://drive.google.com/file/d/abc123/view?usp=sharing",
+        "../x",
+    ],
 )
 def test_resolve_google_file_id_rejects_values_that_cannot_be_ids(value):
     with pytest.raises(ValueError, match="is not a Google Docs link or document id"):
@@ -2397,40 +2405,6 @@ def test_resolve_google_file_id_names_a_link_to_another_kind_of_file(value, prod
     assert "by name" not in message
 
 
-@pytest.mark.parametrize(
-    "value",
-    [
-        "https://drive.google.com/file/d/abc123/view?usp=sharing",
-        "https://drive.google.com/file/u/1/d/abc123/view",
-        "drive.google.com/open?id=abc123",
-        "https://drive.google.com/open?usp=drive_link&id=abc123",
-        "https://www.google.com/url?q=https%3A%2F%2Fdrive.google.com%2Ffile%2Fd%2F"
-        "abc123%2Fview&sa=D",
-    ],
-)
-def test_resolve_google_file_id_accepts_a_drive_link_to_the_file(value):
-    assert (
-        utils.resolve_google_file_id(
-            value, _TEST_DOC_PATTERN, "document_id", _TEST_FILE_KIND
-        )
-        == "abc123"
-    )
-
-
-@pytest.mark.parametrize(
-    "value",
-    [
-        "https://example.com/?next=drive.google.com/file/d/abc123",
-        "https://drive.google.com/open?xid=abc123",
-    ],
-)
-def test_resolve_google_file_id_does_not_take_an_id_from_other_drive_shapes(value):
-    with pytest.raises(ValueError, match="is not a Google Docs link or document id"):
-        utils.resolve_google_file_id(
-            value, _TEST_DOC_PATTERN, "document_id", _TEST_FILE_KIND
-        )
-
-
 def test_resolve_google_file_id_decodes_a_percent_encoded_link():
     wrapped = (
         "https://www.google.com/url?q=https%3A%2F%2Fdocs.google.com%2F"
@@ -2448,7 +2422,7 @@ def test_resolve_google_file_id_decodes_a_percent_encoded_link():
 @pytest.mark.parametrize(
     ("value", "by_name"),
     [
-        ("https://drive.google.com/drive/folders/abc123", False),
+        ("https://drive.google.com/open?id=abc123", False),
         ("https://example.com/report", False),
         ("Quarterly plan", True),
     ],

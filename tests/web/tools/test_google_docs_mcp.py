@@ -52,8 +52,6 @@ def _mock_docs_service(monkeypatch):
         ("doc123", "doc123"),
         ("https://docs.google.com/document/d/doc123/edit", "doc123"),
         ("https://docs.google.com/document/u/1/d/doc123/edit?tab=t.0", "doc123"),
-        ("https://drive.google.com/file/d/doc123/view?usp=sharing", "doc123"),
-        ("https://drive.google.com/open?id=doc123", "doc123"),
     ],
 )
 def test_get_document_accepts_bare_id_and_link_forms(monkeypatch, value, expected):
