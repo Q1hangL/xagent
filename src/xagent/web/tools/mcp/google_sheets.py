@@ -8,7 +8,12 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-not-found]
 from mcp.server.fastmcp import FastMCP
 
-from .utils import resolve_id_from_url, setup_proxy_env
+from .utils import (
+    GoogleFileKind,
+    google_file_error_message,
+    resolve_google_file_id,
+    setup_proxy_env,
+)
 
 logger = logging.getLogger("google-sheets-mcp")
 
@@ -18,6 +23,12 @@ setup_proxy_env()
 mcp = FastMCP("google-sheets-mcp")
 
 _SPREADSHEET_URL_ID_PATTERN = re.compile(r"/spreadsheets/(?:u/\d+/)?d/([a-zA-Z0-9_-]+)")
+_SPREADSHEET_KIND = GoogleFileKind(
+    product="Google Sheets",
+    noun="spreadsheet",
+    link_example="https://docs.google.com/spreadsheets/d/...",
+    create_tool="google_sheets_create_spreadsheet",
+)
 
 
 def _get_credentials() -> Credentials:
@@ -53,8 +64,18 @@ def get_drive_service() -> Any:
 
 def _resolve_spreadsheet_id(spreadsheet_id: str) -> str:
     """Accept either a bare spreadsheet id or a full Google Sheets URL."""
-    return resolve_id_from_url(
-        spreadsheet_id, _SPREADSHEET_URL_ID_PATTERN, "spreadsheet_id"
+    return resolve_google_file_id(
+        spreadsheet_id, _SPREADSHEET_URL_ID_PATTERN, "spreadsheet_id", _SPREADSHEET_KIND
+    )
+
+
+def _spreadsheet_error(exc: Exception) -> str:
+    return json.dumps(
+        {
+            "status": "error",
+            "message": google_file_error_message(exc, _SPREADSHEET_KIND),
+        },
+        ensure_ascii=False,
     )
 
 
@@ -63,6 +84,12 @@ def google_sheets_get_spreadsheet(spreadsheet_id: str) -> str:
     """
     Get metadata for a Google Sheets spreadsheet by id or full URL: its title
     and the list of sheets (tabs) with their sheet_id, title, and grid size.
+
+    Spreadsheets are opened only by link or id; this connector cannot search
+    for or list spreadsheets by name. When the user names a spreadsheet
+    without giving its link, ask them to paste the link
+    (https://docs.google.com/spreadsheets/d/...). Connecting Google Drive is
+    not needed to open a spreadsheet by its link.
     """
     try:
         resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id)
@@ -102,7 +129,7 @@ def google_sheets_get_spreadsheet(spreadsheet_id: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error getting spreadsheet: {e}")
-        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        return _spreadsheet_error(e)
 
 
 @mcp.tool()
@@ -221,7 +248,7 @@ def google_sheets_read_range(
         )
     except Exception as e:
         logger.error(f"Error reading range: {e}")
-        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        return _spreadsheet_error(e)
 
 
 @mcp.tool()
@@ -262,7 +289,7 @@ def google_sheets_update_range(
         )
     except Exception as e:
         logger.error(f"Error updating range: {e}")
-        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        return _spreadsheet_error(e)
 
 
 @mcp.tool()
@@ -303,7 +330,7 @@ def google_sheets_append_rows(
         )
     except Exception as e:
         logger.error(f"Error appending rows: {e}")
-        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        return _spreadsheet_error(e)
 
 
 @mcp.tool()
@@ -330,7 +357,7 @@ def google_sheets_clear_range(spreadsheet_id: str, range_name: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error clearing range: {e}")
-        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        return _spreadsheet_error(e)
 
 
 @mcp.tool()
@@ -378,7 +405,7 @@ def google_sheets_add_sheet(
         )
     except Exception as e:
         logger.error(f"Error adding sheet: {e}")
-        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        return _spreadsheet_error(e)
 
 
 @mcp.tool()
@@ -401,7 +428,7 @@ def google_sheets_delete_sheet(spreadsheet_id: str, sheet_id: int) -> str:
         )
     except Exception as e:
         logger.error(f"Error deleting sheet: {e}")
-        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        return _spreadsheet_error(e)
 
 
 if __name__ == "__main__":

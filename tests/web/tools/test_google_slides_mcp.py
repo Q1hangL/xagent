@@ -2409,3 +2409,90 @@ def test_batch_update_returns_error_payload_on_api_failure(monkeypatch):
 
     assert result["status"] == "error"
     assert "boom" in result["message"]
+
+
+class _HttpResponse:
+    def __init__(self, status: int):
+        self.status = status
+        self.reason = "error"
+
+
+def _http_error(status: int, body: dict):
+    from googleapiclient.errors import HttpError
+
+    return HttpError(
+        _HttpResponse(status),
+        json.dumps(body).encode("utf-8"),
+        uri="https://slides.googleapis.com/v1/presentations/pres1?alt=json",
+    )
+
+
+def test_get_presentation_maps_not_found_to_an_actionable_message(monkeypatch):
+    presentations = Mock()
+    presentations.get.return_value.execute.side_effect = _http_error(
+        404,
+        {"error": {"code": 404, "message": "Requested entity was not found."}},
+    )
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(google_slides.google_slides_get_presentation("pres1"))
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert message.startswith("Google Slides could not open this presentation")
+    assert "google_slides_create_presentation" in message
+    assert message.endswith("HTTP 404 Requested entity was not found.")
+
+
+def test_add_slide_maps_permission_denied_to_an_actionable_message(monkeypatch):
+    presentations = Mock()
+    presentations.get.return_value.execute.side_effect = _http_error(
+        403,
+        {
+            "error": {
+                "code": 403,
+                "message": "The caller does not have permission",
+                "status": "PERMISSION_DENIED",
+            }
+        },
+    )
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide("pres1", title="T", body="B")
+    )
+
+    assert result["message"].startswith(
+        "Google Slides could not open this presentation"
+    )
+    presentations.batchUpdate.assert_not_called()
+
+
+def test_get_presentation_rejects_a_title_without_calling_the_api(monkeypatch):
+    get_service = Mock()
+    monkeypatch.setattr(google_slides, "get_slides_service", get_service)
+
+    result = json.loads(google_slides.google_slides_get_presentation("Sales kickoff"))
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert "'Sales kickoff' is not a Google Slides link" in message
+    assert "cannot search for or list presentations by name" in message
+    assert "https://docs.google.com/presentation/d/" in message
+    get_service.assert_not_called()
+
+
+def test_get_presentation_resolves_multi_account_presentation_url(monkeypatch):
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "presentationId": "abc123",
+        "title": "My Deck",
+        "slides": [],
+    }
+    _mock_slides_service(monkeypatch, presentations)
+
+    url = "https://docs.google.com/presentation/u/1/d/abc123/edit"
+    result = json.loads(google_slides.google_slides_get_presentation(url))
+
+    assert result["status"] == "success"
+    assert presentations.get.call_args.kwargs["presentationId"] == "abc123"

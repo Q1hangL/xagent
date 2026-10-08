@@ -75,6 +75,29 @@ def _patch_downloader(monkeypatch, content: bytes):
     )
 
 
+class _HttpResponse:
+    def __init__(self, status: int):
+        self.status = status
+        self.reason = "error"
+
+
+def _drive_http_error(status: int, message: str, reason: str):
+    from googleapiclient.errors import HttpError
+
+    body = {
+        "error": {
+            "code": status,
+            "message": message,
+            "errors": [{"domain": "global", "reason": reason, "message": message}],
+        }
+    }
+    return HttpError(
+        _HttpResponse(status),
+        json.dumps(body).encode("utf-8"),
+        uri="https://www.googleapis.com/drive/v3/files/f1?alt=json",
+    )
+
+
 def test_get_drive_service_requires_access_token(monkeypatch):
     monkeypatch.delenv("GOOGLE_ACCESS_TOKEN")
 
@@ -627,6 +650,81 @@ def test_search_validates_max_results_before_building_service(monkeypatch):
 
     assert result["status"] == "error"
     get_service.assert_not_called()
+
+
+def test_search_explains_an_empty_result(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.list.return_value.execute.return_value = {"files": []}
+
+    result = json.loads(google_drive.google_drive_search("name contains 'plan'"))
+
+    assert result["status"] == "success"
+    assert result["files"] == []
+    assert result["truncated"] is False
+    note = result["note"]
+    assert "per-file Drive access" in note
+    assert "does not mean the file does not exist" in note
+    assert "ask the user for its link" in note
+
+
+def test_search_adds_no_note_when_files_are_found(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    service.files.return_value.list.return_value.execute.return_value = {
+        "files": [{"id": "f1", "name": "plan.txt"}]
+    }
+
+    result = json.loads(google_drive.google_drive_search("name contains 'plan'"))
+
+    assert "note" not in result
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [(404, "notFound"), (403, "appNotAuthorizedToFile")],
+)
+def test_get_file_content_explains_a_file_this_connection_cannot_see(
+    monkeypatch, status, reason
+):
+    files = Mock()
+    files.get.return_value.execute.side_effect = _drive_http_error(
+        status, "File not found: f1.", reason
+    )
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_get_file_content("f1"))
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert message.startswith("Google Drive could not open this file")
+    assert "per-file Drive access" in message
+    assert "ask the user for its link" in message
+    assert message.endswith(f"Google API response: HTTP {status} File not found: f1.")
+
+
+def test_get_file_content_keeps_raw_error_for_other_403(monkeypatch):
+    files = Mock()
+    error = _drive_http_error(
+        403, "Export size limit exceeded.", "exportSizeLimitExceeded"
+    )
+    files.get.return_value.execute.side_effect = error
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_get_file_content("f1"))
+
+    assert result["message"] == str(error)
+
+
+def test_download_file_explains_a_file_this_connection_cannot_see(monkeypatch):
+    files = Mock()
+    files.get.return_value.execute.side_effect = _drive_http_error(
+        404, "File not found: f1.", "notFound"
+    )
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_download_file("f1"))
+
+    assert result["status"] == "error"
+    assert result["message"].startswith("Google Drive could not open this file")
 
 
 def test_create_file_resolves_parent_id_url_and_supports_shared_drives(monkeypatch):

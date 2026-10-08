@@ -2083,3 +2083,124 @@ def test_success_with_capped_dict_rejects_overlapping_extra_and_critical_fields(
             extra_fields={"note": "a"},
             critical_fields={"note": "b"},
         )
+
+
+class _GoogleHttpResponse:
+    def __init__(self, status):
+        self.status = status
+        self.reason = "error"
+
+
+def _google_http_error(status, content: bytes):
+    from googleapiclient.errors import HttpError
+
+    return HttpError(
+        _GoogleHttpResponse(status),
+        content,
+        uri="https://www.googleapis.com/drive/v3/files/abc404?alt=json",
+    )
+
+
+def test_google_api_error_status_reads_http_error_status():
+    assert utils.google_api_error_status(_google_http_error(404, b"{}")) == 404
+    assert utils.google_api_error_status(_google_http_error("403", b"{}")) == 403
+    assert utils.google_api_error_status(RuntimeError("404 not found")) is None
+
+
+def test_google_api_error_reasons_reads_both_google_body_shapes():
+    error = _google_http_error(
+        403,
+        json.dumps(
+            {
+                "error": {
+                    "message": "denied",
+                    "errors": [{"reason": "insufficientPermissions"}],
+                    "details": [{"reason": "ACCESS_TOKEN_SCOPE_INSUFFICIENT"}],
+                }
+            }
+        ).encode("utf-8"),
+    )
+
+    assert utils.google_api_error_reasons(error) == {
+        "insufficientPermissions",
+        "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+    }
+    assert utils.google_api_error_reasons(_google_http_error(500, b"oops")) == set()
+    assert utils.google_api_error_reasons(RuntimeError("x")) == set()
+
+
+def test_google_api_error_summary_leaves_out_the_request_uri():
+    error = _google_http_error(
+        404, b'{"error": {"message": "File not found: abc404."}}'
+    )
+
+    assert "googleapis.com" in str(error)
+    assert utils.google_api_error_summary(error) == "HTTP 404 File not found: abc404."
+    assert utils.google_api_error_summary(RuntimeError("boom")) == "boom"
+
+
+_TEST_FILE_KIND = utils.GoogleFileKind(
+    product="Google Docs",
+    noun="document",
+    link_example="https://docs.google.com/document/d/...",
+    create_tool="google_docs_create_document",
+)
+_TEST_DOC_PATTERN = re.compile(r"/document/d/([a-zA-Z0-9_-]+)")
+
+
+def test_resolve_google_file_id_accepts_ids_and_links():
+    assert (
+        utils.resolve_google_file_id(
+            " abc_-123 ", _TEST_DOC_PATTERN, "document_id", _TEST_FILE_KIND
+        )
+        == "abc_-123"
+    )
+    assert (
+        utils.resolve_google_file_id(
+            "https://docs.google.com/document/d/abc123/edit",
+            _TEST_DOC_PATTERN,
+            "document_id",
+            _TEST_FILE_KIND,
+        )
+        == "abc123"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "Quarterly plan", "https://drive.google.com/open?id=abc123", "../x"],
+)
+def test_resolve_google_file_id_rejects_values_that_cannot_be_ids(value):
+    with pytest.raises(ValueError, match="is not a Google Docs link or document id"):
+        utils.resolve_google_file_id(
+            value, _TEST_DOC_PATTERN, "document_id", _TEST_FILE_KIND
+        )
+
+
+def test_resolve_google_file_id_shortens_a_long_value_in_the_message():
+    with pytest.raises(ValueError) as excinfo:
+        utils.resolve_google_file_id(
+            "word " * 100, _TEST_DOC_PATTERN, "document_id", _TEST_FILE_KIND
+        )
+
+    assert "word word" in str(excinfo.value)
+    assert len(str(excinfo.value)) < 500
+
+
+def test_google_file_error_message_only_rewrites_file_access_errors():
+    not_found = _google_http_error(404, b'{"error": {"message": "Not found."}}')
+    rate_limited = _google_http_error(
+        403,
+        b'{"error": {"message": "Slow down.", '
+        b'"errors": [{"reason": "userRateLimitExceeded"}]}}',
+    )
+
+    assert utils.google_file_error_message(not_found, _TEST_FILE_KIND).startswith(
+        "Google Docs could not open this document"
+    )
+    assert utils.google_file_error_message(rate_limited, _TEST_FILE_KIND) == str(
+        rate_limited
+    )
+    assert (
+        utils.google_file_error_message(RuntimeError("boom"), _TEST_FILE_KIND) == "boom"
+    )

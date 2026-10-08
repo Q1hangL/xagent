@@ -19,7 +19,13 @@ from pydantic import BeforeValidator
 
 from mcp.server.fastmcp import FastMCP
 
-from .utils import allowed_dirs_from_env, resolve_id_from_url, setup_proxy_env
+from .utils import (
+    GoogleFileKind,
+    allowed_dirs_from_env,
+    google_file_error_message,
+    resolve_google_file_id,
+    setup_proxy_env,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("google-slides-mcp")
@@ -29,7 +35,15 @@ setup_proxy_env()
 
 mcp = FastMCP("google-slides-mcp")
 
-_PRESENTATION_URL_ID_PATTERN = re.compile(r"/presentation/d/([a-zA-Z0-9_-]+)")
+_PRESENTATION_URL_ID_PATTERN = re.compile(
+    r"/presentation/(?:u/\d+/)?d/([a-zA-Z0-9_-]+)"
+)
+_PRESENTATION_KIND = GoogleFileKind(
+    product="Google Slides",
+    noun="presentation",
+    link_example="https://docs.google.com/presentation/d/...",
+    create_tool="google_slides_create_presentation",
+)
 _PPTX_MIME_TYPE = (
     "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 )
@@ -178,6 +192,10 @@ def _strip_bullet_prefixes(text: str) -> str:
 
 def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
+
+
+def _presentation_error(exc: Exception) -> str:
+    return _error(google_file_error_message(exc, _PRESENTATION_KIND))
 
 
 def _delete_imported_presentation(drive_service: Any, presentation_id: str) -> bool:
@@ -476,8 +494,11 @@ def _record_created_default_slide(presentation_id: str, slide_id: str) -> None:
 
 def _resolve_presentation_id(presentation_id: str) -> str:
     """Accept either a bare presentation id or a full Google Slides URL."""
-    return resolve_id_from_url(
-        presentation_id, _PRESENTATION_URL_ID_PATTERN, "presentation_id"
+    return resolve_google_file_id(
+        presentation_id,
+        _PRESENTATION_URL_ID_PATTERN,
+        "presentation_id",
+        _PRESENTATION_KIND,
     )
 
 
@@ -570,6 +591,12 @@ def google_slides_get_presentation(presentation_id: str) -> str:
     """
     Read a Google Slides presentation by id or full URL.
     Returns the title and the text content of each slide.
+
+    Presentations are opened only by link or id; this connector cannot
+    search for or list presentations by name. When the user names a
+    presentation without giving its link, ask them to paste the link
+    (https://docs.google.com/presentation/d/...). Connecting Google Drive is
+    not needed to open a presentation by its link.
     """
     try:
         pres_id = _resolve_presentation_id(presentation_id)
@@ -592,7 +619,7 @@ def google_slides_get_presentation(presentation_id: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error getting presentation: {e}")
-        return _error(str(e))
+        return _presentation_error(e)
 
 
 @mcp.tool()
@@ -1047,7 +1074,7 @@ def google_slides_add_slide(
         )
     except Exception as e:
         logger.error(f"Error adding slide: {e}")
-        return _error(str(e))
+        return _presentation_error(e)
 
 
 @mcp.tool()
@@ -1158,7 +1185,7 @@ def google_slides_update_slide(
         )
     except Exception as e:
         logger.error(f"Error updating slide: {e}")
-        return _error(str(e))
+        return _presentation_error(e)
 
 
 @mcp.tool()
@@ -1196,7 +1223,7 @@ def google_slides_delete_slide(presentation_id: str, slide_id: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error deleting slide: {e}")
-        return _error(str(e))
+        return _presentation_error(e)
 
 
 @mcp.tool()
@@ -1233,7 +1260,7 @@ def google_slides_batch_update(presentation_id: str, requests_json: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error applying batch update: {e}")
-        return _error(str(e))
+        return _presentation_error(e)
 
 
 if __name__ == "__main__":

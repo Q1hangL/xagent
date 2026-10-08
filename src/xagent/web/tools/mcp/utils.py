@@ -2,6 +2,7 @@ import json
 import os
 import re
 import urllib.request
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -1782,6 +1783,67 @@ def resolve_id_from_url(value: str, pattern: re.Pattern[str], field_name: str) -
     return value.strip()
 
 
+def google_api_error_status(exc: BaseException) -> int | None:
+    """Return the HTTP status carried by a googleapiclient ``HttpError``.
+
+    Returns ``None`` for any other exception, or when the status cannot be
+    read as an integer.
+    """
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    if status is None:
+        return None
+    try:
+        return int(status)
+    except (TypeError, ValueError):
+        return None
+
+
+def google_api_error_reasons(exc: BaseException) -> frozenset[str]:
+    """Return the machine-readable reasons in a Google API error body.
+
+    Google reports them as ``error.errors[].reason`` (legacy) and/or as
+    ``error.details[].reason`` (ErrorInfo), sometimes both at once, while
+    ``HttpError``'s own formatting surfaces only one of those fields. Both
+    are collected so a caller can match a reason regardless of which one
+    the API used.
+    """
+    content = getattr(exc, "content", None)
+    if not isinstance(content, bytes):
+        return frozenset()
+    try:
+        data = json.loads(content.decode("utf-8"))
+    except ValueError:
+        return frozenset()
+    error = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(error, dict):
+        return frozenset()
+    reasons: set[str] = set()
+    for field in ("errors", "details"):
+        entries = error.get(field)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            reason = entry.get("reason") if isinstance(entry, dict) else None
+            if isinstance(reason, str) and reason:
+                reasons.add(reason)
+    return frozenset(reasons)
+
+
+def google_api_error_summary(exc: BaseException) -> str:
+    """Return "HTTP <status> <message>" for a Google API error.
+
+    Unlike ``str(exc)``, this leaves out the request URI. Falls back to
+    ``str(exc)`` for an exception that carries no HTTP status.
+    """
+    status = google_api_error_status(exc)
+    if status is None:
+        return str(exc)
+    detail = getattr(exc, "reason", "")
+    if isinstance(detail, str) and detail:
+        return f"HTTP {status} {detail}"
+    return f"HTTP {status}"
+
+
 def setup_proxy_env() -> None:
     """Setup proxy environment variables from system proxies if missing."""
     # Filter out empty proxy vars to prevent httplib2 hangs
@@ -1844,3 +1906,98 @@ def naive_day_bounds(
     start = datetime.combine(day, time.min)
     end = start + timedelta(days=days)
     return start.isoformat(), end.isoformat()
+
+
+# Ids of Google Drive-family files (Docs, Sheets, Slides) only use these
+# characters, so a value outside this class (a document title, a sentence,
+# an unrelated URL) cannot name a file.
+_GOOGLE_FILE_ID_RE = re.compile(r"[a-zA-Z0-9_-]+")
+
+# 403 reasons about the request or the token (rate limits, quota, a disabled
+# API, a missing OAuth scope) rather than about access to one file.
+_NON_FILE_ACCESS_403_REASONS = frozenset(
+    {
+        "rateLimitExceeded",
+        "userRateLimitExceeded",
+        "dailyLimitExceeded",
+        "quotaExceeded",
+        "RATE_LIMIT_EXCEEDED",
+        "accessNotConfigured",
+        "SERVICE_DISABLED",
+        "insufficientPermissions",
+        "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+    }
+)
+
+_MAX_SHOWN_INPUT_LENGTH = 80
+
+
+@dataclass(frozen=True)
+class GoogleFileKind:
+    """How a Google Docs/Sheets/Slides connector names its files in the
+    messages returned to the caller."""
+
+    product: str
+    noun: str
+    link_example: str
+    create_tool: str
+
+
+def resolve_google_file_id(
+    value: str, pattern: re.Pattern[str], field_name: str, kind: GoogleFileKind
+) -> str:
+    """Resolve a link or bare id like ``resolve_id_from_url``, then reject a
+    value that cannot be an id.
+
+    These connectors open files only by link or id. A caller that passes a
+    file's name instead would otherwise get a bare "not found" from the API,
+    which reads as if the file did not exist. Rejecting it here explains how
+    to get a usable link instead, without spending an API call.
+    """
+    resolved = resolve_id_from_url(value, pattern, field_name)
+    if _GOOGLE_FILE_ID_RE.fullmatch(resolved):
+        return resolved
+    shown = resolved
+    if len(shown) > _MAX_SHOWN_INPUT_LENGTH:
+        shown = shown[: _MAX_SHOWN_INPUT_LENGTH - 3] + "..."
+    raise ValueError(
+        f"{field_name} {shown!r} is not a {kind.product} link or {kind.noun} "
+        f"id. These tools open a {kind.noun} only by its link or id and "
+        f"cannot search for or list {kind.noun}s by name. Ask the user to "
+        f"paste the {kind.noun}'s link ({kind.link_example}), or offer to "
+        f"create a new {kind.noun} with {kind.create_tool}."
+    )
+
+
+def is_google_file_access_error(exc: BaseException) -> bool:
+    """Whether ``exc`` means the file does not exist or the connected
+    account cannot open it: an HTTP 404, or a 403 whose reasons are not
+    about rate limits, quota, a disabled API or a missing OAuth scope."""
+    status = google_api_error_status(exc)
+    if status == 404:
+        return True
+    return status == 403 and not (
+        google_api_error_reasons(exc) & _NON_FILE_ACCESS_403_REASONS
+    )
+
+
+def google_file_error_message(exc: BaseException, kind: GoogleFileKind) -> str:
+    """Return ``str(exc)``, or an actionable message when ``exc`` means the
+    file does not exist or the connected Google account cannot open it.
+
+    The raw API error only says "not found" or "permission denied", which
+    leaves the caller guessing whether another connection is missing. The
+    actionable message names what the user can do instead, and keeps the
+    API's own wording at the end for diagnosis.
+    """
+    if not is_google_file_access_error(exc):
+        return str(exc)
+    return (
+        f"{kind.product} could not open this {kind.noun}: it does not exist, "
+        "or the connected Google account does not have the needed access to "
+        "it. Ask the user to check that the link is complete and that this "
+        f"Google account can open the {kind.noun} (it may need to be shared "
+        f"with that account), or offer to create a new {kind.noun} with "
+        f"{kind.create_tool}. Google API response: "
+        f"{google_api_error_summary(exc)}"
+    )

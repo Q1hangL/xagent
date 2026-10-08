@@ -22,6 +22,9 @@ from ....config import get_tool_max_output_length
 from .utils import (
     allowed_dirs_from_env,
     clamp_limit,
+    google_api_error_reasons,
+    google_api_error_status,
+    google_api_error_summary,
     require_clean_identifier,
     setup_proxy_env,
 )
@@ -1029,6 +1032,44 @@ def get_drive_service() -> Any:
     return build("drive", "v3", credentials=credentials)
 
 
+# What a Drive connection can see depends on its OAuth scope, which this
+# process does not know. With the per-file drive.file scope, files.list and
+# files.get only see files created through this app or explicitly granted to
+# it, so the user's other files look missing. Both texts below are worded to
+# stay true under either scope.
+_PER_FILE_ACCESS_NOTE = (
+    "If this connection uses per-file Drive access, it can only see files "
+    "created through this app or explicitly granted to it, so a file the "
+    "user can open in Google Drive may still not be visible here."
+)
+_OPEN_BY_LINK_HINT = (
+    "To work with an existing Google Docs, Sheets or Slides file, ask the "
+    "user for its link and open it with the Google Docs, Sheets or Slides "
+    "tools when they are available; otherwise offer to create a new file."
+)
+_EMPTY_SEARCH_NOTE = (
+    "No files matched. This connection only sees files it can access. "
+    f"{_PER_FILE_ACCESS_NOTE} An empty result does not mean the file does "
+    f"not exist. {_OPEN_BY_LINK_HINT}"
+)
+
+
+def _unavailable_file_message(exc: Exception) -> str:
+    return (
+        "Google Drive could not open this file: it does not exist, or this "
+        f"Drive connection cannot access it. {_PER_FILE_ACCESS_NOTE} "
+        f"{_OPEN_BY_LINK_HINT} Google API response: "
+        f"{google_api_error_summary(exc)}"
+    )
+
+
+def _file_read_error(exc: Exception) -> str:
+    message = (
+        _unavailable_file_message(exc) if _is_unavailable_file_error(exc) else str(exc)
+    )
+    return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
+
+
 @mcp.tool()
 def google_drive_search(query: str = "", max_results: int = 10) -> str:
     """
@@ -1037,6 +1078,11 @@ def google_drive_search(query: str = "", max_results: int = 10) -> str:
     The result's "truncated" field is true if the output was too large and
     some matching files were cut to fit -- treat the "files" list as
     possibly incomplete in that case rather than the full result set.
+
+    Results only include files this connection can access. With per-file
+    Drive access (drive.file), that is only files created through this app
+    or explicitly granted to it, so a file missing from the results may
+    still exist. An empty result carries a "note" field explaining this.
     """
     try:
         page_size = clamp_limit(max_results, max_limit=1000)
@@ -1053,6 +1099,16 @@ def google_drive_search(query: str = "", max_results: int = 10) -> str:
             .execute()
         )
         items = results.get("files", [])
+        if not items:
+            return json.dumps(
+                {
+                    "status": "success",
+                    "files": [],
+                    "truncated": False,
+                    "note": _EMPTY_SEARCH_NOTE,
+                },
+                ensure_ascii=False,
+            )
 
         return _capped_list_response("files", items)
     except Exception as e:
@@ -1210,7 +1266,7 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
         return _capped_content_response(file_metadata, content, encoding)
     except Exception as e:
         logger.error(f"Error getting file content: {e}")
-        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        return _file_read_error(e)
 
 
 @mcp.tool()
@@ -1300,7 +1356,7 @@ def google_drive_download_file(
         )
     except Exception as e:
         logger.error(f"Error downloading file: {e}")
-        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+        return _file_read_error(e)
 
 
 @mcp.tool()
@@ -1790,6 +1846,20 @@ def _is_confirmed_gone(verify_err: Exception) -> bool:
         except (TypeError, ValueError):
             pass
     return "404" in str(verify_err) or "not found" in str(verify_err).lower()
+
+
+def _is_unavailable_file_error(exc: Exception) -> bool:
+    """Whether ``exc`` means Drive will not show a file to this connection.
+
+    That is a 404 (the file is missing, or invisible to a per-file
+    drive.file grant) or a 403 ``appNotAuthorizedToFile`` (the app was
+    never granted the file). Other 403s, such as missing edit permission or
+    rate limits, are not included.
+    """
+    status = google_api_error_status(exc)
+    if status == 404:
+        return True
+    return status == 403 and "appNotAuthorizedToFile" in google_api_error_reasons(exc)
 
 
 def _execute_ignoring_204_ssl_eof(
