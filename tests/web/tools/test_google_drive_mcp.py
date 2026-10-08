@@ -1999,6 +1999,28 @@ def test_move_file_explains_an_update_refused_for_permissions(monkeypatch):
     assert "(reason: insufficientFilePermissions)" in message
 
 
+def test_move_file_explains_an_update_refused_without_a_reason(monkeypatch):
+    from googleapiclient.errors import HttpError
+
+    service = _mock_drive_service(monkeypatch)
+    error = HttpError(
+        _HttpResponse(403),
+        b'{"error": {"code": 403, "message": "The caller does not have permission"}}',
+        uri="https://www.googleapis.com/drive/v3/files/deck1?alt=json",
+    )
+    _move_requests(
+        service, source=_MOVE_SOURCE, destination=_MOVE_DESTINATION, update=error
+    )
+
+    result = json.loads(google_drive.google_drive_move_file("deck1", "folder1"))
+
+    message = result["message"]
+    assert message.startswith("Google Drive refused this change")
+    assert message.endswith(
+        "Google API response: HTTP 403 The caller does not have permission"
+    )
+
+
 @pytest.mark.parametrize(
     "reason",
     [
@@ -2012,6 +2034,11 @@ def test_move_file_explains_an_update_refused_for_permissions(monkeypatch):
         "SERVICE_DISABLED",
         "insufficientPermissions",
         "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+        "storageQuotaExceeded",
+        "domainPolicy",
+        "teamDriveFileLimitExceeded",
+        "teamDrivesParentLimit",
+        "cannotMoveTrashedItemIntoTeamDrive",
     ],
 )
 def test_move_file_keeps_raw_error_for_a_non_permission_403_update(monkeypatch, reason):

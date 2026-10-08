@@ -20,12 +20,10 @@ from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
 from .utils import (
-    GOOGLE_NON_FILE_ACCESS_403_REASONS,
     allowed_dirs_from_env,
     clamp_limit,
-    google_api_error_reasons,
-    google_api_error_status,
     google_api_error_summary,
+    is_google_file_access_error,
     is_google_file_unavailable_error,
     require_clean_identifier,
     setup_proxy_env,
@@ -1748,18 +1746,15 @@ def _unavailable_move_destination_message(exc: Exception) -> str:
 
 def _move_update_error_message(exc: Exception, *, moving: bool) -> str | None:
     """An actionable message for a failed move/rename update, or ``None`` to
-    keep the raw error (anything other than a 404 or a permission 403, such
-    as a rate limit, quota, a disabled API or a missing OAuth scope).
+    keep the raw error (anything ``is_google_file_access_error`` does not
+    cover, such as a rate limit, quota, a disabled API, a missing OAuth scope
+    or a shared drive limit).
 
     ``moving`` is false for a rename-only update of an item that is already
     in the destination folder; its message then leaves out the folder."""
-    status = google_api_error_status(exc)
-    reasons = google_api_error_reasons(exc)
-    summary = google_api_error_summary(exc)
-    if reasons:
-        summary += f" (reason: {', '.join(sorted(reasons))})"
-    if not moving:
-        if is_google_file_unavailable_error(exc):
+    summary = google_api_error_summary(exc, with_reasons=True)
+    if is_google_file_unavailable_error(exc):
+        if not moving:
             return (
                 "Google Drive could not open the file while renaming it, or "
                 "this Drive connection cannot access it, so nothing was "
@@ -1768,16 +1763,6 @@ def _move_update_error_message(exc: Exception, *, moving: bool) -> str | None:
                 "granted to it. Ask the user to rename the file in Google "
                 f"Drive. Google API response: {summary}"
             )
-        if status == 403 and not reasons & GOOGLE_NON_FILE_ACCESS_403_REASONS:
-            return (
-                "Google Drive refused this change, so nothing was renamed. The "
-                "connected Google account may not have permission to rename "
-                "it (for example, it has only view or comment access). Ask the "
-                "user to rename it in Google Drive or to ask the item's owner. "
-                f"Google API response: {summary}"
-            )
-        return None
-    if is_google_file_unavailable_error(exc):
         return (
             "Google Drive could not open the file or the destination folder "
             "while updating it, or this Drive connection cannot access one of "
@@ -1786,16 +1771,23 @@ def _move_update_error_message(exc: Exception, *, moving: bool) -> str | None:
             "through this app. Ask the user to move the file in Google Drive, "
             f"or {_CREATE_FOLDER_OFFER}. Google API response: {summary}"
         )
-    if status == 403 and not reasons & GOOGLE_NON_FILE_ACCESS_403_REASONS:
+    if not is_google_file_access_error(exc):
+        return None
+    if not moving:
         return (
-            "Google Drive refused this change, so nothing was moved or renamed. "
-            "The connected Google account may not have permission to move it (for "
-            "example, it has only view or comment access, or the destination "
-            "is a shared drive that the item's owner is not a member of). Ask "
-            "the user to move it in Google Drive or to ask the item's owner. "
-            f"Google API response: {summary}"
+            "Google Drive refused this change, so nothing was renamed. The "
+            "connected Google account may not have permission to rename it "
+            "(for example, it has only view or comment access). Ask the user "
+            "to rename it in Google Drive or to ask the item's owner. Google "
+            f"API response: {summary}"
         )
-    return None
+    return (
+        "Google Drive refused this change, so nothing was moved or renamed. "
+        "The connected Google account may not have permission to move it (for "
+        "example, it has only view or comment access). Ask the user to move it "
+        "in Google Drive or to ask the item's owner. Google API response: "
+        f"{summary}"
+    )
 
 
 @mcp.tool()
