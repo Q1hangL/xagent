@@ -3064,6 +3064,13 @@ def test_google_file_error_message_for_a_drive_open_link_keeps_other_mappings():
     office_file = _google_http_error(400, json.dumps(_OFFICE_FILE_400).encode("utf-8"))
     not_found = _google_http_error(404, b'{"error": {"message": "Not found."}}')
     server_error = _google_http_error(500, b'{"error": {"message": "Backend."}}')
+    # Only a 400 gets the next steps, even with the message that names no cause.
+    server_error_without_cause = _google_http_error(
+        500,
+        json.dumps(
+            {"error": {"code": 500, "message": "Request contains an invalid argument."}}
+        ).encode("utf-8"),
+    )
 
     assert utils.google_file_error_message(
         office_file, _TEST_FILE_KIND, file_link_or_id=link
@@ -3074,3 +3081,6 @@ def test_google_file_error_message_for_a_drive_open_link_keeps_other_mappings():
     assert utils.google_file_error_message(
         server_error, _TEST_FILE_KIND, file_link_or_id=link
     ) == str(server_error)
+    assert utils.google_file_error_message(
+        server_error_without_cause, _TEST_FILE_KIND, file_link_or_id=link
+    ) == str(server_error_without_cause)
