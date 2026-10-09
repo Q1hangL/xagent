@@ -768,6 +768,108 @@ def test_drive_name_without_an_extension_skips_the_extension_check(
     assert result["status"] == "success"
 
 
+def _typed_drive(monkeypatch, name, mime_type):
+    return _Drive(
+        monkeypatch,
+        current=_current(name=name, mimeType=mime_type),
+        updated=_updated(name=name, mimeType=mime_type),
+    )
+
+
+@pytest.mark.parametrize(
+    ("drive_name", "mime_type", "local_name"),
+    [
+        ("Team Photo.jpeg", "image/jpeg", "Team Photo.jpg"),
+        ("Team Photo.JPG", "image/jpeg", "team photo.jpeg"),
+        ("Scan.tif", "image/tiff", "Scan.tiff"),
+        ("Index.htm", "text/html", "Index.html"),
+        ("config.yaml", "application/x-yaml", "config.yml"),
+        ("config.yml", "application/octet-stream", "config.yaml"),
+    ],
+)
+def test_two_spellings_of_one_extension_are_the_same_type(
+    monkeypatch, allowed_dir, drive_name, mime_type, local_name
+):
+    drive = _typed_drive(monkeypatch, drive_name, mime_type)
+
+    result = _call("deck1", _replacement(allowed_dir, name=local_name))
+
+    assert result["status"] == "success", result
+    assert drive.uploaded == [NEW_CONTENT]
+
+
+@pytest.mark.parametrize(
+    ("drive_name", "mime_type", "local_name"),
+    [
+        # The replacement's extension names the type stored in Drive.
+        ("John.Smith", "application/pdf", "John.Smith.pdf"),
+        ("report.final", DECK_MIME, "report.final.pptx"),
+        # Neither the dotted part nor the stored type says what the file is.
+        ("report.final", "application/octet-stream", "report.final.pptx"),
+    ],
+)
+def test_dotted_drive_name_is_not_taken_as_a_different_type(
+    monkeypatch, allowed_dir, drive_name, mime_type, local_name
+):
+    drive = _typed_drive(monkeypatch, drive_name, mime_type)
+
+    result = _call("deck1", _replacement(allowed_dir, name=local_name))
+
+    assert result["status"] == "success", result
+    assert drive.uploaded == [NEW_CONTENT]
+
+
+@pytest.mark.parametrize(
+    ("drive_name", "mime_type", "local_name", "expected"),
+    [
+        (
+            "John.Smith",
+            "application/pdf",
+            "John.Smith.docx",
+            "'John.Smith' in Google Drive is stored as application/pdf",
+        ),
+        (
+            "Quarterly Deck.pptx",
+            "application/octet-stream",
+            "Quarterly Deck.xlsx",
+            "'Quarterly Deck.pptx' in Google Drive is a .pptx file",
+        ),
+        (
+            "Team Photo.jpg",
+            "image/jpeg",
+            "Team Photo.png",
+            "'Team Photo.jpg' in Google Drive is a .jpg file",
+        ),
+    ],
+)
+def test_replacement_of_another_type_is_still_refused(
+    monkeypatch, allowed_dir, drive_name, mime_type, local_name, expected
+):
+    drive = _typed_drive(monkeypatch, drive_name, mime_type)
+
+    result = _call("deck1", _replacement(allowed_dir, name=local_name))
+
+    assert result["status"] == "error"
+    assert expected in result["message"]
+    assert "Nothing was changed in Google Drive" in result["message"]
+    drive.assert_nothing_written()
+
+
+def test_extension_types_come_from_python_not_the_host(monkeypatch):
+    # mimetypes.guess_type also reads the host's mime.types files, which
+    # differ between machines; the check must not depend on them.
+    monkeypatch.setattr(
+        google_drive.mimetypes,
+        "guess_type",
+        lambda *args, **kwargs: ("application/x-host-type", None),
+    )
+
+    assert google_drive._extension_type(".smith") is None
+    assert google_drive._extension_type(".jpeg") == "image/jpeg"
+    assert google_drive._extension_type(".jpg") == "image/jpeg"
+    assert google_drive._extension_type(".pptx") == DECK_MIME
+
+
 @pytest.mark.parametrize(
     ("status", "api_message", "reason"),
     [

@@ -1,4 +1,5 @@
 import base64
+import functools
 import hashlib
 import io
 import json
@@ -1534,6 +1535,17 @@ _WORKSPACE_FILE_ID_PATTERN = re.compile(
 # Only a short alphanumeric suffix with a letter counts as a file extension,
 # so a name like "Plan v1.2" is treated as having none.
 _FILE_EXTENSION_PATTERN = re.compile(r"\.(?=[a-z0-9]*[a-z])[a-z0-9]{1,10}")
+# Common formats missing from Python's built-in extension table (as of 3.12).
+_EXTRA_EXTENSION_TYPES = {
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+    ".odp": "application/vnd.oasis.opendocument.presentation",
+    ".yaml": "application/yaml",
+    ".yml": "application/yaml",
+}
 
 _CONTENT_UPDATE_GET_FIELDS = (
     "id,name,mimeType,trashed,size,md5Checksum,headRevisionId,version,"
@@ -1651,6 +1663,55 @@ def _as_int(value: Any) -> int | None:
 def _file_extension(name: str) -> str:
     suffix = _split_stem_suffix(name.strip())[1].lower()
     return suffix if _FILE_EXTENSION_PATTERN.fullmatch(suffix) else ""
+
+
+@functools.cache
+def _builtin_mime_types() -> mimetypes.MimeTypes:
+    # A new MimeTypes holds only Python's built-in table, not the host's
+    # mime.types files that mimetypes.guess_type also reads, so the answer
+    # is the same on every host (see _KNOWN_TEXT_EXTENSIONS).
+    return mimetypes.MimeTypes()
+
+
+def _extension_type(extension: str) -> str | None:
+    """The MIME type a lowercase extension such as ".jpeg" names, if known."""
+    if extension in _EXTRA_EXTENSION_TYPES:
+        return _EXTRA_EXTENSION_TYPES[extension]
+    return _builtin_mime_types().guess_type(f"file{extension}", strict=False)[0]
+
+
+def _content_extension_mismatch(
+    drive_name: str, stored_mime_type: str, local_name: str
+) -> tuple[str, str] | None:
+    """When the replacement looks like another type of file than the one in
+    Drive, its extension and what the Drive file is; otherwise ``None``.
+
+    Two spellings of one type (.jpeg and .jpg) match. A dotted part of the
+    Drive name is not taken as its type when the replacement's extension
+    names the type stored in Drive ("John.Smith" stored as a PDF, replaced
+    with "John.Smith.pdf"), or when neither that part nor the stored type
+    says what the file is.
+    """
+    drive_extension = _file_extension(drive_name)
+    local_extension = _file_extension(local_name)
+    if not drive_extension or not local_extension:
+        return None
+    if drive_extension == local_extension:
+        return None
+    drive_type = _extension_type(drive_extension)
+    local_type = _extension_type(local_extension)
+    # A stored octet-stream type says nothing about the file.
+    known_stored_type = stored_mime_type not in ("", _OCTET_STREAM)
+    if local_type is not None and (
+        local_type == drive_type
+        or (known_stored_type and local_type == stored_mime_type)
+    ):
+        return None
+    if drive_type is not None:
+        return local_extension, f"a {drive_extension} file"
+    if not known_stored_type:
+        return None
+    return local_extension, f"stored as {stored_mime_type}"
 
 
 def _validated_content_update_target(file_id: str) -> tuple[str, str | None]:
@@ -1868,14 +1929,14 @@ def _content_update_refusal(
             "content keeps the file's type; to store a different type, "
             f"{_UPLOAD_AS_NEW_FILE_OFFER}. {_NOTHING_CHANGED}"
         )
-    drive_extension = _file_extension(name)
-    local_extension = _file_extension(local_name)
-    if drive_extension and local_extension and drive_extension != local_extension:
+    mismatch = _content_extension_mismatch(name, stored_mime_type, local_name)
+    if mismatch is not None:
+        local_extension, drive_kind = mismatch
         return (
             f"The replacement file is a {local_extension} file but '{name}' in "
-            f"Google Drive is a {drive_extension} file. Replacing the content "
-            f"keeps the file's type; check file_path, or "
-            f"{_UPLOAD_AS_NEW_FILE_OFFER}. {_NOTHING_CHANGED}"
+            f"Google Drive is {drive_kind}. Replacing the content keeps the "
+            f"file's type; check file_path, or {_UPLOAD_AS_NEW_FILE_OFFER}. "
+            f"{_NOTHING_CHANGED}"
         )
     return None
 
