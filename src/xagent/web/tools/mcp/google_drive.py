@@ -1824,39 +1824,79 @@ def _content_error_detail(exc: Exception) -> str:
     return f"Error: {summary or type(exc).__name__}"
 
 
+class _UpdateAttempts:
+    """The http object one files.update sends its requests through, noting
+    whether any of them may have reached Drive without a definite answer.
+
+    googleapiclient retries a timeout, a dropped connection, a 5xx, a 429
+    and a rate-limit 403, so the error it finally raises may be a 4xx that
+    says nothing about an earlier attempt: that attempt may have timed out
+    or got a 5xx after Drive stored the content.
+    """
+
+    def __init__(self, http: Any) -> None:
+        self._http = http
+        self.unclear = False
+
+    def request(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            response, content = self._http.request(*args, **kwargs)
+        except BaseException:
+            self.unclear = True
+            raise
+        status = _as_int(getattr(response, "status", None))
+        if status is None or status >= 500 or status == 408:
+            self.unclear = True
+        return response, content
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._http, name)
+
+
 def _content_update_request_error(
-    exc: Exception, name: str, current_summary: dict[str, Any]
+    exc: Exception,
+    name: str,
+    current_summary: dict[str, Any],
+    *,
+    earlier_attempt_unclear: bool,
 ) -> str:
     """The error result for a files.update request that raised.
 
-    A 4xx reply is a definite rejection, so the pre-read state is still the
-    file's state. A 5xx left after retries, a timeout or a dropped connection
-    may come after Drive stored the upload, so that result says the outcome
-    is unknown and keeps the pre-read state as "previous" rather than as the
-    file's current state.
+    A 4xx reply to the only attempt is a definite rejection, so the
+    pre-read state is still the file's state. A 5xx left after retries, a
+    timeout, a dropped connection, or a 4xx after an attempt that ended
+    that way may come after Drive stored the upload, so that result says
+    the outcome is unknown and keeps the pre-read state as "previous"
+    rather than as the file's current state.
     """
-    if is_google_file_unavailable_error(exc):
-        return _content_update_error(
-            _unavailable_content_update_message(exc), file=current_summary
-        )
-    if is_google_file_access_error(exc):
-        return _content_update_error(
-            _content_permission_message(name, exc), file=current_summary
-        )
-    # Quota, rate limits and a missing OAuth scope keep Drive's own error.
     status = google_api_error_status(exc)
-    if status is not None and 400 <= status < 500 and status != 408:
+    rejected = status is not None and 400 <= status < 500 and status != 408
+    if rejected and not earlier_attempt_unclear:
+        if is_google_file_unavailable_error(exc):
+            return _content_update_error(
+                _unavailable_content_update_message(exc), file=current_summary
+            )
+        if is_google_file_access_error(exc):
+            return _content_update_error(
+                _content_permission_message(name, exc), file=current_summary
+            )
+        # Quota, rate limits and a missing OAuth scope keep Drive's own error.
         return _content_update_error(
             f"Google Drive did not accept the new content for '{name}'. Do "
             "not report the file as updated. "
             f"{_content_error_detail(exc)}",
             file=current_summary,
         )
+    what = (
+        "Google Drive refused a retry of the upload after an earlier attempt "
+        "ended without a clear answer"
+        if rejected
+        else "The upload to Google Drive did not finish normally"
+    )
     return _content_update_error(
-        "The upload to Google Drive did not finish normally, so it is not "
-        f"known whether '{name}' changed. Do not report it as updated or as "
-        "unchanged; ask the user to check the file's version history in "
-        "Google Drive before trying again. "
+        f"{what}, so it is not known whether '{name}' changed. Do not report "
+        "it as updated or as unchanged; ask the user to check the file's "
+        "version history in Google Drive before trying again. "
         f"{_content_error_detail(exc)}",
         previous=current_summary,
     )
@@ -2304,14 +2344,20 @@ def google_drive_update_file_content(
                 fields=_CONTENT_UPDATE_RESULT_FIELDS,
             )
             _attach_resource_key(update_request, resolved_file_id, resource_key)
+            attempts = _UpdateAttempts(update_request.http)
             update_sent = True
             try:
                 updated = update_request.execute(
-                    num_retries=_CONTENT_UPDATE_NUM_RETRIES
+                    http=attempts, num_retries=_CONTENT_UPDATE_NUM_RETRIES
                 )
             except Exception as exc:
                 logger.error(f"Error updating file content: {exc}")
-                return _content_update_request_error(exc, name, current_summary)
+                return _content_update_request_error(
+                    exc,
+                    name,
+                    current_summary,
+                    earlier_attempt_unclear=attempts.unclear,
+                )
 
         if not isinstance(updated, dict):
             updated = {}

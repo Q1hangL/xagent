@@ -221,7 +221,12 @@ def test_simple_update_replaces_content_in_place(monkeypatch, allowed_dir):
     assert media.resumable() is False
     assert media.mimetype() == DECK_MIME
     assert drive.uploaded == [NEW_CONTENT]
-    drive.update_request.execute.assert_called_once_with(num_retries=2)
+    drive.update_request.execute.assert_called_once()
+    execute_kwargs = drive.update_request.execute.call_args.kwargs
+    assert execute_kwargs["num_retries"] == 2
+    # Requests go through the update's own http object, wrapped to note an
+    # attempt that ended without a clear answer.
+    assert execute_kwargs["http"]._http is drive.update_request.http
     drive.files.create.assert_not_called()
 
 
@@ -1394,6 +1399,10 @@ class _RecordingHttp(HttpMockSequence):
     def request(self, uri, method="GET", body=None, headers=None, **kwargs):
         if hasattr(body, "read"):
             body = body.read()
+        if isinstance(self._iterable[0], BaseException):
+            # A transport error, such as a timeout, instead of a reply.
+            self.request_sequence.append((uri, method, body, headers))
+            raise self._iterable.pop(0)
         response, content = super().request(
             uri, method=method, body=body, headers=headers, **kwargs
         )
@@ -1579,6 +1588,105 @@ def test_wire_update_does_not_retry_a_client_error(monkeypatch, allowed_dir):
     assert result["status"] == "error"
     assert "(reason: badRequest)" in result["message"]
     assert [request.method for request in http.requests] == ["GET", "PATCH"]
+
+
+def _error_reply(status, reason):
+    body = {
+        "error": {"code": status, "message": reason, "errors": [{"reason": reason}]}
+    }
+    return ({"status": str(status)}, json.dumps(body))
+
+
+_RATE_LIMITED = _error_reply(429, "rateLimitExceeded")
+_RATE_LIMITED_403 = _error_reply(403, "userRateLimitExceeded")
+
+
+@pytest.mark.parametrize(
+    "replies",
+    [
+        # Drive may have stored the content on the first attempt; the
+        # error that is finally raised is about a retry.
+        [({"status": "503"}, ""), _RATE_LIMITED, _RATE_LIMITED],
+        [({"status": "500"}, ""), _RATE_LIMITED_403, _RATE_LIMITED_403],
+        [({"status": "502"}, ""), _error_reply(400, "badRequest")],
+        [TimeoutError("timed out"), _RATE_LIMITED, _RATE_LIMITED],
+        [
+            ConnectionResetError("reset"),
+            _error_reply(403, "insufficientFilePermissions"),
+        ],
+    ],
+    ids=[
+        "503-then-429",
+        "500-then-rate-limit-403",
+        "502-then-400",
+        "timeout-then-429",
+        "reset-then-permission-403",
+    ],
+)
+def test_wire_rejected_retry_after_an_unclear_attempt_is_an_unknown_outcome(
+    monkeypatch, allowed_dir, replies
+):
+    monkeypatch.setattr(googleapiclient.http.time, "sleep", lambda seconds: None)
+    http = _wire_drive(monkeypatch, [_ok(_current()), *replies])
+
+    result = _call("deck1", _replacement(allowed_dir))
+
+    message = result["message"]
+    assert result["status"] == "error"
+    assert "refused a retry of the upload" in message
+    assert "not known whether 'Quarterly Deck.pptx' changed" in message
+    assert "Do not report it as updated or as unchanged" in message
+    assert "did not accept" not in message
+    assert "nothing was changed" not in message.lower()
+    # The pre-read state is not presented as the file's current state.
+    assert "file" not in result
+    assert result["previous"]["headRevisionId"] == "rev-1"
+    assert [request.method for request in http.requests] == ["GET"] + ["PATCH"] * len(
+        replies
+    )
+
+
+@pytest.mark.parametrize("rate_limited", [_RATE_LIMITED, _RATE_LIMITED_403])
+def test_wire_rate_limit_on_every_attempt_is_a_rejection(
+    monkeypatch, allowed_dir, rate_limited
+):
+    """Every attempt was refused before Drive took the content, so the
+    pre-read state is still the file's state."""
+    monkeypatch.setattr(googleapiclient.http.time, "sleep", lambda seconds: None)
+    http = _wire_drive(monkeypatch, [_ok(_current())] + [rate_limited] * 3)
+
+    result = _call("deck1", _replacement(allowed_dir))
+
+    assert result["status"] == "error"
+    assert "did not accept the new content" in result["message"]
+    assert "not known whether" not in result["message"]
+    assert result["file"]["headRevisionId"] == "rev-1"
+    assert [request.method for request in http.requests] == ["GET"] + ["PATCH"] * 3
+
+
+def test_wire_resumable_chunk_rejected_after_a_server_error_is_unknown(
+    monkeypatch, allowed_dir
+):
+    monkeypatch.setattr(googleapiclient.http.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(google_drive, "_SIMPLE_UPLOAD_MAX_BYTES", 1000)
+    monkeypatch.setattr(google_drive, "_RESUMABLE_CHUNK_BYTES", 256 * 1024)
+    data = (b"slide-bytes-" * 30000)[: 300 * 1024]
+    session = "https://www.googleapis.com/upload/drive/v3/files/deck1?upload_id=s1"
+    _wire_drive(
+        monkeypatch,
+        [
+            _ok(_current()),
+            ({"status": "200", "location": session}, ""),
+            ({"status": "503"}, ""),
+            _error_reply(400, "badRequest"),
+        ],
+    )
+
+    result = _call("deck1", _replacement(allowed_dir, data=data))
+
+    assert result["status"] == "error"
+    assert "not known whether" in result["message"]
+    assert "file" not in result
 
 
 # --- registration and download metadata ------------------------------------
