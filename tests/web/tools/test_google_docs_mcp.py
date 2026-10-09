@@ -653,3 +653,40 @@ def test_tools_add_next_steps_to_a_400_for_a_drive_open_or_uc_link(
     assert ("read the downloaded copy with read_file" in message) is not editing
     assert ("To make this change with these tools" in message) is editing
     assert message.endswith("the error is about the request itself.")
+
+
+# Once a tool has read the document, it is a Google Doc whatever link named
+# it, so a 400 for the tool's later request keeps Google's own error, even
+# one that names no cause.
+@pytest.mark.parametrize(
+    "link",
+    [
+        "https://drive.google.com/open?id=doc123",
+        "https://drive.google.com/uc?export=download&id=doc123",
+    ],
+)
+def test_append_text_keeps_the_raw_400_after_the_document_opened(monkeypatch, link):
+    service, _ = _mock_docs_service(monkeypatch)
+    documents = service.documents.return_value
+    documents.get.return_value.execute.return_value = {
+        "documentId": "doc123",
+        "body": {"content": [{"endIndex": 5}]},
+    }
+    error = _http_error(
+        400,
+        {
+            "error": {
+                "code": 400,
+                "message": "Request contains an invalid argument.",
+                "status": "INVALID_ARGUMENT",
+            }
+        },
+    )
+    documents.batchUpdate.return_value.execute.side_effect = error
+
+    result = json.loads(google_docs.google_docs_append_text(link, "more"))
+
+    assert result["status"] == "error"
+    assert documents.get.call_args.kwargs["documentId"] == "doc123"
+    assert documents.batchUpdate.call_args.kwargs["documentId"] == "doc123"
+    assert result["message"] == str(error)

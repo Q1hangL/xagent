@@ -3298,3 +3298,94 @@ def test_tools_add_next_steps_to_a_400_for_a_drive_open_or_uc_link(
     assert ("read the downloaded copy with read_pptx" in message) is not editing
     assert ("To make this change with these tools" in message) is editing
     assert message.endswith("the error is about the request itself.")
+
+
+_NO_CAUSE_400 = {
+    "error": {
+        "code": 400,
+        "message": "Request contains an invalid argument.",
+        "status": "INVALID_ARGUMENT",
+    }
+}
+
+
+# Once a tool has read the presentation, it is a Google Slides presentation
+# whatever link named it, so a 400 for the tool's later request keeps
+# Google's own error, even one that names no cause.
+@pytest.mark.parametrize(
+    "link",
+    [
+        "https://drive.google.com/open?id=pres1",
+        "https://drive.google.com/uc?export=download&id=pres1",
+    ],
+)
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(
+            lambda pres: google_slides.google_slides_add_slide(
+                pres, title="T", body="B"
+            ),
+            id="add_slide",
+        ),
+        pytest.param(
+            lambda pres: google_slides.google_slides_update_slide(
+                pres, "slide1", title="T"
+            ),
+            id="update_slide",
+        ),
+        pytest.param(
+            lambda pres: google_slides.google_slides_delete_slide(pres, "slide1"),
+            id="delete_slide",
+        ),
+    ],
+)
+def test_tools_keep_the_raw_400_after_the_presentation_opened(monkeypatch, link, call):
+    presentations = Mock()
+    _mock_presentation_get(
+        presentations,
+        "slide1",
+        [_placeholder_element("title_obj", "TITLE", text="Old title")],
+    )
+    error = _http_error(400, _NO_CAUSE_400)
+    presentations.batchUpdate.return_value.execute.side_effect = error
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(call(link))
+
+    assert result["status"] == "error"
+    assert presentations.get.call_args.kwargs["presentationId"] == "pres1"
+    assert presentations.batchUpdate.call_args.kwargs["presentationId"] == "pres1"
+    assert result["message"] == str(error)
+
+
+# add_slide reads the presentation only when it may remove a default page.
+# Without that read nothing shows which file the link names, so the 400
+# still gets the next steps.
+def test_add_slide_adds_next_steps_to_a_400_when_it_did_not_read_the_presentation(
+    monkeypatch,
+):
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.side_effect = _http_error(
+        400, _NO_CAUSE_400
+    )
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide(
+            "https://drive.google.com/open?id=pres1",
+            title="T",
+            body="B",
+            preserve_blank_slide=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    presentations.get.assert_not_called()
+    assert presentations.batchUpdate.call_args.kwargs["presentationId"] == "pres1"
+    assert result["message"].startswith(
+        "Google Slides rejected this request (Google API response: HTTP 400 "
+        "Request contains an invalid argument.). The presentation id was taken "
+        "from a Google Drive link"
+    )
+    assert "To make this change with these tools" in result["message"]

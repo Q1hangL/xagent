@@ -2304,7 +2304,9 @@ def google_file_error_message(
     400 whose message names no cause ("Request contains an invalid
     argument.") keeps Google's response and gets the next steps for an
     uploaded file, since the Docs and Slides APIs answer such an id with
-    that 400. Any other 400 keeps the raw error.
+    that 400. Any other 400 keeps the raw error. A tool that has already
+    read the file passes ``None`` for its later requests instead: the file
+    is then a Google file, so their 400 is about the request.
     """
     if is_google_office_file_error(exc):
         # The product's editor does open such a file, in Office compatibility

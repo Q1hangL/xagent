@@ -92,13 +92,22 @@ def _resolve_document_id(document_id: str, *, editing: bool = False) -> str:
     )
 
 
-def _document_error(exc: Exception, document_id: str, *, editing: bool = False) -> str:
-    """``document_id`` is the tool's own argument, before it was resolved."""
+def _document_error(
+    exc: Exception, document_id: str, *, editing: bool = False, opened: bool = False
+) -> str:
+    """``document_id`` is the tool's own argument, before it was resolved.
+
+    Pass ``opened=True`` once the tool has read the document: it is then a
+    Google Doc, whatever link named it, so a 400 for a later request is
+    about that request and keeps Google's own error."""
     return json.dumps(
         {
             "status": "error",
             "message": google_file_error_message(
-                exc, _DOCUMENT_KIND, editing=editing, file_link_or_id=document_id
+                exc,
+                _DOCUMENT_KIND,
+                editing=editing,
+                file_link_or_id=None if opened else document_id,
             ),
         },
         ensure_ascii=False,
@@ -225,10 +234,12 @@ def google_docs_append_text(document_id: str, text: str) -> str:
     """
     Append plain text to the end of an existing Google Doc.
     """
+    opened = False
     try:
         doc_id = _resolve_document_id(document_id, editing=True)
         service = get_docs_service()
         document = service.documents().get(documentId=doc_id).execute()
+        opened = True
         insert_index = max(_document_end_index(document) - 1, 1)
 
         result = (
@@ -258,7 +269,7 @@ def google_docs_append_text(document_id: str, text: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error appending text: {e}")
-        return _document_error(e, document_id, editing=True)
+        return _document_error(e, document_id, editing=True, opened=opened)
 
 
 @mcp.tool()
