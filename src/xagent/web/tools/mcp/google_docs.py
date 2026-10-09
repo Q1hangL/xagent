@@ -33,6 +33,8 @@ _DOCUMENT_KIND = GoogleFileKind(
     noun="document",
     link_example="https://docs.google.com/document/d/...",
     create_tool="google_docs_create_document",
+    office_file="a Word file (.docx)",
+    office_reader="read_file",
 )
 
 _HEADING_PREFIXES = {
@@ -77,10 +79,16 @@ def get_drive_service() -> Any:
     return build("drive", "v3", credentials=_get_credentials())
 
 
-def _resolve_document_id(document_id: str) -> str:
-    """Accept either a bare document id or a full Google Docs URL."""
+def _resolve_document_id(document_id: str, *, editing: bool = False) -> str:
+    """Accept either a bare document id or a full Google Docs URL.
+
+    Pass ``editing=True`` from a tool that changes the document."""
     return resolve_google_file_id(
-        document_id, _DOCUMENT_URL_ID_PATTERN, "document_id", _DOCUMENT_KIND
+        document_id,
+        _DOCUMENT_URL_ID_PATTERN,
+        "document_id",
+        _DOCUMENT_KIND,
+        editing=editing,
     )
 
 
@@ -215,7 +223,7 @@ def google_docs_append_text(document_id: str, text: str) -> str:
     Append plain text to the end of an existing Google Doc.
     """
     try:
-        doc_id = _resolve_document_id(document_id)
+        doc_id = _resolve_document_id(document_id, editing=True)
         service = get_docs_service()
         document = service.documents().get(documentId=doc_id).execute()
         insert_index = max(_document_end_index(document) - 1, 1)
@@ -258,7 +266,7 @@ def google_docs_replace_text(
     Replace all occurrences of find_text with replace_text in a Google Doc.
     """
     try:
-        doc_id = _resolve_document_id(document_id)
+        doc_id = _resolve_document_id(document_id, editing=True)
         service = get_docs_service()
         result = (
             service.documents()
@@ -306,7 +314,7 @@ def google_docs_batch_update(document_id: str, requests_json: str) -> str:
     Use this only when the simpler tools cannot express the required edit.
     """
     try:
-        doc_id = _resolve_document_id(document_id)
+        doc_id = _resolve_document_id(document_id, editing=True)
         requests = json.loads(requests_json)
         if not isinstance(requests, list):
             raise ValueError("requests_json must be a JSON array of request objects")

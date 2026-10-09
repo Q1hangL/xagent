@@ -2144,6 +2144,8 @@ _TEST_FILE_KIND = utils.GoogleFileKind(
     noun="document",
     link_example="https://docs.google.com/document/d/...",
     create_tool="google_docs_create_document",
+    office_file="a Word file (.docx)",
+    office_reader="read_file",
 )
 _TEST_DOC_PATTERN = re.compile(r"/document/d/([a-zA-Z0-9_-]+)")
 
@@ -2171,10 +2173,7 @@ def test_resolve_google_file_id_accepts_ids_and_links():
     [
         "",
         "Quarterly plan",
-        "https://drive.google.com/open?id=abc123",
-        # Drive gives this link shape mostly for uploaded Office or PDF files,
-        # which the Docs/Sheets/Slides APIs cannot open.
-        "https://drive.google.com/file/d/abc123/view?usp=sharing",
+        "https://drive.google.com/drive/folders/abc123",
         "../x",
     ],
 )
@@ -2427,7 +2426,7 @@ def test_resolve_google_file_id_decodes_a_percent_encoded_link():
 @pytest.mark.parametrize(
     ("value", "by_name"),
     [
-        ("https://drive.google.com/open?id=abc123", False),
+        ("https://drive.google.com/drive/folders/abc123", False),
         ("https://example.com/report", False),
         ("Quarterly plan", True),
     ],
@@ -2445,3 +2444,275 @@ def test_resolve_google_file_id_only_mentions_name_search_for_a_non_link(
     assert ("cannot search for or list documents by name" in message) is by_name
     assert ("If google_drive_search is available" in message) is by_name
     assert ("Connecting Google Drive is not needed" in message) is by_name
+
+
+_DRIVE_FILE_LINKS = [
+    "https://drive.google.com/file/d/abc123/view?usp=sharing",
+    "drive.google.com/file/u/1/d/abc123/view",
+    "https://www.google.com/url?q=https%3A%2F%2Fdrive.google.com%2Ffile%2Fd"
+    "%2Fabc123%2Fview&sa=D",
+    # Older share links and download links, such as those of Google Forms
+    # file uploads.
+    "https://drive.google.com/open?id=abc123",
+    "https://drive.google.com/open?usp=sharing&id=abc123",
+    "https://drive.google.com/uc?export=download&id=abc123",
+    "https://drive.google.com/u/0/uc?id=abc123&export=download",
+]
+
+
+@pytest.mark.parametrize("value", _DRIVE_FILE_LINKS)
+def test_resolve_google_file_id_explains_a_drive_file_link(value):
+    with pytest.raises(ValueError) as excinfo:
+        utils.resolve_google_file_id(
+            value, _TEST_DOC_PATTERN, "document_id", _TEST_FILE_KIND
+        )
+
+    message = str(excinfo.value)
+    assert "is a Google Drive file link, not a Google Docs link" in message
+    assert "such as a Word file (.docx)" in message
+    assert "download the file with google_drive_download_file" in message
+    assert "read the downloaded copy with read_file" in message
+    assert "works only if the Google Drive connection can access the file" in message
+    assert "attach the file to their message" in message
+    assert "File > Save as Google Docs" in message
+    assert "https://docs.google.com/document/d/..." in message
+    assert "by name" not in message
+
+
+@pytest.mark.parametrize("value", _DRIVE_FILE_LINKS)
+def test_resolve_google_file_id_explains_a_drive_file_link_to_an_editing_tool(
+    value,
+):
+    with pytest.raises(ValueError) as excinfo:
+        utils.resolve_google_file_id(
+            value, _TEST_DOC_PATTERN, "document_id", _TEST_FILE_KIND, editing=True
+        )
+
+    message = str(excinfo.value)
+    assert "is a Google Drive file link, not a Google Docs link" in message
+    assert "such as a Word file (.docx)" in message
+    # The same next steps as for the Office-file error from the API: a
+    # downloaded or attached copy can only be read, not changed, and saving
+    # as a Google Doc leaves the Word file as it was.
+    assert "To make this change with these tools, ask the user to open it" in message
+    assert "File > Save as Google Docs" in message
+    assert (
+        "Tell the user that this creates a new document: the change will be "
+        "made in that copy, and the original file will stay unchanged."
+    ) in message
+    assert "google_drive_download_file" not in message
+    assert "attach the file" not in message
+    assert message.endswith(
+        "If the file is a Google Docs document, ask the user for the document's "
+        "own link (https://docs.google.com/document/d/...)."
+    )
+
+
+# The response the Docs, Sheets and Slides APIs give for an Office file
+# stored in Drive.
+_OFFICE_FILE_400 = {
+    "error": {
+        "code": 400,
+        "message": "This operation is not supported for this document",
+        "status": "FAILED_PRECONDITION",
+    }
+}
+
+
+@pytest.mark.parametrize(
+    "error_body",
+    [
+        pytest.param(_OFFICE_FILE_400["error"], id="status-and-message"),
+        pytest.param(
+            {"message": "Precondition check failed.", "status": "FAILED_PRECONDITION"},
+            id="status-only",
+        ),
+        pytest.param(
+            {"message": "This operation is not supported for this document."},
+            id="message-only",
+        ),
+        pytest.param(
+            {"message": "This operation is Not Supported for this document."},
+            id="message-only-other-case",
+        ),
+        pytest.param(
+            {"message": "Bad request.", "errors": [{"reason": "failedPrecondition"}]},
+            id="legacy-reason",
+        ),
+    ],
+)
+def test_is_google_office_file_error_matches_the_status_or_the_message(error_body):
+    error = _google_http_error(400, json.dumps({"error": error_body}).encode("utf-8"))
+
+    assert utils.is_google_office_file_error(error)
+
+
+@pytest.mark.parametrize(
+    ("status", "error_body"),
+    [
+        (
+            400,
+            {
+                "code": 400,
+                "message": "Unable to parse range: Sheet9!A1",
+                "status": "INVALID_ARGUMENT",
+            },
+        ),
+        (400, {"message": "Bad request.", "errors": [{"reason": "badRequest"}]}),
+        # A body that is not Google-shaped, such as one from a proxy.
+        (400, {"message": "Bad request.", "status": ["FAILED_PRECONDITION"]}),
+        (404, _OFFICE_FILE_400["error"]),
+        (500, {"message": "Internal error.", "status": "FAILED_PRECONDITION"}),
+    ],
+)
+def test_is_google_office_file_error_ignores_other_errors(status, error_body):
+    error = _google_http_error(
+        status, json.dumps({"error": error_body}).encode("utf-8")
+    )
+
+    assert not utils.is_google_office_file_error(error)
+
+
+def test_google_file_error_message_keeps_raw_error_for_a_non_string_status():
+    error = _google_http_error(
+        400,
+        json.dumps(
+            {"error": {"message": "Bad request.", "status": ["FAILED_PRECONDITION"]}}
+        ).encode("utf-8"),
+    )
+
+    assert utils.google_file_error_message(error, _TEST_FILE_KIND) == str(error)
+
+
+# Every Docs, Sheets and Slides 400 is checked for the Office-file error, so
+# a 400 whose body is not Google's JSON error object (such as an HTML error
+# page) must keep the raw error rather than make the tool's error handler
+# raise.
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(
+            b"<html><title>Error 400 (Bad Request)!!1</title></html>", id="html-body"
+        ),
+        pytest.param(
+            json.dumps({"error": {"code": 400, "status": "INVALID_ARGUMENT"}}).encode(
+                "utf-8"
+            ),
+            id="no-message",
+        ),
+        pytest.param(
+            json.dumps({"error": "invalid_request"}).encode("utf-8"),
+            id="string-error",
+        ),
+    ],
+)
+@pytest.mark.parametrize("editing", [False, True])
+def test_google_file_error_message_keeps_raw_error_for_a_400_that_is_not_google_shaped(
+    content, editing
+):
+    error = _google_http_error(400, content)
+
+    assert not utils.is_google_office_file_error(error)
+    assert utils.google_file_error_message(
+        error, _TEST_FILE_KIND, editing=editing
+    ) == str(error)
+
+
+def test_is_google_office_file_error_needs_a_google_http_error():
+    assert not utils.is_google_office_file_error(
+        RuntimeError("This operation is not supported for this document")
+    )
+
+
+# Each Office-file 400 body, with the Google API response that the message
+# ends with. The legacy reason is kept there for diagnosis.
+_OFFICE_FILE_400_RESPONSES = [
+    pytest.param(
+        _OFFICE_FILE_400,
+        "HTTP 400 This operation is not supported for this document",
+        id="status-and-message",
+    ),
+    pytest.param(
+        {
+            "error": {
+                "code": 400,
+                "message": "Bad request.",
+                "errors": [{"reason": "failedPrecondition"}],
+            }
+        },
+        "HTTP 400 Bad request. (reason: failedPrecondition)",
+        id="legacy-reason",
+    ),
+]
+
+
+def _assert_explains_an_office_file(message, google_response):
+    # The Google Docs editor does open a Word file (in Office compatibility
+    # mode); only the API behind these tools cannot, so the message must not
+    # say that Google Docs itself cannot open it.
+    assert message.startswith(
+        "The Google Docs tools cannot open this file: it is most likely a Word "
+        "file (.docx) stored in Google Drive rather than a Google Docs document. "
+        "Google Docs can open such a file in Office compatibility mode, but the "
+        "API these tools use cannot."
+    )
+    assert "File > Save as Google Docs" in message
+    assert (
+        "If google_drive_search or the file's mimeType shows that it is a "
+        "Google Sheets or Google Slides file instead, open it with the matching "
+        "tools."
+    ) in message
+    assert message.endswith(f"Google API response: {google_response}")
+
+
+@pytest.mark.parametrize(("body", "google_response"), _OFFICE_FILE_400_RESPONSES)
+def test_google_file_error_message_explains_an_office_file(body, google_response):
+    error = _google_http_error(400, json.dumps(body).encode("utf-8"))
+
+    message = utils.google_file_error_message(error, _TEST_FILE_KIND)
+
+    _assert_explains_an_office_file(message, google_response)
+    assert "If google_drive_download_file and read_file are available" in message
+    assert "works only if the Google Drive connection can access the file" in message
+    assert "attach the file to their message" in message
+
+
+@pytest.mark.parametrize(("body", "google_response"), _OFFICE_FILE_400_RESPONSES)
+def test_google_file_error_message_explains_an_office_file_to_an_editing_tool(
+    body, google_response
+):
+    error = _google_http_error(400, json.dumps(body).encode("utf-8"))
+
+    message = utils.google_file_error_message(error, _TEST_FILE_KIND, editing=True)
+
+    _assert_explains_an_office_file(message, google_response)
+    assert (
+        "To make this change with these tools, ask the user to open it in "
+        "Google Docs, choose File > Save as Google Docs, and paste the new "
+        "document's link. Tell the user that this creates a new document: the "
+        "change will be made in that copy, and the original file will stay "
+        "unchanged."
+    ) in message
+    # A downloaded or attached copy can only be read, not changed.
+    assert "google_drive_download_file" not in message
+    assert "attach the file" not in message
+
+
+@pytest.mark.parametrize("editing", [False, True])
+def test_google_file_error_message_keeps_raw_error_for_other_400(editing):
+    error = _google_http_error(
+        400,
+        json.dumps(
+            {
+                "error": {
+                    "code": 400,
+                    "message": "Unable to parse range: Sheet9!A1",
+                    "status": "INVALID_ARGUMENT",
+                }
+            }
+        ).encode("utf-8"),
+    )
+
+    assert utils.google_file_error_message(
+        error, _TEST_FILE_KIND, editing=editing
+    ) == str(error)

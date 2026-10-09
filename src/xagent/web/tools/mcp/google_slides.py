@@ -45,6 +45,8 @@ _PRESENTATION_KIND = GoogleFileKind(
     noun="presentation",
     link_example="https://docs.google.com/presentation/d/...",
     create_tool="google_slides_create_presentation",
+    office_file="a PowerPoint file (.pptx)",
+    office_reader="read_pptx",
 )
 _PPTX_MIME_TYPE = (
     "application/vnd.openxmlformats-officedocument.presentationml.presentation"
@@ -494,13 +496,16 @@ def _record_created_default_slide(presentation_id: str, slide_id: str) -> None:
     _CREATED_DEFAULT_SLIDES[presentation_id] = slide_id
 
 
-def _resolve_presentation_id(presentation_id: str) -> str:
-    """Accept either a bare presentation id or a full Google Slides URL."""
+def _resolve_presentation_id(presentation_id: str, *, editing: bool = False) -> str:
+    """Accept either a bare presentation id or a full Google Slides URL.
+
+    Pass ``editing=True`` from a tool that changes the presentation."""
     return resolve_google_file_id(
         presentation_id,
         _PRESENTATION_URL_ID_PATTERN,
         "presentation_id",
         _PRESENTATION_KIND,
+        editing=editing,
     )
 
 
@@ -1084,7 +1089,7 @@ def google_slides_add_slide(
                 "empty slide."
             )
 
-        pres_id = _resolve_presentation_id(presentation_id)
+        pres_id = _resolve_presentation_id(presentation_id, editing=True)
         service = get_slides_service()
 
         tracked_default_slide_id = _CREATED_DEFAULT_SLIDES.get(pres_id)
@@ -1245,7 +1250,7 @@ def google_slides_update_slide(
         if body and not body.strip():
             return _error("'body' is whitespace-only; provide real text or omit it.")
 
-        pres_id = _resolve_presentation_id(presentation_id)
+        pres_id = _resolve_presentation_id(presentation_id, editing=True)
         service = get_slides_service()
         presentation = service.presentations().get(presentationId=pres_id).execute()
 
@@ -1333,7 +1338,7 @@ def google_slides_delete_slide(presentation_id: str, slide_id: str) -> str:
     google_slides_update_slide to fix the original.
     """
     try:
-        pres_id = _resolve_presentation_id(presentation_id)
+        pres_id = _resolve_presentation_id(presentation_id, editing=True)
         service = get_slides_service()
         presentation = service.presentations().get(presentationId=pres_id).execute()
 
@@ -1374,7 +1379,7 @@ def google_slides_batch_update(presentation_id: str, requests_json: str) -> str:
     first content slide; this tool cannot infer that id from a later session.
     """
     try:
-        pres_id = _resolve_presentation_id(presentation_id)
+        pres_id = _resolve_presentation_id(presentation_id, editing=True)
         requests = json.loads(requests_json)
         if not isinstance(requests, list):
             raise ValueError("requests_json must be a JSON array of request objects")

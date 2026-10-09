@@ -355,3 +355,101 @@ async def test_get_document_description_says_drive_is_not_needed():
     assert "otherwise, or if it finds nothing, ask the user to paste the link" in (
         description
     )
+
+
+# What the Docs API returns for a Word file stored in Drive.
+_OFFICE_FILE_400 = {
+    "error": {
+        "code": 400,
+        "message": "This operation is not supported for this document",
+        "status": "FAILED_PRECONDITION",
+    }
+}
+
+
+@pytest.mark.parametrize(
+    ("call", "editing"),
+    [
+        pytest.param(
+            lambda: google_docs.google_docs_get_document("doc123"),
+            False,
+            id="get_document",
+        ),
+        pytest.param(
+            lambda: google_docs.google_docs_append_text("doc123", "more"),
+            True,
+            id="append_text",
+        ),
+    ],
+)
+def test_tools_explain_a_word_file_stored_in_drive(monkeypatch, call, editing):
+    service, _ = _mock_docs_service(monkeypatch)
+    service.documents.return_value.get.return_value.execute.side_effect = _http_error(
+        400, _OFFICE_FILE_400
+    )
+
+    result = json.loads(call())
+
+    assert result["status"] == "error"
+    message = result["message"]
+    # Google Docs itself opens the file in Office compatibility mode; only
+    # its API cannot.
+    assert message.startswith(
+        "The Google Docs tools cannot open this file: it is most likely a Word "
+        "file (.docx) stored in Google Drive rather than a Google Docs document. "
+        "Google Docs can open such a file in Office compatibility mode"
+    )
+    assert "File > Save as Google Docs" in message
+    assert "is a Google Sheets or Google Slides file instead" in message
+    # A tool that changes the file is not sent to read a downloaded copy, and
+    # is told that saving as a Google Doc makes a new copy.
+    assert ("read the downloaded copy with read_file" in message) is not editing
+    assert (
+        "this creates a new document: the change will be made in that copy" in message
+    ) is editing
+    assert message.endswith(
+        "Google API response: HTTP 400 This operation is not supported for this "
+        "document"
+    )
+    service.documents.return_value.batchUpdate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("call", "editing"),
+    [
+        pytest.param(google_docs.google_docs_get_document, False, id="get_document"),
+        pytest.param(
+            lambda doc: google_docs.google_docs_append_text(doc, "more"),
+            True,
+            id="append_text",
+        ),
+        pytest.param(
+            lambda doc: google_docs.google_docs_replace_text(doc, "a", "b"),
+            True,
+            id="replace_text",
+        ),
+        pytest.param(
+            lambda doc: google_docs.google_docs_batch_update(doc, "[]"),
+            True,
+            id="batch_update",
+        ),
+    ],
+)
+def test_tools_give_their_own_next_steps_for_a_drive_file_link(
+    monkeypatch, call, editing
+):
+    _, get_service = _mock_docs_service(monkeypatch)
+
+    result = json.loads(call("https://drive.google.com/file/d/doc123/view"))
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert "is a Google Drive file link, not a Google Docs link" in message
+    assert "File > Save as Google Docs" in message
+    # A tool that changes the file is not sent to read a downloaded copy, and
+    # is told that saving as a Google Doc makes a new copy.
+    assert ("read the downloaded copy with read_file" in message) is not editing
+    assert (
+        "this creates a new document: the change will be made in that copy" in message
+    ) is editing
+    get_service.assert_not_called()

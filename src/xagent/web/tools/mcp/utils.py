@@ -1798,6 +1798,19 @@ def google_api_error_status(exc: BaseException) -> int | None:
         return None
 
 
+def _google_api_error_body(exc: BaseException) -> dict[str, Any]:
+    """Return the ``error`` object of a Google API error body, or ``{}``."""
+    content = getattr(exc, "content", None)
+    if not isinstance(content, bytes):
+        return {}
+    try:
+        data = json.loads(content.decode("utf-8"))
+    except ValueError:
+        return {}
+    error = data.get("error") if isinstance(data, dict) else None
+    return error if isinstance(error, dict) else {}
+
+
 def google_api_error_reasons(exc: BaseException) -> frozenset[str]:
     """Return the machine-readable reasons in a Google API error body.
 
@@ -1807,16 +1820,7 @@ def google_api_error_reasons(exc: BaseException) -> frozenset[str]:
     are collected so a caller can match a reason regardless of which one
     the API used.
     """
-    content = getattr(exc, "content", None)
-    if not isinstance(content, bytes):
-        return frozenset()
-    try:
-        data = json.loads(content.decode("utf-8"))
-    except ValueError:
-        return frozenset()
-    error = data.get("error") if isinstance(data, dict) else None
-    if not isinstance(error, dict):
-        return frozenset()
+    error = _google_api_error_body(exc)
     reasons: set[str] = set()
     for field in ("errors", "details"):
         entries = error.get(field)
@@ -1970,6 +1974,23 @@ _LINK_PREFIX_RE = re.compile(
     r"^(?:[a-z][a-z0-9+.-]*://|www\.|[a-z0-9-]+\.google\.com/)"
 )
 
+# Drive links a file that is not a native Google file, most often an
+# uploaded Office or PDF file, as "drive.google.com/file/d/<id>/view". Its
+# download links (".../uc?id=<id>") and older share links (".../open?id=<id>",
+# which Google Forms file uploads use, among others) are matched too. An older
+# share link can also name a native file, which the message allows for.
+_DRIVE_FILE_LINK_RE = re.compile(
+    r"drive\.google\.com/"
+    r"(?:file/(?:u/\d+/)?d/|(?:u/\d+/)?(?:open|uc)\?(?:[^#]*&)?id=)"
+)
+
+# The Docs, Sheets and Slides APIs answer a request for an Office file stored
+# in Drive (which their editors open in Office compatibility mode) with a 400
+# FAILED_PRECONDITION "This operation is not supported for this document".
+# Either signal is enough, so a change to one of them still matches.
+_OFFICE_FILE_ERROR_STATUSES = frozenset({"FAILED_PRECONDITION", "failedPrecondition"})
+_OFFICE_FILE_ERROR_MESSAGE = "not supported for this document"
+
 # Connecting Google Drive does not widen what these connectors can open: a
 # file opens when the account can open it, which depends on sharing.
 _DRIVE_NOT_NEEDED_NOTE = "Connecting Google Drive would not change this access."
@@ -1984,6 +2005,57 @@ class GoogleFileKind:
     noun: str
     link_example: str
     create_tool: str
+    # The Office file that this product's editor opens but its API cannot
+    # (e.g. "an Excel file (.xlsx)"), and the tool that reads a downloaded
+    # copy of it.
+    office_file: str
+    office_reader: str
+
+
+def _office_file_next_steps(kind: GoogleFileKind, *, editing: bool = False) -> str:
+    # "Paste", not "share": these connectors open a file with the user's own
+    # Google account, so the new file needs no sharing. "Share" in a Google
+    # editor means its Share dialog, where the user might open the file up to
+    # anyone with the link.
+    save_as = (
+        f"open it in {kind.product}, choose File > Save as {kind.product}, and "
+        f"paste the new {kind.noun}'s link"
+    )
+    if editing:
+        # A downloaded copy can only be read, so it cannot complete a change.
+        # Saving as a Google file leaves the Office file as it was, which the
+        # user needs to know before the change is made in the new copy.
+        return (
+            f"To make this change with these tools, ask the user to {save_as}. "
+            f"Tell the user that this creates a new {kind.noun}: the change "
+            "will be made in that copy, and the original file will stay "
+            "unchanged"
+        )
+    # Whether the Drive connection can see the file depends on its scope,
+    # which this process does not know, so the download is only offered as
+    # something that may work.
+    return (
+        f"If google_drive_download_file and {kind.office_reader} are "
+        "available, download the file with google_drive_download_file and "
+        f"read the downloaded copy with {kind.office_reader}; this works only "
+        "if the Google Drive connection can access the file. Otherwise, ask "
+        f"the user to attach the file to their message, or to {save_as}"
+    )
+
+
+def _other_google_file_hint(kind: GoogleFileKind) -> str:
+    # The same 400 can come back for an id of another kind of Google file
+    # (for example a document id passed to the Sheets tools), so the
+    # Office-file explanation names the way out of that case too.
+    others = " or ".join(
+        product
+        for _, product in _GOOGLE_EDITOR_LINK_PRODUCTS
+        if product != kind.product
+    )
+    return (
+        f"If google_drive_search or the file's mimeType shows that it is a "
+        f"{others} file instead, open it with the matching tools"
+    )
 
 
 def _find_by_name_hint(kind: GoogleFileKind) -> str:
@@ -2006,7 +2078,12 @@ def _shown_input(value: str) -> str:
 
 
 def resolve_google_file_id(
-    value: str, pattern: re.Pattern[str], field_name: str, kind: GoogleFileKind
+    value: str,
+    pattern: re.Pattern[str],
+    field_name: str,
+    kind: GoogleFileKind,
+    *,
+    editing: bool = False,
 ) -> str:
     """Resolve a link or bare id like ``resolve_id_from_url``, then reject a
     value that cannot be an id.
@@ -2016,8 +2093,13 @@ def resolve_google_file_id(
     which reads as if the file did not exist. Rejecting it here explains how
     to get a usable link instead, without spending an API call. A
     percent-encoded link (for example one wrapped by a redirect URL) is
-    decoded once before giving up, and a link to another kind of Google file
-    is named as such.
+    decoded once before giving up, and a link to another kind of Google file,
+    or to a file uploaded to Drive, is named as such.
+
+    Pass ``editing=True`` from a tool that changes the file, as for
+    ``google_file_error_message``: the next steps for a file uploaded to
+    Drive then leave out reading a downloaded copy, which cannot complete a
+    change, and say that saving as a Google file makes a new copy.
     """
     resolved = resolve_id_from_url(value, pattern, field_name)
     if _GOOGLE_FILE_ID_RE.fullmatch(resolved):
@@ -2045,6 +2127,16 @@ def resolve_google_file_id(
                     f"{kind.noun}, ask them for the {kind.noun}'s link "
                     f"({kind.link_example})."
                 )
+    if _DRIVE_FILE_LINK_RE.search(lowered):
+        raise ValueError(
+            f"{field_name} {shown!r} is a Google Drive file link, not a "
+            f"{kind.product} link. Drive usually gives this kind of link to a "
+            f"file uploaded to Drive, such as {kind.office_file}, which the "
+            f"{kind.product} tools cannot open. "
+            f"{_office_file_next_steps(kind, editing=editing)}. "
+            f"If the file is a {kind.product} {kind.noun}, ask the user for "
+            f"the {kind.noun}'s own link ({kind.link_example})."
+        )
     if _LINK_PREFIX_RE.match(lowered):
         raise ValueError(
             f"{field_name} {shown!r} is not a {kind.product} link or "
@@ -2099,22 +2191,57 @@ def is_google_file_access_error(exc: BaseException) -> bool:
     return not reasons or bool(reasons & GOOGLE_FILE_PERMISSION_403_REASONS)
 
 
+def is_google_office_file_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is the HTTP 400 the Docs, Sheets and Slides APIs return
+    for an Office file stored in Drive (such as an .xlsx opened from a
+    Sheets link), which they cannot open: its status or reason is
+    ``FAILED_PRECONDITION``, or its message says the operation "is not
+    supported for this document". Any other 400 is not matched."""
+    if google_api_error_status(exc) != 400:
+        return False
+    error = _google_api_error_body(exc)
+    status = error.get("status")
+    if (isinstance(status, str) and status in _OFFICE_FILE_ERROR_STATUSES) or (
+        google_api_error_reasons(exc) & _OFFICE_FILE_ERROR_STATUSES
+    ):
+        return True
+    message = error.get("message")
+    return isinstance(message, str) and _OFFICE_FILE_ERROR_MESSAGE in message.lower()
+
+
 def google_file_error_message(
     exc: BaseException, kind: GoogleFileKind, *, editing: bool = False
 ) -> str:
     """Return ``str(exc)``, or an actionable message when ``exc`` means the
-    file does not exist or the connected Google account cannot open it.
+    file is an Office file stored in Drive, does not exist, or the connected
+    Google account cannot open it.
 
-    The raw API error only says "not found" or "permission denied", which
-    leaves the caller guessing whether another connection is missing. The
-    actionable message names what the user can do instead, and keeps the
-    API's own wording at the end for diagnosis.
+    The raw API error only says "not found", "permission denied" or "not
+    supported for this document", which leaves the caller guessing whether
+    another connection is missing. The actionable message names what the
+    user can do instead, and keeps the API's own wording at the end for
+    diagnosis.
 
     Pass ``editing=True`` from a tool that changes the file. A 403 there
     usually means the account can open the file but not edit it (view or
     comment access only), so it is described as a refused change rather
-    than as a file that could not be opened.
+    than as a file that could not be opened. For an Office file, the next
+    steps there leave out reading a downloaded copy, which cannot complete
+    a change, and say that saving as a Google file makes a new copy.
     """
+    if is_google_office_file_error(exc):
+        # The product's editor does open such a file, in Office compatibility
+        # mode; only its API cannot. So the message must not say that the
+        # product itself cannot open the file.
+        return (
+            f"The {kind.product} tools cannot open this file: it is most "
+            f"likely {kind.office_file} stored in Google Drive rather than a "
+            f"{kind.product} {kind.noun}. {kind.product} can open such a file "
+            "in Office compatibility mode, but the API these tools use "
+            f"cannot. {_office_file_next_steps(kind, editing=editing)}. "
+            f"{_other_google_file_hint(kind)}. Google API response: "
+            f"{google_api_error_summary(exc, with_reasons=True)}"
+        )
     if not is_google_file_access_error(exc):
         return str(exc)
     summary = google_api_error_summary(exc, with_reasons=True)

@@ -681,3 +681,197 @@ async def test_get_spreadsheet_description_says_drive_is_not_needed():
     assert "otherwise, or if it finds nothing, ask the user to paste the link" in (
         description
     )
+
+
+# What the Sheets API returns for an Excel file stored in Drive, such as one
+# opened from a ".../spreadsheets/d/<id>/edit?rtpof=true" link.
+_OFFICE_FILE_400 = {
+    "error": {
+        "code": 400,
+        "message": "This operation is not supported for this document",
+        "status": "FAILED_PRECONDITION",
+    }
+}
+
+
+def _assert_explains_an_excel_file(message):
+    # Google Sheets itself opens the file (in Office compatibility mode, which
+    # is where an "rtpof=true" link comes from); only its API cannot.
+    assert message.startswith(
+        "The Google Sheets tools cannot open this file: it is most likely an "
+        "Excel file (.xlsx) stored in Google Drive rather than a Google Sheets "
+        "spreadsheet. Google Sheets can open such a file in Office "
+        "compatibility mode, but the API these tools use cannot."
+    )
+    assert "File > Save as Google Sheets" in message
+    assert "is a Google Docs or Google Slides file instead" in message
+    assert message.endswith(
+        "Google API response: HTTP 400 This operation is not supported for this "
+        "document"
+    )
+
+
+@pytest.mark.parametrize(
+    ("invoke", "request_of"),
+    [
+        pytest.param(
+            lambda: google_sheets.google_sheets_get_spreadsheet(
+                "https://docs.google.com/spreadsheets/d/abc123/edit"
+                "?usp=sharing&rtpof=true&sd=true"
+            ),
+            lambda spreadsheets: spreadsheets.get.return_value,
+            id="get_spreadsheet",
+        ),
+        pytest.param(
+            lambda: google_sheets.google_sheets_read_range("sid", "Sheet1"),
+            lambda spreadsheets: spreadsheets.values.return_value.get.return_value,
+            id="read_range",
+        ),
+    ],
+)
+def test_read_tools_explain_an_excel_file_stored_in_drive(
+    monkeypatch, invoke, request_of
+):
+    spreadsheets = Mock()
+    request_of(spreadsheets).execute.side_effect = _http_error(400, _OFFICE_FILE_400)
+    _mock_sheets_service(monkeypatch, spreadsheets)
+
+    result = json.loads(invoke())
+
+    assert result["status"] == "error"
+    message = result["message"]
+    _assert_explains_an_excel_file(message)
+    assert "download the file with google_drive_download_file" in message
+    assert "read the downloaded copy with read_file" in message
+    assert "works only if the Google Drive connection can access the file" in message
+    assert "attach the file to their message" in message
+
+
+@pytest.mark.parametrize(("invoke", "request_of"), _EDITING_CALLS)
+def test_editing_tools_explain_an_excel_file_stored_in_drive(
+    monkeypatch, invoke, request_of
+):
+    spreadsheets = Mock()
+    request_of(spreadsheets).execute.side_effect = _http_error(400, _OFFICE_FILE_400)
+    _mock_sheets_service(monkeypatch, spreadsheets)
+
+    result = json.loads(invoke())
+
+    assert result["status"] == "error"
+    message = result["message"]
+    _assert_explains_an_excel_file(message)
+    # Reading a downloaded copy cannot complete a change, and saving as a
+    # Google Sheet leaves the Excel file unchanged.
+    assert "To make this change with these tools, ask the user to open it" in (message)
+    assert (
+        "this creates a new spreadsheet: the change will be made in that copy, "
+        "and the original file will stay unchanged"
+    ) in message
+    assert "google_drive_download_file" not in message
+
+
+def test_read_range_keeps_raw_error_for_other_400(monkeypatch):
+    spreadsheets = Mock()
+    error = _http_error(
+        400,
+        {
+            "error": {
+                "code": 400,
+                "message": "Unable to parse range: Sheet9!A1",
+                "status": "INVALID_ARGUMENT",
+            }
+        },
+    )
+    spreadsheets.values.return_value.get.return_value.execute.side_effect = error
+    _mock_sheets_service(monkeypatch, spreadsheets)
+
+    result = json.loads(google_sheets.google_sheets_read_range("sid", "Sheet9!A1"))
+
+    assert result["message"] == str(error)
+
+
+def test_get_spreadsheet_explains_a_drive_file_link_without_calling_the_api(
+    monkeypatch,
+):
+    get_service = Mock()
+    monkeypatch.setattr(google_sheets, "get_sheets_service", get_service)
+
+    result = json.loads(
+        google_sheets.google_sheets_get_spreadsheet(
+            "https://drive.google.com/file/d/abc123/view?usp=sharing"
+        )
+    )
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert "is a Google Drive file link, not a Google Sheets link" in message
+    assert "such as an Excel file (.xlsx)" in message
+    assert "download the file with google_drive_download_file" in message
+    assert "works only if the Google Drive connection can access the file" in message
+    assert "File > Save as Google Sheets" in message
+    assert "https://docs.google.com/spreadsheets/d/..." in message
+    get_service.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("invoke", "editing"),
+    [
+        pytest.param(
+            lambda sid: google_sheets.google_sheets_read_range(sid, "Sheet1!A1"),
+            False,
+            id="read_range",
+        ),
+        pytest.param(
+            lambda sid: google_sheets.google_sheets_update_range(
+                sid, "Sheet1!A1", [["x"]]
+            ),
+            True,
+            id="update_range",
+        ),
+        pytest.param(
+            lambda sid: google_sheets.google_sheets_append_rows(
+                sid, "Sheet1!A1", [["x"]]
+            ),
+            True,
+            id="append_rows",
+        ),
+        pytest.param(
+            lambda sid: google_sheets.google_sheets_clear_range(sid, "Sheet1!A1"),
+            True,
+            id="clear_range",
+        ),
+        pytest.param(
+            lambda sid: google_sheets.google_sheets_add_sheet(sid, "Q4"),
+            True,
+            id="add_sheet",
+        ),
+        pytest.param(
+            lambda sid: google_sheets.google_sheets_delete_sheet(sid, 7),
+            True,
+            id="delete_sheet",
+        ),
+    ],
+)
+def test_tools_give_their_own_next_steps_for_a_drive_file_link(
+    monkeypatch, invoke, editing
+):
+    get_service = Mock()
+    monkeypatch.setattr(google_sheets, "get_sheets_service", get_service)
+
+    result = json.loads(invoke("https://drive.google.com/file/d/abc123/view"))
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert "is a Google Drive file link, not a Google Sheets link" in message
+    assert "File > Save as Google Sheets" in message
+    # A tool that changes the file gets the same steps as for the Office-file
+    # error from the API: a downloaded or attached copy can only be read, and
+    # saving as a Google Sheet leaves the Excel file unchanged.
+    assert ("read the downloaded copy with read_file" in message) is not editing
+    assert ("attach the file to their message" in message) is not editing
+    assert ("To make this change with these tools" in message) is editing
+    assert (
+        "this creates a new spreadsheet: the change will be made in that copy, "
+        "and the original file will stay unchanged" in message
+    ) is editing
+    get_service.assert_not_called()

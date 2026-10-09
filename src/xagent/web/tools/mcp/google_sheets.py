@@ -32,6 +32,8 @@ _SPREADSHEET_KIND = GoogleFileKind(
     noun="spreadsheet",
     link_example="https://docs.google.com/spreadsheets/d/...",
     create_tool="google_sheets_create_spreadsheet",
+    office_file="an Excel file (.xlsx)",
+    office_reader="read_file",
 )
 
 
@@ -66,10 +68,16 @@ def get_drive_service() -> Any:
     return build("drive", "v3", credentials=_get_credentials())
 
 
-def _resolve_spreadsheet_id(spreadsheet_id: str) -> str:
-    """Accept either a bare spreadsheet id or a full Google Sheets URL."""
+def _resolve_spreadsheet_id(spreadsheet_id: str, *, editing: bool = False) -> str:
+    """Accept either a bare spreadsheet id or a full Google Sheets URL.
+
+    Pass ``editing=True`` from a tool that changes the spreadsheet."""
     return resolve_google_file_id(
-        spreadsheet_id, _SPREADSHEET_URL_ID_PATTERN, "spreadsheet_id", _SPREADSHEET_KIND
+        spreadsheet_id,
+        _SPREADSHEET_URL_ID_PATTERN,
+        "spreadsheet_id",
+        _SPREADSHEET_KIND,
+        editing=editing,
     )
 
 
@@ -275,7 +283,7 @@ def google_sheets_update_range(
     literal string).
     """
     try:
-        resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id)
+        resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id, editing=True)
         service = get_sheets_service()
         result = (
             service.spreadsheets()
@@ -314,7 +322,7 @@ def google_sheets_append_rows(
     [["a","b"],["c","d"]].
     """
     try:
-        resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id)
+        resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id, editing=True)
         service = get_sheets_service()
         result = (
             service.spreadsheets()
@@ -349,7 +357,7 @@ def google_sheets_clear_range(spreadsheet_id: str, range_name: str) -> str:
     removing cell formatting.
     """
     try:
-        resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id)
+        resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id, editing=True)
         service = get_sheets_service()
         result = (
             service.spreadsheets()
@@ -377,7 +385,7 @@ def google_sheets_add_sheet(
     Add a new sheet (tab) to an existing spreadsheet.
     """
     try:
-        resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id)
+        resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id, editing=True)
         service = get_sheets_service()
         result = (
             service.spreadsheets()
@@ -425,7 +433,7 @@ def google_sheets_delete_sheet(spreadsheet_id: str, sheet_id: int) -> str:
     the spreadsheet_id string).
     """
     try:
-        resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id)
+        resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id, editing=True)
         service = get_sheets_service()
         service.spreadsheets().batchUpdate(
             spreadsheetId=resolved_spreadsheet_id,

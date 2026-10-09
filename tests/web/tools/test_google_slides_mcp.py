@@ -2955,3 +2955,116 @@ def test_get_presentation_resolves_multi_account_presentation_url(monkeypatch):
 
     assert result["status"] == "success"
     assert presentations.get.call_args.kwargs["presentationId"] == "abc123"
+
+
+# What the Slides API returns for a PowerPoint file stored in Drive.
+_OFFICE_FILE_400 = {
+    "error": {
+        "code": 400,
+        "message": "This operation is not supported for this document",
+        "status": "FAILED_PRECONDITION",
+    }
+}
+
+
+def test_get_presentation_explains_a_powerpoint_file_stored_in_drive(monkeypatch):
+    presentations = Mock()
+    presentations.get.return_value.execute.side_effect = _http_error(
+        400, _OFFICE_FILE_400
+    )
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(google_slides.google_slides_get_presentation("pres1"))
+
+    assert result["status"] == "error"
+    message = result["message"]
+    # Google Slides itself opens the file in Office compatibility mode; only
+    # its API cannot.
+    assert message.startswith(
+        "The Google Slides tools cannot open this file: it is most likely a "
+        "PowerPoint file (.pptx) stored in Google Drive rather than a Google "
+        "Slides presentation. Google Slides can open such a file in Office "
+        "compatibility mode"
+    )
+    assert "read the downloaded copy with read_pptx" in message
+    assert "File > Save as Google Slides" in message
+    assert "is a Google Docs or Google Sheets file instead" in message
+    assert message.endswith(
+        "Google API response: HTTP 400 This operation is not supported for this "
+        "document"
+    )
+
+
+def test_editing_tool_explains_a_powerpoint_file_stored_in_drive(monkeypatch):
+    presentations = Mock()
+    presentations.batchUpdate.return_value.execute.side_effect = _http_error(
+        400, _OFFICE_FILE_400
+    )
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(google_slides.google_slides_batch_update("pres1", "[]"))
+
+    message = result["message"]
+    assert message.startswith(
+        "The Google Slides tools cannot open this file: it is most likely a "
+        "PowerPoint file"
+    )
+    assert (
+        "this creates a new presentation: the change will be made in that copy"
+        in message
+    )
+    assert "read_pptx" not in message
+
+
+@pytest.mark.parametrize(
+    ("call", "editing"),
+    [
+        pytest.param(
+            google_slides.google_slides_get_presentation, False, id="get_presentation"
+        ),
+        pytest.param(
+            lambda pres: google_slides.google_slides_add_slide(
+                pres, title="T", body="B"
+            ),
+            True,
+            id="add_slide",
+        ),
+        pytest.param(
+            lambda pres: google_slides.google_slides_update_slide(
+                pres, "slide1", title="T"
+            ),
+            True,
+            id="update_slide",
+        ),
+        pytest.param(
+            lambda pres: google_slides.google_slides_delete_slide(pres, "slide1"),
+            True,
+            id="delete_slide",
+        ),
+        pytest.param(
+            lambda pres: google_slides.google_slides_batch_update(pres, "[]"),
+            True,
+            id="batch_update",
+        ),
+    ],
+)
+def test_tools_give_their_own_next_steps_for_a_drive_file_link(
+    monkeypatch, call, editing
+):
+    get_service = Mock()
+    monkeypatch.setattr(google_slides, "get_slides_service", get_service)
+
+    result = json.loads(call("https://drive.google.com/file/d/pres1/view"))
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert "is a Google Drive file link, not a Google Slides link" in message
+    assert "File > Save as Google Slides" in message
+    # A tool that changes the file is not sent to read a downloaded copy, and
+    # is told that saving as a Google Slides file makes a new copy.
+    assert ("read the downloaded copy with read_pptx" in message) is not editing
+    assert (
+        "this creates a new presentation: the change will be made in that copy"
+        in message
+    ) is editing
+    get_service.assert_not_called()
