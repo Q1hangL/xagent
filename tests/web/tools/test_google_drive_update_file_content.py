@@ -983,9 +983,11 @@ def test_update_errors_are_mapped(monkeypatch, allowed_dir, status, reason, expe
     assert result["status"] == "error"
     assert expected in result["message"]
     assert "www.googleapis.com" not in result["message"]
-    # A 4xx reply is a definite rejection: the file is still as it was read.
+    # A 4xx reply is a definite rejection once the file, read again, is
+    # still as it was read before the update.
     assert "not known whether" not in result["message"]
     assert result["file"]["headRevisionId"] == "rev-1"
+    assert drive.files.get.call_count == 2
     drive.files.create.assert_not_called()
 
 
@@ -1620,15 +1622,17 @@ def test_wire_update_does_not_retry_a_client_error(monkeypatch, allowed_dir):
         [
             _ok(_current()),
             ({"status": "400"}, json.dumps(bad_request)),
-            _ok(_updated()),
+            _ok(_current()),
         ],
     )
 
     result = _call("deck1", _replacement(allowed_dir))
 
     assert result["status"] == "error"
+    assert "did not accept the new content" in result["message"]
     assert "(reason: badRequest)" in result["message"]
-    assert [request.method for request in http.requests] == ["GET", "PATCH"]
+    # The 400 is not retried; the file is read again to check it is as it was.
+    assert [request.method for request in http.requests] == ["GET", "PATCH", "GET"]
 
 
 def _error_reply(status, reason):
@@ -1693,10 +1697,13 @@ def test_wire_rejected_retry_after_an_unclear_attempt_is_an_unknown_outcome(
 def test_wire_rate_limit_on_every_attempt_is_a_rejection(
     monkeypatch, allowed_dir, rate_limited
 ):
-    """Every attempt was refused before Drive took the content, so the
-    pre-read state is still the file's state."""
+    """Every attempt was refused, and the file read again still has the
+    content read before the update, so that is the file's state."""
     monkeypatch.setattr(googleapiclient.http.time, "sleep", lambda seconds: None)
-    http = _wire_drive(monkeypatch, [_ok(_current())] + [rate_limited] * 3)
+    reread = _current(modifiedTime="2026-05-12T09:00:00.000Z")
+    http = _wire_drive(
+        monkeypatch, [_ok(_current())] + [rate_limited] * 3 + [_ok(reread)]
+    )
 
     result = _call("deck1", _replacement(allowed_dir))
 
@@ -1704,7 +1711,80 @@ def test_wire_rate_limit_on_every_attempt_is_a_rejection(
     assert "did not accept the new content" in result["message"]
     assert "not known whether" not in result["message"]
     assert result["file"]["headRevisionId"] == "rev-1"
-    assert [request.method for request in http.requests] == ["GET"] + ["PATCH"] * 3
+    assert result["file"]["modifiedTime"] == reread["modifiedTime"]
+    methods = [request.method for request in http.requests]
+    assert methods == ["GET"] + ["PATCH"] * 3 + ["GET"]
+    reread_request = http.requests[-1]
+    assert "md5Checksum" in parse_qs(urlparse(reread_request.uri).query)["fields"][0]
+
+
+def test_wire_rejected_update_reads_the_file_again_with_its_resource_key(
+    monkeypatch, allowed_dir
+):
+    http = _wire_drive(
+        monkeypatch,
+        [_ok(_current()), _error_reply(400, "badRequest"), _ok(_current())],
+    )
+
+    result = _call(
+        "https://drive.google.com/file/d/deck1/view?resourcekey=0-key",
+        _replacement(allowed_dir),
+    )
+
+    assert "did not accept the new content" in result["message"]
+    pre_read, update, reread = http.requests
+    assert reread.method == "GET"
+    assert reread.uri.startswith("https://www.googleapis.com/drive/v3/files/deck1?")
+    assert "supportsAllDrives=true" in reread.uri
+    for request in (pre_read, update, reread):
+        assert request.headers["x-goog-drive-resource-keys"] == "deck1/0-key"
+
+
+@pytest.mark.parametrize(
+    ("update_replies", "reread_replies"),
+    [
+        # httplib2 sent the request again on its own after the connection
+        # closed with no reply, so neither googleapiclient nor the tool saw
+        # the attempt that stored the content; every attempt they saw got 429.
+        ([_RATE_LIMITED] * 3, [_ok(_updated())]),
+        ([_error_reply(400, "badRequest")], [_ok(_updated())]),
+        # Someone else changed the file meanwhile.
+        (
+            [_error_reply(403, "insufficientFilePermissions")],
+            [_ok(_current(md5Checksum=_md5(b"other"), headRevisionId="rev-9"))],
+        ),
+        # The file cannot be read again.
+        ([_error_reply(404, "notFound")], [_error_reply(404, "notFound")]),
+        ([_RATE_LIMITED] * 3, [_RATE_LIMITED] * 3),
+    ],
+    ids=[
+        "429-after-a-hidden-resend-stored-it",
+        "400-after-a-hidden-resend-stored-it",
+        "changed-by-someone-else",
+        "not-found-on-the-re-read",
+        "re-read-rate-limited",
+    ],
+)
+def test_wire_rejection_the_file_read_again_does_not_settle_is_unknown(
+    monkeypatch, allowed_dir, update_replies, reread_replies
+):
+    monkeypatch.setattr(googleapiclient.http.time, "sleep", lambda seconds: None)
+    http = _wire_drive(monkeypatch, [_ok(_current()), *update_replies, *reread_replies])
+
+    result = _call("deck1", _replacement(allowed_dir))
+
+    message = result["message"]
+    assert result["status"] == "error"
+    assert "reading the file again did not confirm that it is unchanged" in message
+    assert "not known whether 'Quarterly Deck.pptx' changed" in message
+    assert "Do not report it as updated or as unchanged" in message
+    assert "did not accept" not in message
+    assert "nothing was changed" not in message.lower()
+    assert "file" not in result
+    assert result["previous"]["headRevisionId"] == "rev-1"
+    assert [request.method for request in http.requests] == (
+        ["GET"] + ["PATCH"] * len(update_replies) + ["GET"] * len(reread_replies)
+    )
 
 
 _SESSION = (
@@ -1757,7 +1837,7 @@ def test_wire_resumable_server_error_before_the_last_chunk_stores_nothing(
     monkeypatch.setattr(google_drive, "_SIMPLE_UPLOAD_MAX_BYTES", 1000)
     monkeypatch.setattr(google_drive, "_RESUMABLE_CHUNK_BYTES", 256 * 1024)
     data = (b"slide-bytes-" * 30000)[: 300 * 1024]
-    http = _wire_drive(monkeypatch, [_ok(_current()), *replies])
+    http = _wire_drive(monkeypatch, [_ok(_current()), *replies, _ok(_current())])
 
     result = _call("deck1", _replacement(allowed_dir, data=data))
 
@@ -1765,7 +1845,7 @@ def test_wire_resumable_server_error_before_the_last_chunk_stores_nothing(
     assert expected in result["message"]
     assert "not known whether" not in result["message"]
     assert result["file"]["headRevisionId"] == "rev-1"
-    assert [request.method for request in http.requests] == ["GET", *methods]
+    assert [request.method for request in http.requests] == ["GET", *methods, "GET"]
     # The last chunk was never sent.
     assert not any(
         request.headers.get("content-range", "").startswith("bytes 262144-")

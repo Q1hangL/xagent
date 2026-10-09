@@ -1930,7 +1930,9 @@ class _UpdateAttempts:
     googleapiclient retries a timeout, a dropped connection, a 5xx, a 429
     and a rate-limit 403, so the error it finally raises may be a 4xx that
     says nothing about an earlier attempt: that attempt may have timed out
-    or got a 5xx after Drive stored the content.
+    or got a 5xx after Drive stored the content. Only the requests that
+    googleapiclient makes pass through here, not one that httplib2 sends
+    again on its own (see _content_update_request_error).
     """
 
     def __init__(self, http: Any) -> None:
@@ -1962,46 +1964,101 @@ class _UpdateAttempts:
         return getattr(self._http, name)
 
 
+def _is_content_rejection(exc: Exception) -> bool:
+    """Whether Drive answered the update with a 4xx other than a timeout."""
+    status = google_api_error_status(exc)
+    return status is not None and 400 <= status < 500 and status != 408
+
+
+def _reread_unchanged_file(
+    service: Any, file_id: str, resource_key: str | None, previous: dict[str, Any]
+) -> dict[str, Any] | None:
+    """The file as Drive returns it now, when it still has the content read
+    before the update (the same checksum and head revision); ``None`` when
+    it does not, or when it cannot be read."""
+    request = service.files().get(
+        fileId=file_id,
+        supportsAllDrives=True,
+        fields=_CONTENT_UPDATE_RESULT_FIELDS,
+    )
+    _attach_resource_key(request, file_id, resource_key)
+    try:
+        now = request.execute(num_retries=_CONTENT_UPDATE_NUM_RETRIES)
+    except Exception as exc:
+        logger.warning(
+            "Could not read file %s again after the update: %s", file_id, exc
+        )
+        return None
+    if not isinstance(now, dict):
+        return None
+    old_md5 = previous.get("md5Checksum")
+    new_md5 = now.get("md5Checksum")
+    if not (
+        isinstance(old_md5, str)
+        and old_md5
+        and isinstance(new_md5, str)
+        and new_md5.lower() == old_md5.lower()
+    ):
+        return None
+    if now.get("headRevisionId") != previous.get("headRevisionId"):
+        return None
+    return now
+
+
 def _content_update_request_error(
     exc: Exception,
     name: str,
     current_summary: dict[str, Any],
     *,
     earlier_attempt_unclear: bool,
+    unchanged_file: dict[str, Any] | None,
 ) -> str:
     """The error result for a files.update request that raised.
 
-    A 4xx reply to the only attempt is a definite rejection, so the
-    pre-read state is still the file's state. A 5xx left after retries, a
-    timeout, a dropped connection, or a 4xx after an attempt that ended
-    that way may come after Drive stored the upload, so that result says
-    the outcome is unknown and keeps the pre-read state as "previous"
-    rather than as the file's current state.
+    A 4xx is a definite rejection only when ``unchanged_file``, the file
+    read again after it, still has the content read before the update; that
+    state is then the file's state. A 4xx on every attempt _UpdateAttempts
+    saw does not show this by itself: httplib2 sends a request again on its
+    own when the connection closes before any reply, so an attempt that
+    stored the content may never reach googleapiclient's retries or the
+    wrapper.
+
+    A 5xx left after retries, a timeout, a dropped connection, a 4xx after
+    an attempt that ended that way, or a 4xx that the re-read does not
+    settle may come after Drive stored the upload, so that result says the
+    outcome is unknown and keeps the pre-read state as "previous" rather
+    than as the file's current state.
     """
-    status = google_api_error_status(exc)
-    rejected = status is not None and 400 <= status < 500 and status != 408
-    if rejected and not earlier_attempt_unclear:
+    rejected = _is_content_rejection(exc)
+    if rejected and unchanged_file is not None:
+        file = _content_summary(unchanged_file)
         if is_google_file_unavailable_error(exc):
             return _content_update_error(
-                _unavailable_content_update_message(exc), file=current_summary
+                _unavailable_content_update_message(exc), file=file
             )
         if is_google_file_access_error(exc):
             return _content_update_error(
-                _content_permission_message(name, exc), file=current_summary
+                _content_permission_message(name, exc), file=file
             )
         # Quota, rate limits and a missing OAuth scope keep Drive's own error.
         return _content_update_error(
             f"Google Drive did not accept the new content for '{name}'. Do "
             "not report the file as updated. "
             f"{_content_error_detail(exc)}",
-            file=current_summary,
+            file=file,
         )
-    what = (
-        "Google Drive refused a retry of the upload after an earlier attempt "
-        "ended without a clear answer"
-        if rejected
-        else "The upload to Google Drive did not finish normally"
-    )
+    if not rejected:
+        what = "The upload to Google Drive did not finish normally"
+    elif earlier_attempt_unclear:
+        what = (
+            "Google Drive refused a retry of the upload after an earlier "
+            "attempt ended without a clear answer"
+        )
+    else:
+        what = (
+            "Google Drive refused the upload, but reading the file again did "
+            "not confirm that it is unchanged"
+        )
     return _content_update_error(
         f"{what}, so it is not known whether '{name}' changed. Do not report "
         "it as updated or as unchanged; ask the user to check the file's "
@@ -2441,11 +2498,17 @@ def google_drive_update_file_content(
                 )
             except Exception as exc:
                 logger.error(f"Error updating file content: {exc}")
+                unchanged_file = None
+                if _is_content_rejection(exc) and not attempts.unclear:
+                    unchanged_file = _reread_unchanged_file(
+                        service, resolved_file_id, resource_key, current
+                    )
                 return _content_update_request_error(
                     exc,
                     name,
                     current_summary,
                     earlier_attempt_unclear=attempts.unclear,
+                    unchanged_file=unchanged_file,
                 )
 
         if not isinstance(updated, dict):
