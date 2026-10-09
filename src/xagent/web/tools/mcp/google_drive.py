@@ -8,7 +8,6 @@ import mimetypes
 import os
 import re
 from collections.abc import Callable
-from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import ParseResult, parse_qs, urlparse
@@ -26,7 +25,6 @@ from ....config import get_tool_max_output_length
 from .utils import (
     allowed_dirs_from_env,
     clamp_limit,
-    datetime_key_for_comparison,
     google_api_error_status,
     google_api_error_summary,
     is_google_file_access_error,
@@ -1552,7 +1550,7 @@ _EXTRA_EXTENSION_TYPES = {
 _CONTENT_UPDATE_GET_FIELDS = (
     "id,name,mimeType,trashed,size,md5Checksum,headRevisionId,version,"
     "modifiedTime,webViewLink,shared,driveId,"
-    "capabilities(canEdit,canModifyContent),shortcutDetails(targetId,targetMimeType)"
+    "capabilities(canModifyContent),shortcutDetails(targetId,targetMimeType)"
 )
 _CONTENT_UPDATE_RESULT_FIELDS = (
     "id,name,mimeType,size,md5Checksum,headRevisionId,version,modifiedTime,"
@@ -2145,31 +2143,25 @@ def _content_update_mismatch(
     *,
     file_id: str,
     local_md5: str,
-    local_size: int,
 ) -> str | None:
     """Why ``updated`` does not show the uploaded bytes as the new head
     revision of ``file_id``, or ``None`` when it does.
 
-    The checksum is the main evidence. headRevisionId only changes with the
-    content, while version also counts renames and sharing changes, so each
-    is compared only when Drive returned it on both sides; a missing
-    headRevisionId falls back to version, and a missing checksum requires a
-    matching size, an advanced version and a modified time that did not move
-    backwards. With a checksum, modifiedTime is not used: a client can set it
-    ahead of Google's clock, and a content update then resets it to the
+    The checksum is the evidence, so a reply without one is not confirmed.
+    headRevisionId only changes with the content, while version also counts
+    renames and sharing changes, so each is compared only when Drive
+    returned it on both sides. modifiedTime is not used: a client can set
+    it ahead of Google's clock, and a content update then resets it to the
     current time.
     """
     if updated.get("id") != file_id:
         return "it returned a different file id"
     new_md5 = updated.get("md5Checksum")
-    new_md5 = new_md5.lower() if isinstance(new_md5, str) and new_md5 else None
-    new_size = _as_int(updated.get("size"))
-    if new_md5 is not None and new_md5 != local_md5:
+    if not isinstance(new_md5, str) or not new_md5:
+        return "it returned no checksum to check"
+    new_md5 = new_md5.lower()
+    if new_md5 != local_md5:
         return "its checksum does not match the uploaded file"
-    if new_size is not None and new_size != local_size:
-        return "its size does not match the uploaded file"
-    if new_md5 is None and new_size is None:
-        return "it returned neither a checksum nor a size to check"
 
     old_head = previous.get("headRevisionId")
     new_head = updated.get("headRevisionId")
@@ -2183,21 +2175,6 @@ def _content_update_mismatch(
         if new_version <= old_version:
             return "its version did not advance"
         version_compared = True
-
-    if new_md5 is None:
-        if not version_compared:
-            return "it returned no checksum and no version to check"
-        old_time = datetime_key_for_comparison(previous.get("modifiedTime"))
-        new_time = datetime_key_for_comparison(updated.get("modifiedTime"))
-        if (
-            isinstance(old_time, datetime)
-            and isinstance(new_time, datetime)
-            # A value with an offset and one without cannot be compared.
-            and (old_time.tzinfo is None) == (new_time.tzinfo is None)
-            and new_time < old_time
-        ):
-            return "its modified time is earlier than before the update"
-        return None
     old_md5 = previous.get("md5Checksum")
     md5_changed = (
         isinstance(old_md5, str) and bool(old_md5) and old_md5.lower() != new_md5
@@ -2434,7 +2411,6 @@ def google_drive_update_file_content(
             current,
             file_id=resolved_file_id,
             local_md5=local_md5,
-            local_size=local_size,
         )
         if mismatch is not None:
             return _content_update_error(

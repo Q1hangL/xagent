@@ -71,7 +71,7 @@ def _current(**overrides):
         "modifiedTime": "2026-05-12T08:00:00.000Z",
         "webViewLink": "https://drive.google.com/file/d/deck1/view",
         "shared": False,
-        "capabilities": {"canEdit": True, "canModifyContent": True},
+        "capabilities": {"canModifyContent": True},
     }
     file.update(overrides)
     # Drive leaves out a field it has no value for.
@@ -212,6 +212,7 @@ def test_simple_update_replaces_content_in_place(monkeypatch, allowed_dir):
     assert get_kwargs["supportsAllDrives"] is True
     for field in ("canModifyContent", "headRevisionId", "md5Checksum", "shared"):
         assert field in get_kwargs["fields"]
+    assert "canEdit" not in get_kwargs["fields"]
     update_kwargs = drive.files.update.call_args.kwargs
     assert update_kwargs["fileId"] == "deck1"
     assert "body" not in update_kwargs
@@ -706,7 +707,7 @@ def test_trashed_file_is_refused(monkeypatch, allowed_dir):
 def test_file_without_edit_access_is_refused(monkeypatch, allowed_dir):
     drive = _Drive(
         monkeypatch,
-        current=_current(capabilities={"canEdit": False, "canModifyContent": False}),
+        current=_current(capabilities={"canModifyContent": False}),
     )
 
     result = _call("deck1", _replacement(allowed_dir))
@@ -1054,22 +1055,11 @@ def test_failed_pre_read_changes_nothing_and_keeps_the_uri_out(
     ("updated", "expected"),
     [
         (_updated(md5Checksum=_md5(b"something else")), "checksum does not match"),
-        (_updated(size="3"), "size does not match"),
         (_updated(headRevisionId="rev-1"), "head revision did not change"),
         (_updated(version="7"), "version did not advance"),
-        (
-            _updated(md5Checksum=None, modifiedTime="2026-01-01T00:00:00Z"),
-            "modified time is earlier",
-        ),
         (_updated(id="other"), "different file id"),
-        (
-            _updated(md5Checksum=None, size=None),
-            "neither a checksum nor a size",
-        ),
-        (
-            _updated(md5Checksum=None, version=None),
-            "no checksum and no version",
-        ),
+        # The checksum is the evidence; size and version do not replace it.
+        (_updated(md5Checksum=None), "returned no checksum to check"),
     ],
 )
 def test_unverified_update_is_not_reported_as_success(
@@ -1093,14 +1083,6 @@ def test_checksum_confirms_the_update_when_modified_time_moved_back(
     """A client can store a modifiedTime ahead of Google's clock; a content
     update then sets it to the current time, which is earlier."""
     _Drive(monkeypatch, current=_current(modifiedTime="2027-01-01T00:00:00.000Z"))
-
-    result = _call("deck1", _replacement(allowed_dir))
-
-    assert result["status"] == "success"
-
-
-def test_missing_checksum_falls_back_to_size_and_version(monkeypatch, allowed_dir):
-    _Drive(monkeypatch, updated=_updated(md5Checksum=None))
 
     result = _call("deck1", _replacement(allowed_dir))
 
