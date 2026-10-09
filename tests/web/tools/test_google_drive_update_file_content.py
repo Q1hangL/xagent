@@ -1740,36 +1740,48 @@ def test_wire_rejected_update_reads_the_file_again_with_its_resource_key(
         assert request.headers["x-goog-drive-resource-keys"] == "deck1/0-key"
 
 
+_NO_HEAD = {"headRevisionId": None}
+
+
 @pytest.mark.parametrize(
-    ("update_replies", "reread_replies"),
+    ("update_replies", "reread_replies", "without_head"),
     [
         # httplib2 sent the request again on its own after the connection
         # closed with no reply, so neither googleapiclient nor the tool saw
         # the attempt that stored the content; every attempt they saw got 429.
-        ([_RATE_LIMITED] * 3, [_ok(_updated())]),
-        ([_error_reply(400, "badRequest")], [_ok(_updated())]),
+        ([_RATE_LIMITED] * 3, [_ok(_updated())], False),
+        ([_error_reply(400, "badRequest")], [_ok(_updated())], False),
+        # The same, for a file Drive returns no head revision for.
+        ([_RATE_LIMITED] * 3, [_ok(_updated(**_NO_HEAD))], True),
         # Someone else changed the file meanwhile.
         (
             [_error_reply(403, "insufficientFilePermissions")],
             [_ok(_current(md5Checksum=_md5(b"other"), headRevisionId="rev-9"))],
+            False,
         ),
+        # A new revision with the old content, which may sit on top of one
+        # with the new content.
+        ([_RATE_LIMITED] * 3, [_ok(_current(headRevisionId="rev-3"))], False),
         # The file cannot be read again.
-        ([_error_reply(404, "notFound")], [_error_reply(404, "notFound")]),
-        ([_RATE_LIMITED] * 3, [_RATE_LIMITED] * 3),
+        ([_error_reply(404, "notFound")], [_error_reply(404, "notFound")], False),
+        ([_RATE_LIMITED] * 3, [_RATE_LIMITED] * 3, False),
     ],
     ids=[
         "429-after-a-hidden-resend-stored-it",
         "400-after-a-hidden-resend-stored-it",
+        "stored-without-head-revisions",
         "changed-by-someone-else",
+        "new-revision-with-the-old-content",
         "not-found-on-the-re-read",
         "re-read-rate-limited",
     ],
 )
 def test_wire_rejection_the_file_read_again_does_not_settle_is_unknown(
-    monkeypatch, allowed_dir, update_replies, reread_replies
+    monkeypatch, allowed_dir, update_replies, reread_replies, without_head
 ):
     monkeypatch.setattr(googleapiclient.http.time, "sleep", lambda seconds: None)
-    http = _wire_drive(monkeypatch, [_ok(_current()), *update_replies, *reread_replies])
+    current = _current(**_NO_HEAD) if without_head else _current()
+    http = _wire_drive(monkeypatch, [_ok(current), *update_replies, *reread_replies])
 
     result = _call("deck1", _replacement(allowed_dir))
 
@@ -1781,10 +1793,26 @@ def test_wire_rejection_the_file_read_again_does_not_settle_is_unknown(
     assert "did not accept" not in message
     assert "nothing was changed" not in message.lower()
     assert "file" not in result
-    assert result["previous"]["headRevisionId"] == "rev-1"
+    assert result["previous"]["md5Checksum"] == _md5(OLD_CONTENT)
+    assert result["previous"].get("headRevisionId") == current.get("headRevisionId")
     assert [request.method for request in http.requests] == (
         ["GET"] + ["PATCH"] * len(update_replies) + ["GET"] * len(reread_replies)
     )
+
+
+def test_wire_rejection_without_head_revisions_is_checked_by_checksum(
+    monkeypatch, allowed_dir
+):
+    monkeypatch.setattr(googleapiclient.http.time, "sleep", lambda seconds: None)
+    current = _current(**_NO_HEAD)
+    _wire_drive(
+        monkeypatch, [_ok(current), _error_reply(400, "badRequest"), _ok(current)]
+    )
+
+    result = _call("deck1", _replacement(allowed_dir))
+
+    assert "did not accept the new content" in result["message"]
+    assert result["file"]["md5Checksum"] == _md5(OLD_CONTENT)
 
 
 _SESSION = (
