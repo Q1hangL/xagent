@@ -799,6 +799,16 @@ async def test_read_tool_descriptions_say_how_to_read_office_files_and_sheets():
         "A downloaded Excel (.xlsx), Word (.docx) or PDF file can be read with "
         "read_file, and a PowerPoint (.pptx) file with read_pptx" in download
     )
+    # read_file picks its reader by the extension, and a file that is not
+    # exported gets none added, so a bare filename would be read as text.
+    assert (
+        "read_file chooses how to read a file by its extension, so the saved "
+        "name must keep its .xlsx, .docx or .pdf extension (see filename)." in download
+    )
+    assert (
+        "For any other file nothing is appended, so a filename given here must "
+        'keep the file\'s own extension (e.g. "report.xlsx", not "report").' in download
+    )
     content = " ".join(tools["google_drive_get_file_content"].description.split())
     assert (
         "A Google Sheets spreadsheet is exported as CSV by default, which holds "
@@ -3292,6 +3302,31 @@ def test_download_file_appends_extension_to_explicit_filename_missing_one(
 
     assert result["status"] == "success"
     assert result["path"] == str(tmp_path / "output" / "report.pdf")
+
+
+def test_download_file_adds_no_extension_to_a_filename_for_an_uploaded_file(
+    monkeypatch, tmp_path
+):
+    """Only an export gets an extension appended. An uploaded file is saved
+    under the filename as given, which is why the description says to keep
+    the extension that read_file needs."""
+    files = Mock()
+    files.get.return_value.execute.return_value = {
+        "id": "f1",
+        "name": "Budget.xlsx",
+        "mimeType": (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+    }
+    _mock_drive_service_with_files(monkeypatch, files)
+    _patch_downloader(monkeypatch, b"PK-fake-xlsx")
+
+    result = json.loads(
+        google_drive.google_drive_download_file("f1", filename="report")
+    )
+
+    assert result["status"] == "success"
+    assert result["path"] == str(tmp_path / "output" / "report")
 
 
 def test_download_file_does_not_double_extension_on_case_mismatch(

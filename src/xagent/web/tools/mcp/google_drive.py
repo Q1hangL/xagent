@@ -1320,7 +1320,9 @@ def google_drive_download_file(
     directly to another tool that reads local files, e.g. gmail_send_messages's
     'attachments'. A downloaded Excel (.xlsx), Word (.docx) or PDF file can
     be read with read_file, and a PowerPoint (.pptx) file with read_pptx,
-    when those tools are available.
+    when those tools are available. read_file chooses how to read a file by
+    its extension, so the saved name must keep its .xlsx, .docx or .pdf
+    extension (see filename).
 
     mime_type: required when file_id is a Google Workspace document (Docs,
     Sheets, Slides) — the format to export to (e.g. "application/pdf").
@@ -1330,7 +1332,9 @@ def google_drive_download_file(
     file's own name. Either way, if exporting a Workspace document the
     mime_type's extension is appended when not already present (so a bare
     filename="report" for an "application/pdf" export still ends up
-    "report.pdf").
+    "report.pdf"). For any other file nothing is appended, so a filename
+    given here must keep the file's own extension (e.g. "report.xlsx", not
+    "report").
     """
     try:
         resolved_file_id = _resolve_file_id(file_id)
