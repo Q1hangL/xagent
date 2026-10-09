@@ -800,14 +800,21 @@ async def test_read_tool_descriptions_say_how_to_read_office_files_and_sheets():
         "read_file, and a PowerPoint (.pptx) file with read_pptx" in download
     )
     # read_file picks its reader by the extension, and a file that is not
-    # exported gets none added, so a bare filename would be read as text.
+    # exported gets none added, so a bare filename, or a Drive name without
+    # an extension, would be read as text.
     assert (
         "read_file chooses how to read a file by its extension, so the saved "
-        "name must keep its .xlsx, .docx or .pdf extension (see filename)." in download
+        "name must end in .xlsx, .docx or .pdf. If the returned path has no "
+        "such extension (an uploaded file whose Drive name has none), download "
+        "the file again with a filename that adds the extension of its "
+        "returned mimeType (see filename)." in download
     )
     assert (
-        "For any other file nothing is appended, so a filename given here must "
-        'keep the file\'s own extension (e.g. "report.xlsx", not "report").' in download
+        "For any other file nothing is appended: the file is saved under the "
+        "filename, or its Drive name, as it is. So a filename given here must "
+        'keep the file\'s own extension (e.g. "report.xlsx", not "report"), and '
+        "a file whose Drive name has no extension needs a filename that adds "
+        "one." in download
     )
     content = " ".join(tools["google_drive_get_file_content"].description.split())
     assert (
@@ -3304,16 +3311,23 @@ def test_download_file_appends_extension_to_explicit_filename_missing_one(
     assert result["path"] == str(tmp_path / "output" / "report.pdf")
 
 
-def test_download_file_adds_no_extension_to_a_filename_for_an_uploaded_file(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize(
+    ("drive_name", "filename", "saved_name"),
+    [
+        pytest.param("Budget.xlsx", "report", "report", id="filename"),
+        pytest.param("Q3 Budget", "", "Q3 Budget", id="drive-name"),
+    ],
+)
+def test_download_file_adds_no_extension_to_an_uploaded_file(
+    monkeypatch, tmp_path, drive_name, filename, saved_name
 ):
     """Only an export gets an extension appended. An uploaded file is saved
-    under the filename as given, which is why the description says to keep
-    the extension that read_file needs."""
+    under the filename, or its Drive name, as it is, which is why the
+    description says how to keep the extension that read_file needs."""
     files = Mock()
     files.get.return_value.execute.return_value = {
         "id": "f1",
-        "name": "Budget.xlsx",
+        "name": drive_name,
         "mimeType": (
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         ),
@@ -3322,11 +3336,11 @@ def test_download_file_adds_no_extension_to_a_filename_for_an_uploaded_file(
     _patch_downloader(monkeypatch, b"PK-fake-xlsx")
 
     result = json.loads(
-        google_drive.google_drive_download_file("f1", filename="report")
+        google_drive.google_drive_download_file("f1", filename=filename)
     )
 
     assert result["status"] == "success"
-    assert result["path"] == str(tmp_path / "output" / "report")
+    assert result["path"] == str(tmp_path / "output" / saved_name)
 
 
 def test_download_file_does_not_double_extension_on_case_mismatch(
