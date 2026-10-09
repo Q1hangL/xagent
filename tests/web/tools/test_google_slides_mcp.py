@@ -3158,6 +3158,62 @@ def test_tools_give_their_own_next_steps_for_a_drive_file_link(
     get_service.assert_not_called()
 
 
+# A 400 whose message names a cause is about the request, so it keeps the
+# raw error for an id taken from a Drive open?id= or uc?id= link too.
+@pytest.mark.parametrize(
+    "link",
+    [
+        "https://drive.google.com/open?id=pres1",
+        "https://drive.google.com/uc?export=download&id=pres1",
+    ],
+)
+@pytest.mark.parametrize(
+    "error_body",
+    [
+        pytest.param(
+            {
+                "error": {
+                    "code": 400,
+                    "message": "Precondition check failed.",
+                    "status": "FAILED_PRECONDITION",
+                }
+            },
+            id="failed-precondition",
+        ),
+        pytest.param(
+            {
+                "error": {
+                    "code": 400,
+                    "message": (
+                        "Invalid requests[0].deleteObject: The object (shape1) "
+                        "could not be found."
+                    ),
+                    "status": "INVALID_ARGUMENT",
+                }
+            },
+            id="request-field",
+        ),
+    ],
+)
+def test_batch_update_keeps_the_raw_error_for_a_400_with_a_cause_for_a_drive_open_or_uc_link(
+    monkeypatch, link, error_body
+):
+    presentations = Mock()
+    error = _http_error(400, error_body)
+    presentations.batchUpdate.return_value.execute.side_effect = error
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_batch_update(
+            link, '[{"deleteObject": {"objectId": "shape1"}}]'
+        )
+    )
+
+    assert result["status"] == "error"
+    assert presentations.batchUpdate.call_args.kwargs["presentationId"] == "pres1"
+    assert result["message"] == str(error)
+
+
 # A Drive open?id= or uc?id= link can name a native presentation or an
 # uploaded file, so its id goes to the API. The Slides API answers the id of
 # an uploaded file (an Excel file, at least) with a 400 that does not name

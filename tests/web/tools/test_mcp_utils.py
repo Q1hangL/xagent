@@ -2890,10 +2890,152 @@ def test_google_file_error_message_adds_next_steps_to_a_400_for_a_drive_open_lin
     assert (
         "this creates a new document: the change will be made in that copy" in message
     ) is editing
+    # Such a link does not show which product the file belongs to.
     assert message.endswith(
-        "If the file is a Google Docs document (google_drive_search or the "
-        "file's mimeType shows its type), the error is about the request itself."
+        "If google_drive_search or the file's mimeType shows that it is a "
+        "Google Sheets or Google Slides file instead, open it with the matching "
+        "tools. If it is a Google Docs document, the error is about the request "
+        "itself."
     )
+
+
+@pytest.mark.parametrize(
+    "error_message",
+    [
+        "request contains an invalid argument",
+        "  Request contains an invalid argument.  ",
+    ],
+)
+def test_google_file_error_message_for_a_drive_open_link_matches_the_message_loosely(
+    error_message,
+):
+    error = _google_http_error(
+        400,
+        json.dumps(
+            {
+                "error": {
+                    "code": 400,
+                    "message": error_message,
+                    "status": "INVALID_ARGUMENT",
+                }
+            }
+        ).encode("utf-8"),
+    )
+
+    message = utils.google_file_error_message(
+        error,
+        _TEST_FILE_KIND,
+        file_link_or_id="https://drive.google.com/open?id=abc123",
+    )
+
+    assert "The document id was taken from a Google Drive link" in message
+
+
+def test_google_file_error_message_for_a_drive_open_link_keeps_the_reasons():
+    error = _google_http_error(
+        400,
+        json.dumps(
+            {
+                "error": {
+                    **_INVALID_ARGUMENT_400["error"],
+                    "errors": [
+                        {
+                            "message": "Request contains an invalid argument.",
+                            "domain": "global",
+                            "reason": "badRequest",
+                        }
+                    ],
+                }
+            }
+        ).encode("utf-8"),
+    )
+
+    message = utils.google_file_error_message(
+        error,
+        _TEST_FILE_KIND,
+        file_link_or_id="https://drive.google.com/open?id=abc123",
+    )
+
+    assert message.startswith(
+        "Google Docs rejected this request (Google API response: HTTP 400 "
+        "Request contains an invalid argument. (reason: badRequest)). The "
+        "document id was taken from a Google Drive link"
+    )
+
+
+# A 400 whose message names a cause is about the request, even for an id
+# taken from a Drive open?id= or uc?id= link, so it keeps the raw error, as
+# it does for a bare id.
+@pytest.mark.parametrize(
+    "link",
+    [
+        "https://drive.google.com/open?id=abc123",
+        "https://drive.google.com/uc?export=download&id=abc123",
+    ],
+)
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(
+            json.dumps(
+                {
+                    "error": {
+                        "code": 400,
+                        "message": "Unable to parse range: Q3 Budget!A1:B2",
+                        "status": "INVALID_ARGUMENT",
+                    }
+                }
+            ).encode("utf-8"),
+            id="range",
+        ),
+        pytest.param(
+            json.dumps(
+                {
+                    "error": {
+                        "code": 400,
+                        "message": (
+                            "Invalid requests[0].insertText: The insertion index "
+                            "must be inside the bounds of an existing paragraph."
+                        ),
+                        "status": "INVALID_ARGUMENT",
+                    }
+                }
+            ).encode("utf-8"),
+            id="request-field",
+        ),
+        pytest.param(
+            json.dumps(
+                {
+                    "error": {
+                        "code": 400,
+                        "message": "Precondition check failed.",
+                        "status": "FAILED_PRECONDITION",
+                        "errors": [{"reason": "failedPrecondition"}],
+                    }
+                }
+            ).encode("utf-8"),
+            id="failed-precondition",
+        ),
+        pytest.param(
+            json.dumps({"error": {"code": 400, "status": "INVALID_ARGUMENT"}}).encode(
+                "utf-8"
+            ),
+            id="no-message",
+        ),
+        pytest.param(
+            b"<html><title>Error 400 (Bad Request)!!1</title></html>", id="html-body"
+        ),
+    ],
+)
+@pytest.mark.parametrize("editing", [False, True])
+def test_google_file_error_message_for_a_drive_open_link_keeps_raw_400_with_a_cause(
+    link, content, editing
+):
+    error = _google_http_error(400, content)
+
+    assert utils.google_file_error_message(
+        error, _TEST_FILE_KIND, editing=editing, file_link_or_id=link
+    ) == str(error)
 
 
 @pytest.mark.parametrize(

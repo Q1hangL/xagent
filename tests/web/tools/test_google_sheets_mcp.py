@@ -773,7 +773,17 @@ def test_editing_tools_explain_an_excel_file_stored_in_drive(
     assert "google_drive_download_file" not in message
 
 
-def test_read_range_keeps_raw_error_for_other_400(monkeypatch):
+# A 400 that names its cause is about the request, also for an id taken
+# from a Drive open?id= or uc?id= link.
+@pytest.mark.parametrize(
+    "spreadsheet_id",
+    [
+        "sid",
+        "https://drive.google.com/open?id=sid",
+        "https://drive.google.com/uc?export=download&id=sid",
+    ],
+)
+def test_read_range_keeps_raw_error_for_other_400(monkeypatch, spreadsheet_id):
     spreadsheets = Mock()
     error = _http_error(
         400,
@@ -788,8 +798,12 @@ def test_read_range_keeps_raw_error_for_other_400(monkeypatch):
     spreadsheets.values.return_value.get.return_value.execute.side_effect = error
     _mock_sheets_service(monkeypatch, spreadsheets)
 
-    result = json.loads(google_sheets.google_sheets_read_range("sid", "Sheet9!A1"))
+    result = json.loads(
+        google_sheets.google_sheets_read_range(spreadsheet_id, "Sheet9!A1")
+    )
 
+    get = spreadsheets.values.return_value.get
+    assert get.call_args.kwargs["spreadsheetId"] == "sid"
     assert result["message"] == str(error)
 
 

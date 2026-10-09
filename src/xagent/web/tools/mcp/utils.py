@@ -1990,12 +1990,17 @@ _DRIVE_FILE_LINK_RE = re.compile(
 # with a 400, but only the Sheets API's answer for an Excel file names the
 # cause: the Docs and Slides APIs answer the id of an Excel file with a bare
 # INVALID_ARGUMENT "Request contains an invalid argument." So
-# google_file_error_message adds the next steps for an uploaded file to any
-# other 400 for an id taken from such a link.
+# google_file_error_message adds the next steps for an uploaded file to that
+# bare 400 for an id taken from such a link. A 400 whose message names a
+# cause (a range, a request field, a failed precondition) is about the
+# request, so it keeps the raw error, as it does for a bare id.
 _DRIVE_ID_QUERY_LINK_RE = re.compile(
     r"drive\.google\.com/(?:u/\d+/)?(?:open|uc)\?(?:[^#]*&)?id=([a-zA-Z0-9_-]+)",
     re.IGNORECASE,
 )
+
+# Google's generic INVALID_ARGUMENT message, which names no cause.
+_NO_CAUSE_400_MESSAGE = "request contains an invalid argument"
 
 # The Sheets API answers a request for an Excel file stored in Drive (which
 # Google Sheets opens in Office compatibility mode) with a 400 "This
@@ -2096,24 +2101,36 @@ def _is_drive_id_query_link(value: str | None) -> bool:
     )
 
 
+def _is_no_cause_400(exc: BaseException) -> bool:
+    if google_api_error_status(exc) != 400:
+        return False
+    message = _google_api_error_body(exc).get("message")
+    return (
+        isinstance(message, str)
+        and message.strip().rstrip(".").lower() == _NO_CAUSE_400_MESSAGE
+    )
+
+
 def _drive_id_query_link_400_message(
     exc: BaseException, kind: GoogleFileKind, *, editing: bool
 ) -> str:
-    # Google's response comes first: the 400 may be about the request itself
-    # (for example a batch update built by the caller), and nothing here
-    # knows which file the link names. The next steps are those of a Drive
-    # file link (see resolve_google_file_id).
+    # Google's response comes first: even a 400 that names no cause may be
+    # about the request itself (for example a batch update built by the
+    # caller), and nothing here knows which file the link names. The next
+    # steps are those of a Drive file link (see resolve_google_file_id). A
+    # link of this form does not show which product the file belongs to, so
+    # the way out for another kind of Google file is named too.
     return (
         f"{kind.product} rejected this request (Google API response: "
         f"{google_api_error_summary(exc, with_reasons=True)}). The {kind.noun} "
         "id was taken from a Google Drive link, which can name a file "
         "uploaded to Drive, such as an Office or PDF file, as well as a "
         f"{kind.product} {kind.noun}. The {kind.product} tools cannot open an "
-        f"uploaded file, and the {kind.product} API can answer its id with an "
-        f"HTTP 400 like this one. {_office_file_next_steps(kind, editing=editing)}"
-        f". If the file is a {kind.product} {kind.noun} (google_drive_search "
-        "or the file's mimeType shows its type), the error is about the "
-        "request itself."
+        f"uploaded file, and the {kind.product} API can answer its id with "
+        "this HTTP 400, which does not name the cause. "
+        f"{_office_file_next_steps(kind, editing=editing)}. "
+        f"{_other_google_file_hint(kind)}. If it is a {kind.product} "
+        f"{kind.noun}, the error is about the request itself."
     )
 
 
@@ -2142,9 +2159,9 @@ def resolve_google_file_id(
     decoded once before giving up. A Drive ".../open?id=<id>" or
     ".../uc?id=<id>" link resolves to its id, because it can name a native
     file too; pass the same value to ``google_file_error_message`` as
-    ``file_link_or_id``, so that a 400 for an uploaded file still gets next
-    steps. A link to another kind of Google file, or to a file uploaded to
-    Drive, is named as such.
+    ``file_link_or_id``, so that the 400 that names no cause, which the API
+    can give for an uploaded file, still gets next steps. A link to another
+    kind of Google file, or to a file uploaded to Drive, is named as such.
 
     Pass ``editing=True`` from a tool that changes the file, as for
     ``google_file_error_message``: the next steps for a file uploaded to
@@ -2283,10 +2300,11 @@ def google_file_error_message(
 
     Pass ``file_link_or_id``, the value the caller gave before
     ``resolve_google_file_id``. When it is a Drive ".../open?id=<id>" or
-    ".../uc?id=<id>" link, which can name a file uploaded to Drive, any other
-    HTTP 400 keeps Google's response and gets the next steps for an
-    uploaded file, since the Docs and Slides APIs answer such an id with a
-    400 that does not name the cause.
+    ".../uc?id=<id>" link, which can name a file uploaded to Drive, an HTTP
+    400 whose message names no cause ("Request contains an invalid
+    argument.") keeps Google's response and gets the next steps for an
+    uploaded file, since the Docs and Slides APIs answer such an id with
+    that 400. Any other 400 keeps the raw error.
     """
     if is_google_office_file_error(exc):
         # The product's editor does open such a file, in Office compatibility
@@ -2301,7 +2319,7 @@ def google_file_error_message(
             f"{_other_google_file_hint(kind)}. Google API response: "
             f"{google_api_error_summary(exc, with_reasons=True)}"
         )
-    if google_api_error_status(exc) == 400 and _is_drive_id_query_link(file_link_or_id):
+    if _is_no_cause_400(exc) and _is_drive_id_query_link(file_link_or_id):
         return _drive_id_query_link_400_message(exc, kind, editing=editing)
     if not is_google_file_access_error(exc):
         return str(exc)
