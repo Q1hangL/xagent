@@ -862,6 +862,52 @@ def test_replacement_of_another_type_is_still_refused(
     drive.assert_nothing_written()
 
 
+@pytest.mark.parametrize(
+    ("drive_name", "mime_type", "local_name", "drive_kind"),
+    [
+        # google_drive_upload_file stores "report.csv.gz" as text/csv.
+        ("report.csv.gz", "text/csv", "report.csv", "a .gz file"),
+        ("backup.tgz", "application/x-gzip", "backup.tar", "a .tgz file"),
+        ("logo.svgz", "image/svg+xml", "logo.svg", "a .svgz file"),
+        ("logs.gz", "application/octet-stream", "logs.txt", "a .gz file"),
+        ("dump.xz", "application/octet-stream", "dump.sql", "a .xz file"),
+        ("backup.tar", "application/x-tar", "backup.tgz", "a .tar file"),
+        ("report.csv", "text/csv", "report.csv.gz", "a .csv file"),
+    ],
+)
+def test_compressed_and_plain_files_are_different_types(
+    monkeypatch, allowed_dir, drive_name, mime_type, local_name, drive_kind
+):
+    drive = _typed_drive(monkeypatch, drive_name, mime_type)
+
+    result = _call("deck1", _replacement(allowed_dir, name=local_name))
+
+    assert result["status"] == "error"
+    assert f"'{drive_name}' in Google Drive is {drive_kind}" in result["message"]
+    assert "Nothing was changed in Google Drive" in result["message"]
+    drive.assert_nothing_written()
+
+
+@pytest.mark.parametrize(
+    ("drive_name", "mime_type", "local_name"),
+    [
+        # Extensions missing from Python's table, stored under their own type.
+        ("Keynote.key", "application/x-iwork-keynote-sffkey", "Keynote.key"),
+        ("Site Plan.dwg", "image/vnd.dwg", "site plan v2.DWG"),
+        ("logs.gz", "application/gzip", "logs.gz"),
+    ],
+)
+def test_same_extension_is_accepted_whatever_the_stored_type(
+    monkeypatch, allowed_dir, drive_name, mime_type, local_name
+):
+    drive = _typed_drive(monkeypatch, drive_name, mime_type)
+
+    result = _call("deck1", _replacement(allowed_dir, name=local_name))
+
+    assert result["status"] == "success", result
+    assert drive.uploaded == [NEW_CONTENT]
+
+
 def test_extension_types_come_from_python_not_the_host(monkeypatch):
     # mimetypes.guess_type also reads the host's mime.types files, which
     # differ between machines; the check must not depend on them.
@@ -872,9 +918,11 @@ def test_extension_types_come_from_python_not_the_host(monkeypatch):
     )
 
     assert google_drive._extension_type(".smith") is None
-    assert google_drive._extension_type(".jpeg") == "image/jpeg"
-    assert google_drive._extension_type(".jpg") == "image/jpeg"
-    assert google_drive._extension_type(".pptx") == DECK_MIME
+    assert google_drive._extension_type(".jpeg") == ("image/jpeg", None)
+    assert google_drive._extension_type(".jpg") == ("image/jpeg", None)
+    assert google_drive._extension_type(".pptx") == (DECK_MIME, None)
+    assert google_drive._extension_type(".svgz") == ("image/svg+xml", "gzip")
+    assert google_drive._extension_type(".gz") == (None, "gzip")
 
 
 @pytest.mark.parametrize(

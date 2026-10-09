@@ -1718,11 +1718,21 @@ def _builtin_mime_types() -> mimetypes.MimeTypes:
     return mimetypes.MimeTypes()
 
 
-def _extension_type(extension: str) -> str | None:
-    """The MIME type a lowercase extension such as ".jpeg" names, if known."""
+def _extension_type(extension: str) -> tuple[str | None, str | None] | None:
+    """The MIME type and compression a lowercase extension such as ".jpeg"
+    or ".tgz" names, or ``None`` when it names neither.
+
+    The compression is part of the type: ".svgz" is not an ".svg" file and
+    ".gz" is not the file it compresses.
+    """
     if extension in _EXTRA_EXTENSION_TYPES:
-        return _EXTRA_EXTENSION_TYPES[extension]
-    return _builtin_mime_types().guess_type(f"file{extension}", strict=False)[0]
+        return _EXTRA_EXTENSION_TYPES[extension], None
+    mime_type, encoding = _builtin_mime_types().guess_type(
+        f"file{extension}", strict=False
+    )
+    if mime_type is None and encoding is None:
+        return None
+    return mime_type, encoding
 
 
 def _content_extension_mismatch(
@@ -1731,8 +1741,9 @@ def _content_extension_mismatch(
     """When the replacement looks like another type of file than the one in
     Drive, its extension and what the Drive file is; otherwise ``None``.
 
-    Two spellings of one type (.jpeg and .jpg) match. A dotted part of the
-    Drive name is not taken as its type when the replacement's extension
+    Two spellings of one type (.jpeg and .jpg) match; a compressed and a
+    plain file (.csv.gz and .csv, .svgz and .svg) do not. A dotted part of
+    the Drive name is not taken as its type when the replacement's extension
     names the type stored in Drive ("John.Smith" stored as a PDF, replaced
     with "John.Smith.pdf"), or when neither that part nor the stored type
     says what the file is.
@@ -1747,9 +1758,17 @@ def _content_extension_mismatch(
     local_type = _extension_type(local_extension)
     # A stored octet-stream type says nothing about the file.
     known_stored_type = stored_mime_type not in ("", _OCTET_STREAM)
+    # A compressed file may be stored under the type of what it compresses
+    # (google_drive_upload_file stores "report.csv.gz" as text/csv), so the
+    # stored type does not stand in for a compression extension.
+    drive_compressed = drive_type is not None and drive_type[1] is not None
     if local_type is not None and (
         local_type == drive_type
-        or (known_stored_type and local_type == stored_mime_type)
+        or (
+            known_stored_type
+            and not drive_compressed
+            and local_type == (stored_mime_type, None)
+        )
     ):
         return None
     if drive_type is not None:
