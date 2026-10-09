@@ -1762,8 +1762,9 @@ _NO_HEAD = {"headRevisionId": None}
         # A new revision with the old content, which may sit on top of one
         # with the new content.
         ([_RATE_LIMITED] * 3, [_ok(_current(headRevisionId="rev-3"))], False),
-        # The file cannot be read again.
-        ([_error_reply(404, "notFound")], [_error_reply(404, "notFound")], False),
+        # The file cannot be read again. A file that is gone or out of
+        # reach on the re-read is covered by
+        # test_wire_rejection_with_the_file_out_of_reach_on_the_re_read.
         ([_RATE_LIMITED] * 3, [_RATE_LIMITED] * 3, False),
     ],
     ids=[
@@ -1772,7 +1773,6 @@ _NO_HEAD = {"headRevisionId": None}
         "stored-without-head-revisions",
         "changed-by-someone-else",
         "new-revision-with-the-old-content",
-        "not-found-on-the-re-read",
         "re-read-rate-limited",
     ],
 )
@@ -1797,6 +1797,82 @@ def test_wire_rejection_the_file_read_again_does_not_settle_is_unknown(
     assert result["previous"].get("headRevisionId") == current.get("headRevisionId")
     assert [request.method for request in http.requests] == (
         ["GET"] + ["PATCH"] * len(update_replies) + ["GET"] * len(reread_replies)
+    )
+
+
+_PER_FILE_ACCESS = "per-file Drive access"
+_NO_LONGER_READABLE = "refused to let the connected Google account read"
+
+
+@pytest.mark.parametrize(
+    ("update_replies", "reread_reply", "expected"),
+    [
+        (
+            [_error_reply(404, "notFound")],
+            _error_reply(404, "notFound"),
+            _PER_FILE_ACCESS,
+        ),
+        (
+            [_error_reply(400, "badRequest")],
+            _error_reply(404, "notFound"),
+            _PER_FILE_ACCESS,
+        ),
+        (
+            [_error_reply(403, "appNotAuthorizedToFile")],
+            _error_reply(403, "appNotAuthorizedToFile"),
+            _PER_FILE_ACCESS,
+        ),
+        (
+            [_RATE_LIMITED] * 3,
+            _error_reply(403, "appNotAuthorizedToFile"),
+            _PER_FILE_ACCESS,
+        ),
+        (
+            [_error_reply(403, "insufficientFilePermissions")],
+            _error_reply(403, "insufficientFilePermissions"),
+            _NO_LONGER_READABLE,
+        ),
+    ],
+    ids=[
+        "404-then-not-found",
+        "400-then-not-found",
+        "app-not-authorized-then-app-not-authorized",
+        "429-then-app-not-authorized",
+        "permission-403-then-permission-403",
+    ],
+)
+def test_wire_rejection_with_the_file_out_of_reach_on_the_re_read(
+    monkeypatch, allowed_dir, update_replies, reread_reply, expected
+):
+    """The file was deleted, or this connection lost access to it, after
+    the pre-read, so reading it again cannot show whether it changed. The
+    result gives the guidance for a file out of reach, without claiming
+    that nothing changed or sending the user to a version history they
+    cannot open."""
+    monkeypatch.setattr(googleapiclient.http.time, "sleep", lambda seconds: None)
+    http = _wire_drive(monkeypatch, [_ok(_current()), *update_replies, reread_reply])
+
+    result = _call("deck1", _replacement(allowed_dir))
+
+    message = result["message"]
+    assert result["status"] == "error"
+    assert expected in message
+    assert "not known whether 'Quarterly Deck.pptx' changed" in message
+    assert "Do not report it as updated or as unchanged" in message
+    assert "google_drive_upload_file" in message
+    reread_status = reread_reply[0]["status"]
+    update_status = update_replies[-1][0]["status"]
+    assert f"HTTP {reread_status} " in message
+    to_update = "Google API response to the update"
+    assert f"(when reading it again). {to_update}: HTTP {update_status} " in message
+    assert "nothing was changed" not in message.lower()
+    assert "check the file's version history" not in message
+    assert "did not accept" not in message
+    assert "www.googleapis.com" not in message
+    assert "file" not in result
+    assert result["previous"]["headRevisionId"] == "rev-1"
+    assert [request.method for request in http.requests] == (
+        ["GET"] + ["PATCH"] * len(update_replies) + ["GET"]
     )
 
 

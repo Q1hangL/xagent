@@ -1899,15 +1899,21 @@ def _hash_replacement_file(
     )
 
 
-def _unavailable_content_update_message(exc: Exception) -> str:
+def _unavailable_content_update_message(exc: Exception, lead: str | None = None) -> str:
+    """Guidance for a file this connection cannot open. ``lead`` replaces
+    the first sentence, which says that nothing was changed."""
+    if lead is None:
+        lead = (
+            "Google Drive could not open file_id: the file does not exist, or "
+            "this Drive connection cannot access it, so nothing was changed."
+        )
     # Not _OPEN_BY_LINK_HINT: opening the file with the Docs, Sheets or Slides
     # tools does not help for a stored .pptx, .xlsx or PDF.
     return (
-        "Google Drive could not open file_id: the file does not exist, or this "
-        "Drive connection cannot access it, so nothing was changed. If this "
-        "connection uses per-file Drive access, it can only change files "
-        "created through this app or explicitly granted to it, so a file the "
-        "user uploaded to Google Drive themselves may not be reachable here. "
+        f"{lead} If this connection uses per-file Drive access, it can only "
+        "change files created through this app or explicitly granted to it, "
+        "so a file the user uploaded to Google Drive themselves may not be "
+        "reachable here. "
         "Options to offer the user: (1) if Google Drive's file picker is "
         "available for this connection, select the file there and ask again; "
         "(2) replace the file themselves in Google Drive (Manage versions > "
@@ -1920,13 +1926,20 @@ def _unavailable_content_update_message(exc: Exception) -> str:
     )
 
 
-def _content_permission_message(name: str, exc: Exception | None = None) -> str:
+def _content_permission_message(
+    name: str, exc: Exception | None = None, lead: str | None = None
+) -> str:
+    """Guidance for a file the connected account may not change. ``lead``
+    replaces the first sentence, which says that nothing was changed."""
+    if lead is None:
+        lead = (
+            "The connected Google account cannot change the content of "
+            f"'{name}' (for example, it has only view or comment access, or "
+            "the file is locked), so nothing was changed."
+        )
     message = (
-        f"The connected Google account cannot change the content of '{name}' "
-        "(for example, it has only view or comment access, or the file is "
-        "locked), so nothing was changed. Ask the user to replace it in Google "
-        "Drive or to ask the file's owner, or "
-        f"{_UPLOAD_AS_NEW_FILE_OFFER}."
+        f"{lead} Ask the user to replace it in Google Drive or to ask the "
+        f"file's owner, or {_UPLOAD_AS_NEW_FILE_OFFER}."
     )
     if exc is not None:
         message += (
@@ -2005,10 +2018,13 @@ def _is_content_rejection(exc: Exception) -> bool:
 
 def _reread_unchanged_file(
     service: Any, file_id: str, resource_key: str | None, previous: dict[str, Any]
-) -> dict[str, Any] | None:
-    """The file as Drive returns it now, when it still has the content read
-    before the update (the same checksum and head revision); ``None`` when
-    it does not, or when it cannot be read."""
+) -> tuple[dict[str, Any] | None, Exception | None]:
+    """Read the file again after a rejected update.
+
+    The first item is the file as Drive returns it now, when it still has
+    the content read before the update (the same checksum and head
+    revision), and ``None`` otherwise. The second is the error when the
+    file cannot be read, and ``None`` otherwise."""
     request = service.files().get(
         fileId=file_id,
         supportsAllDrives=True,
@@ -2021,9 +2037,9 @@ def _reread_unchanged_file(
         logger.warning(
             "Could not read file %s again after the update: %s", file_id, exc
         )
-        return None
+        return None, exc
     if not isinstance(now, dict):
-        return None
+        return None, None
     old_md5 = previous.get("md5Checksum")
     new_md5 = now.get("md5Checksum")
     if not (
@@ -2032,10 +2048,10 @@ def _reread_unchanged_file(
         and isinstance(new_md5, str)
         and new_md5.lower() == old_md5.lower()
     ):
-        return None
+        return None, None
     if now.get("headRevisionId") != previous.get("headRevisionId"):
-        return None
-    return now
+        return None, None
+    return now, None
 
 
 def _content_update_request_error(
@@ -2045,6 +2061,7 @@ def _content_update_request_error(
     *,
     earlier_attempt_unclear: bool,
     unchanged_file: dict[str, Any] | None,
+    reread_error: Exception | None = None,
 ) -> str:
     """The error result for a files.update request that raised.
 
@@ -2061,6 +2078,11 @@ def _content_update_request_error(
     settle may come after Drive stored the upload, so that result says the
     outcome is unknown and keeps the pre-read state as "previous" rather
     than as the file's current state.
+
+    When that re-read fails because the file is gone or out of this
+    connection's reach (``reread_error``), the result gives the guidance for
+    such a file instead, without saying whether the file changed or sending
+    the user to a version history they may not be able to open.
     """
     rejected = _is_content_rejection(exc)
     if rejected and unchanged_file is not None:
@@ -2080,6 +2102,38 @@ def _content_update_request_error(
             f"{_content_error_detail(exc)}",
             file=file,
         )
+    if rejected and reread_error is not None:
+        unknown = (
+            f"so it is not known whether '{name}' changed. Do not report it "
+            "as updated or as unchanged."
+        )
+        message: str | None = None
+        if is_google_file_unavailable_error(reread_error):
+            message = _unavailable_content_update_message(
+                reread_error,
+                lead=(
+                    "Google Drive refused the upload, and then could not open "
+                    "file_id to check it: the file no longer exists, or this "
+                    f"Drive connection can no longer access it, {unknown}"
+                ),
+            )
+        elif is_google_file_access_error(reread_error):
+            message = _content_permission_message(
+                name,
+                reread_error,
+                lead=(
+                    "Google Drive refused the upload, and then refused to let "
+                    f"the connected Google account read '{name}' again to "
+                    "check it (for example, the file is no longer shared with "
+                    f"it), {unknown}"
+                ),
+            )
+        if message is not None:
+            return _content_update_error(
+                f"{message} (when reading it again). Google API response to "
+                f"the update: {google_api_error_summary(exc, with_reasons=True)}",
+                previous=current_summary,
+            )
     if not rejected:
         what = "The upload to Google Drive did not finish normally"
     elif earlier_attempt_unclear:
@@ -2531,9 +2585,9 @@ def google_drive_update_file_content(
                 )
             except Exception as exc:
                 logger.error(f"Error updating file content: {exc}")
-                unchanged_file = None
+                unchanged_file = reread_error = None
                 if _is_content_rejection(exc) and not attempts.unclear:
-                    unchanged_file = _reread_unchanged_file(
+                    unchanged_file, reread_error = _reread_unchanged_file(
                         service, resolved_file_id, resource_key, current
                     )
                 return _content_update_request_error(
@@ -2542,6 +2596,7 @@ def google_drive_update_file_content(
                     current_summary,
                     earlier_attempt_unclear=attempts.unclear,
                     unchanged_file=unchanged_file,
+                    reread_error=reread_error,
                 )
 
         if not isinstance(updated, dict):
