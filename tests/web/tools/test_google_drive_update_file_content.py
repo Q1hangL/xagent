@@ -1911,14 +1911,30 @@ def _overwrite_at(offset):
     return change
 
 
+def _truncate_to(size):
+    return lambda fh: fh.truncate(size)
+
+
 @pytest.mark.parametrize(
     ("change", "sent_chunks"),
     [
         (_overwrite_at(0), 0),
         (_overwrite_at(256 * 1024 + 5), 1),
-        (lambda fh: fh.truncate(300 * 1024 - 10), 1),
+        (_truncate_to(300 * 1024 - 10), 1),
+        # Cut on a 64 KiB block boundary, every block still read is intact,
+        # so only the short read shows the change.
+        (_truncate_to(0), 0),
+        (_truncate_to(3 * 64 * 1024), 0),
+        (_truncate_to(256 * 1024), 1),
     ],
-    ids=["first-chunk-changed", "last-chunk-changed", "truncated"],
+    ids=[
+        "first-chunk-changed",
+        "last-chunk-changed",
+        "truncated",
+        "emptied",
+        "truncated-on-a-block-boundary",
+        "truncated-at-the-chunk-boundary",
+    ],
 )
 def test_wire_resumable_upload_stops_when_the_file_changes_after_hashing(
     monkeypatch, allowed_dir, change, sent_chunks
@@ -1954,6 +1970,10 @@ def test_wire_resumable_upload_stops_when_the_file_changes_after_hashing(
     assert methods == ["GET", "PATCH"] + ["PUT"] * sent_chunks
     for request in http.requests[2:]:
         assert request.body == data[: len(request.body)]
+        # No chunk ends the upload at another size than the hashed one.
+        assert request.headers["content-range"] == (
+            f"bytes 0-{len(request.body) - 1}/{len(data)}"
+        )
 
 
 def test_wire_resumable_upload_sends_only_the_hashed_bytes_of_a_grown_file(
