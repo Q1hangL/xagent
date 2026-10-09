@@ -1321,10 +1321,11 @@ def google_drive_download_file(
     'attachments'. A downloaded Excel (.xlsx), Word (.docx) or PDF file can
     be read with read_file, and a PowerPoint (.pptx) file with read_pptx,
     when those tools are available. read_file chooses how to read a file by
-    its extension, so the saved name must end in .xlsx, .docx or .pdf. If
-    the returned path has no such extension (an uploaded file whose Drive
-    name has none), download the file again with a filename that adds the
-    extension of its returned mimeType (see filename).
+    its extension, so the saved name must keep the file's own extension
+    (for example .xlsx, .docx or .pdf). If the returned path has no
+    extension at all (an uploaded file whose Drive name has none), download
+    the file again with a filename that adds the extension of its returned
+    mimeType (see filename).
 
     mime_type: required when file_id is a Google Workspace document (Docs,
     Sheets, Slides) — the format to export to (e.g. "application/pdf").

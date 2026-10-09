@@ -801,14 +801,16 @@ async def test_read_tool_descriptions_say_how_to_read_office_files_and_sheets():
     )
     # read_file picks its reader by the extension, and a file that is not
     # exported gets none added, so a bare filename, or a Drive name without
-    # an extension, would be read as text.
+    # an extension, would be read as text. Only a path with no extension at
+    # all calls for another download: a .pptx, .xls or .png keeps its own.
     assert (
         "read_file chooses how to read a file by its extension, so the saved "
-        "name must end in .xlsx, .docx or .pdf. If the returned path has no "
-        "such extension (an uploaded file whose Drive name has none), download "
-        "the file again with a filename that adds the extension of its "
-        "returned mimeType (see filename)." in download
+        "name must keep the file's own extension (for example .xlsx, .docx or "
+        ".pdf). If the returned path has no extension at all (an uploaded file "
+        "whose Drive name has none), download the file again with a filename "
+        "that adds the extension of its returned mimeType (see filename)." in download
     )
+    assert "must end in" not in download
     assert (
         "For any other file nothing is appended: the file is saved under the "
         "filename, or its Drive name, as it is. So a filename given here must "
