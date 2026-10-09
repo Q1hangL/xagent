@@ -369,30 +369,51 @@ _OFFICE_FILE_400 = {
 }
 
 
+# Every Docs tool that opens an existing document, with the request that gets
+# the 400: an editing tool must pass editing=True to the error message too,
+# not only to the id resolver.
 @pytest.mark.parametrize(
-    ("call", "editing"),
+    ("call", "request_of", "editing"),
     [
         pytest.param(
             lambda: google_docs.google_docs_get_document("doc123"),
+            lambda documents: documents.get,
             False,
             id="get_document",
         ),
         pytest.param(
             lambda: google_docs.google_docs_append_text("doc123", "more"),
+            lambda documents: documents.get,
             True,
             id="append_text",
         ),
+        pytest.param(
+            lambda: google_docs.google_docs_replace_text("doc123", "a", "b"),
+            lambda documents: documents.batchUpdate,
+            True,
+            id="replace_text",
+        ),
+        pytest.param(
+            lambda: google_docs.google_docs_batch_update(
+                "doc123", '[{"insertText": {"location": {"index": 1}, "text": "x"}}]'
+            ),
+            lambda documents: documents.batchUpdate,
+            True,
+            id="batch_update",
+        ),
     ],
 )
-def test_tools_explain_a_word_file_stored_in_drive(monkeypatch, call, editing):
+def test_tools_explain_a_word_file_stored_in_drive(
+    monkeypatch, call, request_of, editing
+):
     service, _ = _mock_docs_service(monkeypatch)
-    service.documents.return_value.get.return_value.execute.side_effect = _http_error(
-        400, _OFFICE_FILE_400
-    )
+    request = request_of(service.documents.return_value)
+    request.return_value.execute.side_effect = _http_error(400, _OFFICE_FILE_400)
 
     result = json.loads(call())
 
     assert result["status"] == "error"
+    assert request.call_args.kwargs["documentId"] == "doc123"
     message = result["message"]
     # Google Docs itself opens the file in Office compatibility mode; only
     # its API cannot.
@@ -406,6 +427,7 @@ def test_tools_explain_a_word_file_stored_in_drive(monkeypatch, call, editing):
     # A tool that changes the file is not sent to read a downloaded copy, and
     # is told that saving as a Google Doc makes a new copy.
     assert ("read the downloaded copy with read_file" in message) is not editing
+    assert ("To make this change with these tools" in message) is editing
     assert (
         "this creates a new document: the change will be made in that copy" in message
     ) is editing
@@ -413,7 +435,6 @@ def test_tools_explain_a_word_file_stored_in_drive(monkeypatch, call, editing):
         "Google API response: HTTP 400 This operation is not supported for this "
         "document"
     )
-    service.documents.return_value.batchUpdate.assert_not_called()
 
 
 @pytest.mark.parametrize(

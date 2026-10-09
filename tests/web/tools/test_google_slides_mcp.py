@@ -2997,25 +2997,65 @@ def test_get_presentation_explains_a_powerpoint_file_stored_in_drive(monkeypatch
     )
 
 
-def test_editing_tool_explains_a_powerpoint_file_stored_in_drive(monkeypatch):
+# Every Slides tool that changes an existing presentation, with the request
+# that gets the 400: each must pass editing=True to the error message too,
+# not only to the id resolver.
+@pytest.mark.parametrize(
+    ("call", "request_of"),
+    [
+        pytest.param(
+            lambda: google_slides.google_slides_add_slide("pres1", title="T", body="B"),
+            lambda presentations: presentations.get,
+            id="add_slide",
+        ),
+        pytest.param(
+            lambda: google_slides.google_slides_update_slide(
+                "pres1", "slide1", title="T"
+            ),
+            lambda presentations: presentations.get,
+            id="update_slide",
+        ),
+        pytest.param(
+            lambda: google_slides.google_slides_delete_slide("pres1", "slide1"),
+            lambda presentations: presentations.get,
+            id="delete_slide",
+        ),
+        pytest.param(
+            lambda: google_slides.google_slides_batch_update(
+                "pres1", '[{"deleteObject": {"objectId": "shape1"}}]'
+            ),
+            lambda presentations: presentations.batchUpdate,
+            id="batch_update",
+        ),
+    ],
+)
+def test_editing_tools_explain_a_powerpoint_file_stored_in_drive(
+    monkeypatch, call, request_of
+):
     presentations = Mock()
-    presentations.batchUpdate.return_value.execute.side_effect = _http_error(
-        400, _OFFICE_FILE_400
-    )
+    request = request_of(presentations)
+    request.return_value.execute.side_effect = _http_error(400, _OFFICE_FILE_400)
     _mock_slides_service(monkeypatch, presentations)
 
-    result = json.loads(google_slides.google_slides_batch_update("pres1", "[]"))
+    result = json.loads(call())
 
+    assert result["status"] == "error"
+    assert request.call_args.kwargs["presentationId"] == "pres1"
     message = result["message"]
     assert message.startswith(
         "The Google Slides tools cannot open this file: it is most likely a "
         "PowerPoint file"
     )
+    assert "To make this change with these tools" in message
     assert (
         "this creates a new presentation: the change will be made in that copy"
         in message
     )
     assert "read_pptx" not in message
+    assert message.endswith(
+        "Google API response: HTTP 400 This operation is not supported for this "
+        "document"
+    )
 
 
 @pytest.mark.parametrize(

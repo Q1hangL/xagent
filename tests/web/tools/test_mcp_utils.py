@@ -2732,7 +2732,8 @@ def test_is_google_office_file_error_needs_a_google_http_error():
 
 
 # Each Office-file 400 body, with the Google API response that the message
-# ends with. The legacy reason is kept there for diagnosis.
+# ends with. A reason, from errors[] or only from details[], is kept there
+# for diagnosis.
 _OFFICE_FILE_400_RESPONSES = [
     pytest.param(
         _OFFICE_FILE_400,
@@ -2751,6 +2752,23 @@ _OFFICE_FILE_400_RESPONSES = [
         "HTTP 400 This operation is not supported for this document "
         "(reason: failedPrecondition)",
         id="legacy-reason",
+    ),
+    pytest.param(
+        {
+            "error": {
+                "code": 400,
+                "message": "This operation is not supported for this document",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                        "reason": "FAILED_PRECONDITION",
+                    }
+                ],
+            }
+        },
+        "HTTP 400 This operation is not supported for this document "
+        "(reason: FAILED_PRECONDITION)",
+        id="details-reason",
     ),
 ]
 
