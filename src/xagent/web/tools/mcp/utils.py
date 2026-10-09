@@ -1975,8 +1975,13 @@ _LINK_PREFIX_RE = re.compile(
 )
 
 # Drive links a file that is not a native Google file, most often an
-# uploaded Office or PDF file, as "drive.google.com/file/d/<id>/view".
-_DRIVE_FILE_LINK_RE = re.compile(r"drive\.google\.com/file/(?:u/\d+/)?d/")
+# uploaded Office or PDF file, as "drive.google.com/file/d/<id>/view" (or,
+# in older links, "docs.google.com/file/d/<id>"), and downloads its content
+# from "drive.usercontent.google.com/download?id=<id>".
+_DRIVE_FILE_LINK_RE = re.compile(
+    r"(?:docs|drive)\.google\.com/file/(?:u/\d+/)?d/"
+    r"|drive\.usercontent\.google\.com/download\?(?:[^#]*&)?id="
+)
 
 # Drive's older share links (".../open?id=<id>", which Google Forms file
 # uploads use, among others) and its download links (".../uc?id=<id>") can

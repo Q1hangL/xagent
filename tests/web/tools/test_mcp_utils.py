@@ -2451,6 +2451,13 @@ _DRIVE_FILE_LINKS = [
     "drive.google.com/file/u/1/d/abc123/view",
     "https://www.google.com/url?q=https%3A%2F%2Fdrive.google.com%2Ffile%2Fd"
     "%2Fabc123%2Fview&sa=D",
+    # An older form of the same link.
+    "https://docs.google.com/file/d/abc123/edit",
+    # Drive's download host for the content of an uploaded file.
+    "https://drive.usercontent.google.com/download?id=abc123&export=download",
+    "https://drive.usercontent.google.com/download?export=download&id=abc123",
+    "https://www.google.com/url?q=https%3A%2F%2Fdrive.usercontent.google.com"
+    "%2Fdownload%3Fid%3Dabc123%26export%3Ddownload&sa=D",
 ]
 
 

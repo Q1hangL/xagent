@@ -859,17 +859,21 @@ def test_tools_explain_an_excel_file_named_by_a_drive_open_or_uc_link(
     assert ("To make this change with these tools" in message) is editing
 
 
+@pytest.mark.parametrize(
+    "link",
+    [
+        "https://drive.google.com/file/d/abc123/view?usp=sharing",
+        "https://docs.google.com/file/d/abc123/edit",
+        "https://drive.usercontent.google.com/download?id=abc123&export=download",
+    ],
+)
 def test_get_spreadsheet_explains_a_drive_file_link_without_calling_the_api(
-    monkeypatch,
+    monkeypatch, link
 ):
     get_service = Mock()
     monkeypatch.setattr(google_sheets, "get_sheets_service", get_service)
 
-    result = json.loads(
-        google_sheets.google_sheets_get_spreadsheet(
-            "https://drive.google.com/file/d/abc123/view?usp=sharing"
-        )
-    )
+    result = json.loads(google_sheets.google_sheets_get_spreadsheet(link))
 
     assert result["status"] == "error"
     message = result["message"]
