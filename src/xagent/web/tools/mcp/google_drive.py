@@ -2215,56 +2215,35 @@ def google_drive_update_file_content(
     expected_head_revision_id: str = "",
 ) -> str:
     """
-    Replace the content of an existing Google Drive file with a local file,
-    keeping the same file: its id, link, sharing and version history stay,
-    and no second file is created. Use this to save an edited .pptx, .xlsx,
-    .docx, .pdf, image or other stored file back to Google Drive. To add a
-    new file, use google_drive_upload_file instead.
+    Replace the content of an existing Google Drive file with a local file.
+    The file keeps its id, link, sharing and version history; no second file
+    is created. Use it to save an edited .pptx, .xlsx, .docx, .pdf, image or
+    other stored file. Google Docs, Sheets and Slides, folders and shortcuts
+    are refused. To add a new file, use google_drive_upload_file.
 
-    file_id: the Google Drive file to overwrite, as a bare Drive id or a
-    Google Drive link. It is never a workspace file id.
-    file_path: the replacement content: an absolute path to a file in the
-    task workspace, or file:<id> for a file registered in this task (for
-    example an edited copy saved in an earlier turn). That file:<id> is not
-    a Drive id; if it cannot be found, do not rebuild the file without
-    asking the user.
-    mime_type: optional; defaults to the file's current type in Google
-    Drive. A type different from the current one is refused, because
-    replacing the content keeps the file's type.
-    expected_head_revision_id: the most recent headRevisionId this task has
-    seen for the file: the file.headRevisionId that
-    google_drive_download_file returned, or, once this tool has saved the
-    file in this task, the file.headRevisionId in that save's result (each
-    save moves it). Pass it whenever the file was downloaded and edited in
-    this task: if the file has changed in Google Drive since then, the call
-    is refused instead of overwriting that change.
+    file_id: the Drive file to overwrite (a Drive id or link), never a
+    workspace file id.
+    file_path: the replacement: an absolute path in the task workspace, or
+    file:<id> for a file registered in this task (not a Drive id). If it
+    cannot be found, do not rebuild the file without asking the user.
+    mime_type: optional; defaults to the file's current type, and a
+    different type is refused.
+    expected_head_revision_id: the latest headRevisionId this task has seen
+    for the file, from google_drive_download_file or, once this tool saved
+    it, from that save's result. Pass it whenever the file was downloaded
+    and edited in this task; the call is refused if the file has changed
+    since then.
 
-    This overwrites the file for everyone who can open it. Confirm with the
-    user before calling: name the Drive file (name and link), say that its
-    content will be replaced, and show or attach the replacement file.
-    Unless you know that the file is not shared, say that everyone with
-    access to it will see the new content: google_drive_download_file
-    returns "shared" and "driveId" (a file in a shared drive is seen by all
-    of that drive's members), and google_drive_list_permissions lists who
-    has access.
-    Google Drive keeps the previous version in the file's version history
-    only for a limited time (about 30 days unless it is kept forever), so do
-    not promise that it can always be restored. If the user's approval may
-    arrive in a later turn, end the confirmation with the Drive file id, the
-    replacement's file:<id> and the headRevisionId to pass as
-    expected_head_revision_id, and call with exactly those.
+    Confirm with the user before calling: name the file (name and link), say
+    that its content will be replaced for everyone with access to it, and
+    attach the replacement. Do not promise that the old version can always
+    be restored. If approval may come in a later turn, end the confirmation
+    with the Drive file id, the replacement's file:<id> and the
+    headRevisionId, and call with exactly those.
 
-    Google Docs, Sheets, Slides and other native Google files, folders and
-    shortcuts are refused; edit those with the Google Docs, Sheets or Slides
-    tools. If this connection uses per-file Drive access (drive.file), it can
-    only change files created through this app or explicitly granted to it.
-
-    The result's "status" is "success" when the new content was uploaded and
-    checked ("file" is the file after the update and "previous" its state
-    before), "unchanged" when Google Drive already has exactly the
-    replacement's content (this call uploaded nothing; the message says
-    what to check before reporting it), or "error", whose message says
-    whether anything changed.
+    "status" is "success" (uploaded and checked), "unchanged" (Drive already
+    had this content; nothing was uploaded) or "error" (the message says
+    whether anything changed).
     """
     update_sent = False
     try:
@@ -2469,7 +2448,9 @@ def google_drive_update_file_content(
 
         message = (
             f"Replaced the content of '{name}' in Google Drive. Its id, link "
-            "and sharing are unchanged."
+            "and sharing are unchanged. Google Drive keeps the previous version "
+            "in the file's version history only for a limited time (about 30 "
+            "days unless it is kept forever)."
         )
         # Drive does not set "shared" for a file in a shared drive, whose
         # members all see it.

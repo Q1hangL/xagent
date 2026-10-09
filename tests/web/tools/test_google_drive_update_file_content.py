@@ -195,6 +195,7 @@ def test_simple_update_replaces_content_in_place(monkeypatch, allowed_dir):
 
     assert result["status"] == "success"
     assert result["changed"] is True
+    assert "only for a limited time (about 30 days" in result["message"]
     assert result["file"]["id"] == "deck1"
     assert result["file"]["md5Checksum"] == _md5(NEW_CONTENT)
     # The model names and links the updated file from these.
@@ -1856,26 +1857,25 @@ async def test_tool_schema_and_annotations():
     assert classify_non_idempotent_write(wire) is False
     description = " ".join(tool.description.split())
     for phrase in (
-        "This overwrites the file for everyone who can open it",
         "Confirm with the user before calling",
-        "say that its content will be replaced",
+        "say that its content will be replaced for everyone with access to it",
+        "attach the replacement",
         # An approval in a later turn needs these to make the approved call.
         "end the confirmation with the Drive file id, the replacement's "
         "file:<id> and the headRevisionId",
-        "Unless you know that the file is not shared, say that everyone with "
-        "access to it will see the new content",
-        'google_drive_download_file returns "shared" and "driveId"',
-        "google_drive_list_permissions",
-        "only for a limited time (about 30 days unless it is kept forever)",
+        "Do not promise that the old version can always be restored",
         "Pass it whenever the file was downloaded and edited in this task",
         # After a save in this task, the download's head revision is stale.
-        "the file.headRevisionId in that save's result (each save moves it)",
-        "the headRevisionId to pass as expected_head_revision_id",
-        "That file:<id> is not a Drive id",
+        "once this tool saved it, from that save's result",
+        "(not a Drive id)",
+        "do not rebuild the file without asking the user",
         "google_drive_upload_file",
         '"unchanged"',
     ):
         assert phrase in description
+    # The description is sent with every tool listing; details belong in the
+    # result messages.
+    assert len(tool.description) < 1800
 
 
 def test_download_returns_revision_metadata(monkeypatch, tmp_path):
