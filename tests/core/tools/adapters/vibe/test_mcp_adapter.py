@@ -480,6 +480,7 @@ def test_build_mcp_tool_adapter_marks_all_tools_safe_when_server_opts_in():
         ("OneDrive", "onedrive_upload_file", "local_file_path"),
         ("SharePoint", "sharepoint_upload_file", "local_file_path"),
         ("Google Drive", "google_drive_upload_file", "file_path"),
+        ("Google Drive", "google_drive_update_file_content", "file_path"),
         ("Slack", "slack_upload_file", "file_path"),
         ("Jira", "jira_add_attachment", "file_path"),
     ],
@@ -557,6 +558,104 @@ async def test_mcp_upload_file_ref_is_staged_and_cleaned_after_connector_call(
     assert captured["arguments"]["remote_path"].endswith(".xlsx")
     assert workspace.discarded == [
         "/task/temp/.xagent-internal/mcp-upload/staged/file.xlsx"
+    ]
+
+
+def test_durable_upload_note_names_the_field_only_for_a_tool_with_its_own_file_id():
+    def adapter_for(tool_name, properties):
+        return _build_mcp_tool_adapter(
+            "Google Drive",
+            {"transport": "stdio", "command": "python", "args": []},
+            SimpleNamespace(
+                name=tool_name,
+                description="Tool.",
+                inputSchema={"type": "object", "properties": properties},
+            ),
+            workspace=object(),
+        )
+
+    upload = adapter_for(
+        "google_drive_upload_file",
+        {"file_path": {"type": "string"}, "name": {"type": "string"}},
+    )
+    update = adapter_for(
+        "google_drive_update_file_content",
+        {"file_id": {"type": "string"}, "file_path": {"type": "string"}},
+    )
+
+    # Existing upload tools keep their description word for word.
+    assert upload.description == (
+        "Tool. A registered file_id (or file:<id>) may be supplied for the "
+        "local upload argument; it will be staged in the current task "
+        "workspace before this connector runs."
+    )
+    assert "may be supplied for file_path;" in update.description
+    assert "The file_id argument is not a workspace file id." in update.description
+    assert "the local upload argument" not in update.description
+
+
+@pytest.mark.asyncio
+async def test_drive_content_update_stages_only_the_replacement_file(monkeypatch):
+    mcp_tool = SimpleNamespace(
+        name="google_drive_update_file_content",
+        description="Replace a Drive file's content",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "file_id": {"type": "string"},
+                "file_path": {"type": "string"},
+            },
+        },
+    )
+
+    class FakeWorkspace:
+        def __init__(self):
+            self.staged = []
+            self.discarded = []
+
+        def stage_file_for_external_upload(self, file_id):
+            self.staged.append(file_id)
+            return "/task/temp/.xagent-internal/mcp-upload/staged/deck.pptx"
+
+        def discard_staged_external_upload(self, path):
+            self.discarded.append(path)
+
+    workspace = FakeWorkspace()
+    adapter = _build_mcp_tool_adapter(
+        "Google Drive",
+        {"transport": "stdio", "command": "python", "args": []},
+        mcp_tool,
+        workspace=workspace,
+    )
+    captured = {}
+
+    class FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            captured["arguments"] = arguments
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def fake_create_session(_connection):
+        yield FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+
+    result = await adapter.run_json_async(
+        {
+            "file_id": "1a2B3c4D5e6F7g8H9i0J",
+            "file_path": "file:31218a9f-1497-4216-9f75-1fc8d51368c4",
+        }
+    )
+
+    assert result["is_error"] is False
+    assert workspace.staged == ["31218a9f-1497-4216-9f75-1fc8d51368c4"]
+    assert captured["arguments"]["file_id"] == "1a2B3c4D5e6F7g8H9i0J"
+    assert captured["arguments"]["file_path"].endswith("/deck.pptx")
+    assert workspace.discarded == [
+        "/task/temp/.xagent-internal/mcp-upload/staged/deck.pptx"
     ]
 
 
@@ -750,6 +849,76 @@ async def test_mcp_upload_missing_file_id_has_public_safe_error(monkeypatch):
         "content": [{"text": "file_id not found or not accessible."}],
         "is_error": True,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "properties", "expected"),
+    [
+        (
+            "google_drive_upload_file",
+            {"file_path": {"type": "string"}, "name": {"type": "string"}},
+            "file_id not found or not accessible.",
+        ),
+        (
+            "google_drive_update_file_content",
+            {"file_id": {"type": "string"}, "file_path": {"type": "string"}},
+            "file_path: the registered workspace file (file:<id>) was not found "
+            "or is not accessible, so the tool was not called and nothing was "
+            "changed. This is about the file passed as file_path, not the "
+            "file_id argument. Check that the file:<id> is the one recorded "
+            "for that file. Do not rebuild the file without asking the user "
+            "again; if it is no longer available, tell the user.",
+        ),
+    ],
+)
+async def test_missing_file_ref_error_names_the_upload_field_only_when_ambiguous(
+    monkeypatch, tool_name, properties, expected
+):
+    """A tool whose own file_id names something else (the Drive file whose
+    content is replaced) must not be told that "file_id" was not found when
+    the replacement file:<id> could not be staged. Since the replacement
+    may have been approved in an earlier turn, it is also told not to
+    rebuild it without asking the user again."""
+    mcp_tool = SimpleNamespace(
+        name=tool_name,
+        description="Drive tool",
+        inputSchema={"type": "object", "properties": properties},
+    )
+
+    class FakeWorkspace:
+        def stage_file_for_external_upload(self, file_id):
+            raise FileNotFoundError(file_id)
+
+    adapter = _build_mcp_tool_adapter(
+        "Google Drive",
+        {"transport": "stdio", "command": "python", "args": []},
+        mcp_tool,
+        workspace=FakeWorkspace(),
+    )
+    calls = []
+
+    class FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            calls.append(name)
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def fake_create_session(_connection):
+        yield FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+    args = {"file_path": "file:31218a9f-1497-4216-9f75-1fc8d51368c4"}
+    if "file_id" in properties:
+        args["file_id"] = "1a2B3c4D5e6F7g8H9i0J"
+
+    result = await adapter.run_json_async(args)
+
+    assert result == {"content": [{"text": expected}], "is_error": True}
+    assert calls == []
 
 
 @pytest.mark.asyncio
