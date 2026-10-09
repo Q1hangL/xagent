@@ -1516,6 +1516,8 @@ _RESUMABLE_CHUNK_BYTES = 16 * 1024 * 1024
 # matching onedrive.py's cap: a replacement this large is much more likely a
 # mistake than an edited document.
 _MAX_CONTENT_UPDATE_BYTES = 2 * 1024 * 1024 * 1024
+# The hash pass reads, and for a resumable upload records a digest of, one
+# block of this size at a time.
 _HASH_BLOCK_BYTES = 1024 * 1024
 # googleapiclient retries only 5xx, 429, rate-limit 403s and connection
 # errors. Replaying a content update cannot change the final bytes; at worst it
@@ -1625,6 +1627,51 @@ class _ChunkBytesUpload(MediaIoBaseUpload):  # type: ignore[no-any-unimported]
 
     def has_stream(self) -> bool:
         return False
+
+
+class _ReplacementChangedError(ValueError):
+    """The replacement file no longer has the bytes that were hashed."""
+
+
+class _VerifiedChunkUpload(_ChunkBytesUpload):
+    """A resumable upload that sends only the bytes that were hashed.
+
+    A file too large to keep in memory is read again, one chunk at a time,
+    after the hash pass. Each chunk is checked block by block against that
+    pass before it is sent, and a difference stops the upload before its
+    last chunk, so Drive never completes it and keeps the file as it was.
+    The size is the hashed size, so bytes added to the file since then are
+    not sent either.
+    """
+
+    def __init__(
+        self, fd: BinaryIO, *, size: int, block_digests: list[bytes], **kwargs: Any
+    ) -> None:
+        super().__init__(fd, **kwargs)
+        self._hashed_size = size
+        self._block_digests = block_digests
+
+    def size(self) -> int:
+        return self._hashed_size
+
+    def getbytes(self, begin: int, length: int) -> bytes:
+        end = min(begin + length, self._hashed_size)
+        if begin >= end:
+            return b""
+        # Read whole blocks, since a digest covers a whole block.
+        first_block = begin // _HASH_BLOCK_BYTES
+        start = first_block * _HASH_BLOCK_BYTES
+        stop = min(-(-end // _HASH_BLOCK_BYTES) * _HASH_BLOCK_BYTES, self._hashed_size)
+        data: bytes = super().getbytes(start, stop - start)
+        if len(data) != stop - start:
+            raise _ReplacementChangedError(_LOCAL_FILE_CHANGED)
+        for index, offset in enumerate(
+            range(0, len(data), _HASH_BLOCK_BYTES), first_block
+        ):
+            block = data[offset : offset + _HASH_BLOCK_BYTES]
+            if _block_digest(block) != self._block_digests[index]:
+                raise _ReplacementChangedError(_LOCAL_FILE_CHANGED)
+        return data[begin - start : end - start]
 
 
 def _content_update_error(message: str, **extra: Any) -> str:
@@ -1752,11 +1799,26 @@ def _validated_expected_head_revision_id(value: str) -> str:
     return stripped
 
 
+def _block_digest(block: bytes) -> bytes:
+    return hashlib.sha256(block).digest()
+
+
+def _read_exactly(fh: BinaryIO, length: int) -> bytes:
+    data = fh.read(length)
+    while len(data) < length:
+        more = fh.read(length - len(data))
+        if not more:
+            raise ValueError(_LOCAL_FILE_CHANGED)
+        data += more
+    return data
+
+
 def _hash_replacement_file(
     fh: BinaryIO, size: int, *, keep_bytes: bool
-) -> tuple[str, bytes | None]:
-    """Return the MD5 of exactly ``size`` bytes of ``fh``, and those bytes
-    when ``keep_bytes`` is set, then rewind ``fh``.
+) -> tuple[str, bytes | None, list[bytes]]:
+    """Return the MD5 of exactly ``size`` bytes of ``fh``, and either those
+    bytes (``keep_bytes``) or a digest of each _HASH_BLOCK_BYTES block for
+    _VerifiedChunkUpload to check the file against, then rewind ``fh``.
 
     A short read, or more data after ``size`` bytes, means the file changed
     since it was opened; the Drive checksum check after the upload could not
@@ -1765,19 +1827,24 @@ def _hash_replacement_file(
     """
     digest = hashlib.md5(usedforsecurity=False)
     kept = bytearray() if keep_bytes else None
+    block_digests: list[bytes] = []
     remaining = size
     while remaining > 0:
-        block = fh.read(min(_HASH_BLOCK_BYTES, remaining))
-        if not block:
-            raise ValueError(_LOCAL_FILE_CHANGED)
+        block = _read_exactly(fh, min(_HASH_BLOCK_BYTES, remaining))
         digest.update(block)
         if kept is not None:
             kept.extend(block)
+        else:
+            block_digests.append(_block_digest(block))
         remaining -= len(block)
     if fh.read(1):
         raise ValueError(_LOCAL_FILE_CHANGED)
     fh.seek(0)
-    return digest.hexdigest(), bytes(kept) if kept is not None else None
+    return (
+        digest.hexdigest(),
+        bytes(kept) if kept is not None else None,
+        block_digests,
+    )
 
 
 def _unavailable_content_update_message(exc: Exception) -> str:
@@ -2247,8 +2314,9 @@ def google_drive_update_file_content(
             try:
                 # A simple upload sends the bytes in one request, so keep the
                 # exact bytes that were hashed; a resumable upload reads the
-                # file one chunk at a time instead of holding it in memory.
-                local_md5, local_bytes = _hash_replacement_file(
+                # file again one chunk at a time instead of holding it in
+                # memory, and checks each chunk against the hash pass.
+                local_md5, local_bytes, block_digests = _hash_replacement_file(
                     fh, local_size, keep_bytes=simple_upload
                 )
             except ValueError as exc:
@@ -2331,12 +2399,21 @@ def google_drive_update_file_content(
             # No body: a metadata body (even an empty one) turns this into a
             # multipart upload. Leaving it out keeps the name, parents and
             # description exactly as they are.
-            media = _ChunkBytesUpload(
-                io.BytesIO(local_bytes) if local_bytes is not None else fh,
-                mimetype=requested_mime_type or stored_mime_type or _OCTET_STREAM,
-                chunksize=_RESUMABLE_CHUNK_BYTES,
-                resumable=not simple_upload,
-            )
+            upload_mime_type = requested_mime_type or stored_mime_type or _OCTET_STREAM
+            media: _ChunkBytesUpload
+            if local_bytes is not None:
+                media = _ChunkBytesUpload(
+                    io.BytesIO(local_bytes), mimetype=upload_mime_type, resumable=False
+                )
+            else:
+                media = _VerifiedChunkUpload(
+                    fh,
+                    size=local_size,
+                    block_digests=block_digests,
+                    mimetype=upload_mime_type,
+                    chunksize=_RESUMABLE_CHUNK_BYTES,
+                    resumable=True,
+                )
             update_request = service.files().update(
                 fileId=resolved_file_id,
                 media_body=media,
@@ -2349,6 +2426,17 @@ def google_drive_update_file_content(
             try:
                 updated = update_request.execute(
                     http=attempts, num_retries=_CONTENT_UPDATE_NUM_RETRIES
+                )
+            except _ReplacementChangedError:
+                # Raised while reading a chunk, before it is sent, and Drive
+                # stores nothing until the last chunk arrives.
+                return _content_update_error(
+                    "The local file changed while it was being uploaded, so "
+                    "the upload was stopped before it completed and Google "
+                    "Drive kept the file as it was. Finish writing the "
+                    "replacement file before calling this tool. "
+                    f"{_NOTHING_CHANGED}",
+                    file=current_summary,
                 )
             except Exception as exc:
                 logger.error(f"Error updating file content: {exc}")

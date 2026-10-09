@@ -1305,15 +1305,25 @@ def test_file_changing_while_read_fails_before_any_request(
     assert "changed while it was being read" in result["message"]
 
 
-def test_hash_reads_exactly_the_stated_size():
+def test_hash_reads_exactly_the_stated_size(monkeypatch):
+    monkeypatch.setattr(google_drive, "_HASH_BLOCK_BYTES", 4)
     data = b"0123456789"
 
-    digest, kept = google_drive._hash_replacement_file(
+    digest, kept, blocks = google_drive._hash_replacement_file(
         io.BytesIO(data), len(data), keep_bytes=True
     )
 
     assert digest == _md5(data)
     assert kept == data
+    assert blocks == []
+    digest, kept, blocks = google_drive._hash_replacement_file(
+        io.BytesIO(data), len(data), keep_bytes=False
+    )
+    assert digest == _md5(data)
+    assert kept is None
+    assert blocks == [
+        hashlib.sha256(part).digest() for part in (b"0123", b"4567", b"89")
+    ]
     for size in (len(data) + 1, len(data) - 1):
         with pytest.raises(ValueError, match="changed while it was being read"):
             google_drive._hash_replacement_file(
@@ -1687,6 +1697,137 @@ def test_wire_resumable_chunk_rejected_after_a_server_error_is_unknown(
     assert result["status"] == "error"
     assert "not known whether" in result["message"]
     assert "file" not in result
+
+
+def _change_after_hashing(monkeypatch, local, change):
+    """Run change(fh) on the replacement once it was hashed, when the tool
+    asks for the Drive service."""
+    service = google_drive.get_drive_service()
+
+    def change_then_connect():
+        with local.open("r+b") as fh:
+            change(fh)
+        return service
+
+    monkeypatch.setattr(google_drive, "get_drive_service", change_then_connect)
+
+
+def _overwrite_at(offset):
+    def change(fh):
+        fh.seek(offset)
+        fh.write(b"X")
+
+    return change
+
+
+@pytest.mark.parametrize(
+    ("change", "sent_chunks"),
+    [
+        (_overwrite_at(0), 0),
+        (_overwrite_at(256 * 1024 + 5), 1),
+        (lambda fh: fh.truncate(300 * 1024 - 10), 1),
+    ],
+    ids=["first-chunk-changed", "last-chunk-changed", "truncated"],
+)
+def test_wire_resumable_upload_stops_when_the_file_changes_after_hashing(
+    monkeypatch, allowed_dir, change, sent_chunks
+):
+    """A file above the simple-upload limit is read again for the upload.
+    Bytes other than the hashed ones are never sent, and the upload stops
+    before its last chunk, so Drive never completes it."""
+    monkeypatch.setattr(google_drive, "_SIMPLE_UPLOAD_MAX_BYTES", 1000)
+    monkeypatch.setattr(google_drive, "_RESUMABLE_CHUNK_BYTES", 256 * 1024)
+    monkeypatch.setattr(google_drive, "_HASH_BLOCK_BYTES", 64 * 1024)
+    data = (b"slide-bytes-" * 30000)[: 300 * 1024]
+    local = _replacement(allowed_dir, data=data)
+    session = "https://www.googleapis.com/upload/drive/v3/files/deck1?upload_id=s1"
+    http = _wire_drive(
+        monkeypatch,
+        [
+            _ok(_current()),
+            ({"status": "200", "location": session}, ""),
+            ({"status": "308", "range": "bytes=0-262143"}, ""),
+            _ok(_updated(data)),
+        ],
+    )
+    _change_after_hashing(monkeypatch, local, change)
+
+    result = _call("deck1", local)
+
+    message = result["message"]
+    assert result["status"] == "error"
+    assert "changed while it was being uploaded" in message
+    assert "Nothing was changed in Google Drive" in message
+    assert result["file"]["headRevisionId"] == "rev-1"
+    methods = [request.method for request in http.requests]
+    assert methods == ["GET", "PATCH"] + ["PUT"] * sent_chunks
+    for request in http.requests[2:]:
+        assert request.body == data[: len(request.body)]
+
+
+def test_wire_resumable_upload_sends_only_the_hashed_bytes_of_a_grown_file(
+    monkeypatch, allowed_dir
+):
+    monkeypatch.setattr(google_drive, "_SIMPLE_UPLOAD_MAX_BYTES", 1000)
+    monkeypatch.setattr(google_drive, "_RESUMABLE_CHUNK_BYTES", 256 * 1024)
+    data = (b"slide-bytes-" * 30000)[: 300 * 1024]
+    local = _replacement(allowed_dir, data=data)
+    session = "https://www.googleapis.com/upload/drive/v3/files/deck1?upload_id=s1"
+    http = _wire_drive(
+        monkeypatch,
+        [
+            _ok(_current()),
+            ({"status": "200", "location": session}, ""),
+            ({"status": "308", "range": "bytes=0-262143"}, ""),
+            _ok(_updated(data)),
+        ],
+    )
+
+    def append(fh):
+        fh.seek(0, os.SEEK_END)
+        fh.write(b"appended later")
+
+    _change_after_hashing(monkeypatch, local, append)
+
+    result = _call("deck1", local)
+
+    assert result["status"] == "success", result
+    _, start, first, second = http.requests
+    assert start.headers["x-upload-content-length"] == str(len(data))
+    assert second.headers["content-range"].endswith(f"/{len(data)}")
+    assert first.body + second.body == data
+
+
+def test_verified_upload_checks_the_whole_blocks_around_any_range(monkeypatch):
+    monkeypatch.setattr(google_drive, "_HASH_BLOCK_BYTES", 4)
+    data = bytes(range(26))
+    fh = io.BytesIO(data)
+    _, _, blocks = google_drive._hash_replacement_file(fh, len(data), keep_bytes=False)
+    media = google_drive._VerifiedChunkUpload(
+        fh,
+        size=len(data),
+        block_digests=blocks,
+        mimetype=DECK_MIME,
+        chunksize=256 * 1024,
+        resumable=True,
+    )
+
+    assert media.size() == len(data)
+    # Drive may report progress that is not on a block boundary.
+    assert media.getbytes(5, 6) == data[5:11]
+    assert media.getbytes(24, 10) == data[24:]
+    assert media.getbytes(0, 100) == data
+
+    fh.seek(0, os.SEEK_END)
+    fh.write(b"appended")
+    assert media.size() == len(data)
+    assert media.getbytes(20, 100) == data[20:]
+
+    fh.seek(9)
+    fh.write(b"\xff")
+    with pytest.raises(ValueError, match="changed while it was being read"):
+        media.getbytes(5, 6)
+    assert media.getbytes(0, 8) == data[:8]
 
 
 # --- registration and download metadata ------------------------------------
