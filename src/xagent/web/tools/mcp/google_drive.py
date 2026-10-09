@@ -1770,18 +1770,35 @@ def _extension_type(extension: str) -> tuple[str | None, str | None] | None:
     return mime_type, encoding
 
 
+def _name_type(name: str, extension: str) -> tuple[str | None, str | None] | None:
+    """What ``_extension_type`` says for ``extension``, the lowercase
+    extension of ``name``, except that a compression extension is read with
+    the part before it: "data.tar.gz" and "data.tgz" both name a gzipped
+    tar file, and "logo.svg.gz" and "logo.svgz" a gzipped SVG."""
+    extension_type = _extension_type(extension)
+    if extension_type is None or extension_type[1] is None:
+        return extension_type
+    # mimetypes reads no more than these two extensions. It takes its
+    # argument as a URL and matches ".gz" and the like case-sensitively, so
+    # it gets them lowercased after a fixed stem, not the name itself.
+    inner_extension = _file_extension(_split_stem_suffix(name.strip())[0])
+    return _builtin_mime_types().guess_type(
+        f"file{inner_extension}{extension}", strict=False
+    )
+
+
 def _content_extension_mismatch(
     drive_name: str, stored_mime_type: str, local_name: str
 ) -> tuple[str, str] | None:
     """When the replacement looks like another type of file than the one in
     Drive, its extension and what the Drive file is; otherwise ``None``.
 
-    Two spellings of one type (.jpeg and .jpg) match; a compressed and a
-    plain file (.csv.gz and .csv, .svgz and .svg) do not. A dotted part of
-    the Drive name is not taken as its type when the replacement's extension
-    names the type stored in Drive ("John.Smith" stored as a PDF, replaced
-    with "John.Smith.pdf"), or when neither that part nor the stored type
-    says what the file is.
+    Two spellings of one type (.jpeg and .jpg, .tar.gz and .tgz) match; a
+    compressed and a plain file (.csv.gz and .csv, .svgz and .svg) do not.
+    A dotted part of the Drive name is not taken as its type when the
+    replacement's extension names the type stored in Drive ("John.Smith"
+    stored as a PDF, replaced with "John.Smith.pdf"), or when neither that
+    part nor the stored type says what the file is.
     """
     drive_extension = _file_extension(drive_name)
     local_extension = _file_extension(local_name)
@@ -1789,8 +1806,8 @@ def _content_extension_mismatch(
         return None
     if drive_extension == local_extension:
         return None
-    drive_type = _extension_type(drive_extension)
-    local_type = _extension_type(local_extension)
+    drive_type = _name_type(drive_name, drive_extension)
+    local_type = _name_type(local_name, local_extension)
     # A stored octet-stream type says nothing about the file.
     known_stored_type = stored_mime_type not in ("", _OCTET_STREAM)
     # A compressed file may be stored under the type of what it compresses

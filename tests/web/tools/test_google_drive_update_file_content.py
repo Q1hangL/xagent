@@ -873,6 +873,9 @@ def test_replacement_of_another_type_is_still_refused(
         ("dump.xz", "application/octet-stream", "dump.sql", "a .xz file"),
         ("backup.tar", "application/x-tar", "backup.tgz", "a .tar file"),
         ("report.csv", "text/csv", "report.csv.gz", "a .csv file"),
+        ("data.tar.gz", "application/x-tar", "data.tar", "a .gz file"),
+        ("logo.svg.gz", "image/svg+xml", "logo.svg", "a .gz file"),
+        ("data.tar.gz", "application/x-tar", "data.svgz", "a .gz file"),
     ],
 )
 def test_compressed_and_plain_files_are_different_types(
@@ -886,6 +889,30 @@ def test_compressed_and_plain_files_are_different_types(
     assert f"'{drive_name}' in Google Drive is {drive_kind}" in result["message"]
     assert "Nothing was changed in Google Drive" in result["message"]
     drive.assert_nothing_written()
+
+
+@pytest.mark.parametrize(
+    ("drive_name", "mime_type", "local_name"),
+    [
+        ("data.tar.gz", "application/x-tar", "data.tgz"),
+        ("data.tgz", "application/x-tar", "data.tar.gz"),
+        ("data.tar.bz2", "application/x-tar", "data.tbz2"),
+        ("data.tbz2", "application/x-bzip2", "data.tar.bz2"),
+        ("data.tar.xz", "application/x-xz", "data.txz"),
+        ("logo.svg.gz", "image/svg+xml", "logo.svgz"),
+        ("logo.svgz", "image/svg+xml", "logo.svg.gz"),
+        ("Data.TAR.GZ", "application/gzip", "data.tgz"),
+    ],
+)
+def test_two_spellings_of_one_compressed_type_are_the_same_type(
+    monkeypatch, allowed_dir, drive_name, mime_type, local_name
+):
+    drive = _typed_drive(monkeypatch, drive_name, mime_type)
+
+    result = _call("deck1", _replacement(allowed_dir, name=local_name))
+
+    assert result["status"] == "success", result
+    assert drive.uploaded == [NEW_CONTENT]
 
 
 @pytest.mark.parametrize(
@@ -923,6 +950,12 @@ def test_extension_types_come_from_python_not_the_host(monkeypatch):
     assert google_drive._extension_type(".pptx") == (DECK_MIME, None)
     assert google_drive._extension_type(".svgz") == ("image/svg+xml", "gzip")
     assert google_drive._extension_type(".gz") == (None, "gzip")
+    tar_gz = ("application/x-tar", "gzip")
+    assert google_drive._name_type("data.tar.gz", ".gz") == tar_gz
+    assert google_drive._name_type("Data.TAR.GZ", ".gz") == tar_gz
+    assert google_drive._name_type("data.tgz", ".tgz") == tar_gz
+    assert google_drive._name_type("logs.gz", ".gz") == (None, "gzip")
+    assert google_drive._name_type("data.tar", ".tar") == ("application/x-tar", None)
 
 
 @pytest.mark.parametrize(
