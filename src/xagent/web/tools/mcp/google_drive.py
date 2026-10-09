@@ -1521,6 +1521,8 @@ _HASH_BLOCK_BYTES = 1024 * 1024
 # errors. Replaying a content update cannot change the final bytes; at worst it
 # adds one more revision with the same content.
 _CONTENT_UPDATE_NUM_RETRIES = 2
+# The Content-Range of a resumable upload chunk: "bytes <first>-<last>/<size>".
+_CONTENT_RANGE_PATTERN = re.compile(r"bytes \d+-(?P<last>\d+)/(?P<size>\d+)")
 
 _OCTET_STREAM = "application/octet-stream"
 _FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
@@ -1908,9 +1910,22 @@ def _content_error_detail(exc: Exception) -> str:
     return f"Error: {summary or type(exc).__name__}"
 
 
+def _request_may_store_content(uri: str, headers: dict[str, str] | None) -> bool:
+    """Whether Drive may store the upload on this request of a files.update:
+    the one request of a simple upload, or the chunk that ends a resumable
+    upload. Starting a resumable session or sending an earlier chunk stores
+    nothing."""
+    for key, value in (headers or {}).items():
+        if key.lower() == "content-range":
+            match = _CONTENT_RANGE_PATTERN.fullmatch(str(value).strip())
+            return match is None or int(match["last"]) + 1 == int(match["size"])
+    return parse_qs(urlparse(uri).query).get("uploadType") != ["resumable"]
+
+
 class _UpdateAttempts:
     """The http object one files.update sends its requests through, noting
-    whether any of them may have reached Drive without a definite answer.
+    whether a request that may store the content ended without a definite
+    answer.
 
     googleapiclient retries a timeout, a dropped connection, a 5xx, a 429
     and a rate-limit 403, so the error it finally raises may be a 4xx that
@@ -1922,14 +1937,24 @@ class _UpdateAttempts:
         self._http = http
         self.unclear = False
 
-    def request(self, *args: Any, **kwargs: Any) -> Any:
+    def request(
+        self,
+        uri: str,
+        method: str = "GET",
+        body: Any = None,
+        headers: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        may_store = _request_may_store_content(uri, headers)
         try:
-            response, content = self._http.request(*args, **kwargs)
+            response, content = self._http.request(
+                uri, method=method, body=body, headers=headers, **kwargs
+            )
         except BaseException:
-            self.unclear = True
+            self.unclear = self.unclear or may_store
             raise
         status = _as_int(getattr(response, "status", None))
-        if status is None or status >= 500 or status == 408:
+        if may_store and (status is None or status >= 500 or status == 408):
             self.unclear = True
         return response, content
 

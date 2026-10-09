@@ -1655,6 +1655,7 @@ _RATE_LIMITED_403 = _error_reply(403, "userRateLimitExceeded")
             ConnectionResetError("reset"),
             _error_reply(403, "insufficientFilePermissions"),
         ],
+        [({"status": "503"}, ""), _error_reply(404, "notFound")],
     ],
     ids=[
         "503-then-429",
@@ -1662,6 +1663,7 @@ _RATE_LIMITED_403 = _error_reply(403, "userRateLimitExceeded")
         "502-then-400",
         "timeout-then-429",
         "reset-then-permission-403",
+        "503-then-not-found",
     ],
 )
 def test_wire_rejected_retry_after_an_unclear_attempt_is_an_unknown_outcome(
@@ -1705,19 +1707,86 @@ def test_wire_rate_limit_on_every_attempt_is_a_rejection(
     assert [request.method for request in http.requests] == ["GET"] + ["PATCH"] * 3
 
 
-def test_wire_resumable_chunk_rejected_after_a_server_error_is_unknown(
+_SESSION = (
+    "https://www.googleapis.com/upload/drive/v3/files/deck1"
+    "?uploadType=resumable&upload_id=s1"
+)
+_SESSION_STARTED = ({"status": "200", "location": _SESSION}, "")
+
+
+_NOT_ACCEPTED = "did not accept the new content"
+_NOT_OPENED = "could not open file_id"
+
+
+@pytest.mark.parametrize(
+    ("replies", "methods", "expected"),
+    [
+        (
+            [
+                ({"status": "503"}, ""),
+                _SESSION_STARTED,
+                _error_reply(400, "badRequest"),
+            ],
+            ["PATCH", "PATCH", "PUT"],
+            _NOT_ACCEPTED,
+        ),
+        (
+            [
+                _SESSION_STARTED,
+                ({"status": "503"}, ""),
+                _error_reply(400, "badRequest"),
+            ],
+            ["PATCH", "PUT", "PUT"],
+            _NOT_ACCEPTED,
+        ),
+        (
+            [_SESSION_STARTED, ({"status": "500"}, ""), _error_reply(404, "notFound")],
+            ["PATCH", "PUT", "PUT"],
+            _NOT_OPENED,
+        ),
+    ],
+    ids=["session-start-503", "first-chunk-503", "first-chunk-500-then-404"],
+)
+def test_wire_resumable_server_error_before_the_last_chunk_stores_nothing(
+    monkeypatch, allowed_dir, replies, methods, expected
+):
+    """Drive stores a resumable upload only when its last chunk arrives, so
+    a server error on the request that starts the session or on an earlier
+    chunk leaves a later rejection a definite one."""
+    monkeypatch.setattr(googleapiclient.http.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(google_drive, "_SIMPLE_UPLOAD_MAX_BYTES", 1000)
+    monkeypatch.setattr(google_drive, "_RESUMABLE_CHUNK_BYTES", 256 * 1024)
+    data = (b"slide-bytes-" * 30000)[: 300 * 1024]
+    http = _wire_drive(monkeypatch, [_ok(_current()), *replies])
+
+    result = _call("deck1", _replacement(allowed_dir, data=data))
+
+    assert result["status"] == "error"
+    assert expected in result["message"]
+    assert "not known whether" not in result["message"]
+    assert result["file"]["headRevisionId"] == "rev-1"
+    assert [request.method for request in http.requests] == ["GET", *methods]
+    # The last chunk was never sent.
+    assert not any(
+        request.headers.get("content-range", "").startswith("bytes 262144-")
+        for request in http.requests
+    )
+
+
+def test_wire_resumable_last_chunk_rejected_after_a_server_error_is_unknown(
     monkeypatch, allowed_dir
 ):
     monkeypatch.setattr(googleapiclient.http.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(google_drive, "_SIMPLE_UPLOAD_MAX_BYTES", 1000)
     monkeypatch.setattr(google_drive, "_RESUMABLE_CHUNK_BYTES", 256 * 1024)
     data = (b"slide-bytes-" * 30000)[: 300 * 1024]
-    session = "https://www.googleapis.com/upload/drive/v3/files/deck1?upload_id=s1"
-    _wire_drive(
+    http = _wire_drive(
         monkeypatch,
         [
             _ok(_current()),
-            ({"status": "200", "location": session}, ""),
+            _SESSION_STARTED,
+            ({"status": "308", "range": "bytes=0-262143"}, ""),
+            # The last chunk may have completed the upload before the 503.
             ({"status": "503"}, ""),
             _error_reply(400, "badRequest"),
         ],
@@ -1725,9 +1794,20 @@ def test_wire_resumable_chunk_rejected_after_a_server_error_is_unknown(
 
     result = _call("deck1", _replacement(allowed_dir, data=data))
 
+    message = result["message"]
     assert result["status"] == "error"
-    assert "not known whether" in result["message"]
+    assert "refused a retry of the upload" in message
+    assert "not known whether 'Quarterly Deck.pptx' changed" in message
     assert "file" not in result
+    assert result["previous"]["headRevisionId"] == "rev-1"
+    last_range = f"bytes 262144-{len(data) - 1}/{len(data)}"
+    assert [request.headers.get("content-range") for request in http.requests] == [
+        None,
+        None,
+        f"bytes 0-262143/{len(data)}",
+        last_range,
+        last_range,
+    ]
 
 
 def _change_after_hashing(monkeypatch, local, change):
