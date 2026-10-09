@@ -198,8 +198,18 @@ def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
 
 
-def _presentation_error(exc: Exception, *, editing: bool = False) -> str:
-    return _error(google_file_error_message(exc, _PRESENTATION_KIND, editing=editing))
+def _presentation_error(
+    exc: Exception, presentation_id: str, *, editing: bool = False
+) -> str:
+    """``presentation_id`` is the tool's own argument, before it was resolved."""
+    return _error(
+        google_file_error_message(
+            exc,
+            _PRESENTATION_KIND,
+            editing=editing,
+            file_link_or_id=presentation_id,
+        )
+    )
 
 
 def _delete_imported_presentation(drive_service: Any, presentation_id: str) -> bool:
@@ -675,7 +685,7 @@ def google_slides_get_presentation(presentation_id: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error getting presentation: {e}")
-        return _presentation_error(e)
+        return _presentation_error(e, presentation_id)
 
 
 @mcp.tool()
@@ -1215,7 +1225,7 @@ def google_slides_add_slide(
         )
     except Exception as e:
         logger.error(f"Error adding slide: {e}")
-        return _presentation_error(e, editing=True)
+        return _presentation_error(e, presentation_id, editing=True)
 
 
 @mcp.tool()
@@ -1326,7 +1336,7 @@ def google_slides_update_slide(
         )
     except Exception as e:
         logger.error(f"Error updating slide: {e}")
-        return _presentation_error(e, editing=True)
+        return _presentation_error(e, presentation_id, editing=True)
 
 
 @mcp.tool()
@@ -1364,7 +1374,7 @@ def google_slides_delete_slide(presentation_id: str, slide_id: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error deleting slide: {e}")
-        return _presentation_error(e, editing=True)
+        return _presentation_error(e, presentation_id, editing=True)
 
 
 @mcp.tool()
@@ -1401,7 +1411,7 @@ def google_slides_batch_update(presentation_id: str, requests_json: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error applying batch update: {e}")
-        return _presentation_error(e, editing=True)
+        return _presentation_error(e, presentation_id, editing=True)
 
 
 if __name__ == "__main__":

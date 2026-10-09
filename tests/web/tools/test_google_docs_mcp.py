@@ -522,3 +522,78 @@ def test_tools_give_their_own_next_steps_for_a_drive_file_link(
         "this creates a new document: the change will be made in that copy" in message
     ) is editing
     get_service.assert_not_called()
+
+
+# A Drive open?id= or uc?id= link can name a native document or an uploaded
+# file, so its id goes to the API. The Docs API answers the id of an
+# uploaded file (an Excel file, at least) with a 400 that does not name the
+# cause, so every tool must pass its own argument to the error message, which
+# then adds the next steps for an uploaded file.
+@pytest.mark.parametrize(
+    "link",
+    [
+        "https://drive.google.com/open?id=doc123",
+        "https://drive.google.com/uc?export=download&id=doc123",
+    ],
+)
+@pytest.mark.parametrize(
+    ("call", "request_of", "editing"),
+    [
+        pytest.param(
+            google_docs.google_docs_get_document,
+            lambda documents: documents.get,
+            False,
+            id="get_document",
+        ),
+        pytest.param(
+            lambda doc: google_docs.google_docs_append_text(doc, "more"),
+            lambda documents: documents.get,
+            True,
+            id="append_text",
+        ),
+        pytest.param(
+            lambda doc: google_docs.google_docs_replace_text(doc, "a", "b"),
+            lambda documents: documents.batchUpdate,
+            True,
+            id="replace_text",
+        ),
+        pytest.param(
+            lambda doc: google_docs.google_docs_batch_update(
+                doc, '[{"insertText": {"location": {"index": 1}, "text": "x"}}]'
+            ),
+            lambda documents: documents.batchUpdate,
+            True,
+            id="batch_update",
+        ),
+    ],
+)
+def test_tools_add_next_steps_to_a_400_for_a_drive_open_or_uc_link(
+    monkeypatch, link, call, request_of, editing
+):
+    service, _ = _mock_docs_service(monkeypatch)
+    request = request_of(service.documents.return_value)
+    request.return_value.execute.side_effect = _http_error(
+        400,
+        {
+            "error": {
+                "code": 400,
+                "message": "Request contains an invalid argument.",
+                "status": "INVALID_ARGUMENT",
+            }
+        },
+    )
+
+    result = json.loads(call(link))
+
+    assert result["status"] == "error"
+    assert request.call_args.kwargs["documentId"] == "doc123"
+    message = result["message"]
+    assert message.startswith(
+        "Google Docs rejected this request (Google API response: HTTP 400 "
+        "Request contains an invalid argument.). The document id was taken "
+        "from a Google Drive link"
+    )
+    assert "File > Save as Google Docs" in message
+    assert ("read the downloaded copy with read_file" in message) is not editing
+    assert ("To make this change with these tools" in message) is editing
+    assert message.endswith("the error is about the request itself.")

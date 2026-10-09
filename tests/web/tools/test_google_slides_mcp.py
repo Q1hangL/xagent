@@ -3156,3 +3156,89 @@ def test_tools_give_their_own_next_steps_for_a_drive_file_link(
         in message
     ) is editing
     get_service.assert_not_called()
+
+
+# A Drive open?id= or uc?id= link can name a native presentation or an
+# uploaded file, so its id goes to the API. The Slides API answers the id of
+# an uploaded file (an Excel file, at least) with a 400 that does not name
+# the cause, so every tool must pass its own argument to the error message,
+# which then adds the next steps for an uploaded file.
+@pytest.mark.parametrize(
+    "link",
+    [
+        "https://drive.google.com/open?id=pres1",
+        "https://drive.google.com/uc?export=download&id=pres1",
+    ],
+)
+@pytest.mark.parametrize(
+    ("call", "request_of", "editing"),
+    [
+        pytest.param(
+            google_slides.google_slides_get_presentation,
+            lambda presentations: presentations.get,
+            False,
+            id="get_presentation",
+        ),
+        pytest.param(
+            lambda pres: google_slides.google_slides_add_slide(
+                pres, title="T", body="B"
+            ),
+            lambda presentations: presentations.get,
+            True,
+            id="add_slide",
+        ),
+        pytest.param(
+            lambda pres: google_slides.google_slides_update_slide(
+                pres, "slide1", title="T"
+            ),
+            lambda presentations: presentations.get,
+            True,
+            id="update_slide",
+        ),
+        pytest.param(
+            lambda pres: google_slides.google_slides_delete_slide(pres, "slide1"),
+            lambda presentations: presentations.get,
+            True,
+            id="delete_slide",
+        ),
+        pytest.param(
+            lambda pres: google_slides.google_slides_batch_update(
+                pres, '[{"deleteObject": {"objectId": "shape1"}}]'
+            ),
+            lambda presentations: presentations.batchUpdate,
+            True,
+            id="batch_update",
+        ),
+    ],
+)
+def test_tools_add_next_steps_to_a_400_for_a_drive_open_or_uc_link(
+    monkeypatch, link, call, request_of, editing
+):
+    presentations = Mock()
+    request = request_of(presentations)
+    request.return_value.execute.side_effect = _http_error(
+        400,
+        {
+            "error": {
+                "code": 400,
+                "message": "Request contains an invalid argument.",
+                "status": "INVALID_ARGUMENT",
+            }
+        },
+    )
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(call(link))
+
+    assert result["status"] == "error"
+    assert request.call_args.kwargs["presentationId"] == "pres1"
+    message = result["message"]
+    assert message.startswith(
+        "Google Slides rejected this request (Google API response: HTTP 400 "
+        "Request contains an invalid argument.). The presentation id was taken "
+        "from a Google Drive link"
+    )
+    assert "File > Save as Google Slides" in message
+    assert ("read the downloaded copy with read_pptx" in message) is not editing
+    assert ("To make this change with these tools" in message) is editing
+    assert message.endswith("the error is about the request itself.")

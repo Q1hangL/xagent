@@ -948,3 +948,97 @@ def test_tools_give_their_own_next_steps_for_a_drive_file_link(
         "and the original file will stay unchanged" in message
     ) is editing
     get_service.assert_not_called()
+
+
+# The Sheets API answers an Excel file with the Office-file 400 (above). For
+# any other 400 after a Drive open?id= or uc?id= link, which can name an
+# uploaded file such as a PDF, every tool must pass its own argument to the
+# error message, which then adds the next steps for an uploaded file.
+@pytest.mark.parametrize(
+    "link",
+    [
+        "https://drive.google.com/open?id=abc123",
+        "https://drive.google.com/uc?export=download&id=abc123",
+    ],
+)
+@pytest.mark.parametrize(
+    ("request_of", "invoke", "editing"),
+    [
+        pytest.param(
+            lambda sp: sp.get,
+            google_sheets.google_sheets_get_spreadsheet,
+            False,
+            id="get_spreadsheet",
+        ),
+        pytest.param(
+            lambda sp: sp.values.return_value.get,
+            lambda sid: google_sheets.google_sheets_read_range(sid, "Sheet1!A1"),
+            False,
+            id="read_range",
+        ),
+        pytest.param(
+            lambda sp: sp.values.return_value.update,
+            lambda sid: google_sheets.google_sheets_update_range(
+                sid, "Sheet1!A1", [["x"]]
+            ),
+            True,
+            id="update_range",
+        ),
+        pytest.param(
+            lambda sp: sp.values.return_value.append,
+            lambda sid: google_sheets.google_sheets_append_rows(
+                sid, "Sheet1!A1", [["x"]]
+            ),
+            True,
+            id="append_rows",
+        ),
+        pytest.param(
+            lambda sp: sp.values.return_value.clear,
+            lambda sid: google_sheets.google_sheets_clear_range(sid, "Sheet1!A1"),
+            True,
+            id="clear_range",
+        ),
+        pytest.param(
+            lambda sp: sp.batchUpdate,
+            lambda sid: google_sheets.google_sheets_add_sheet(sid, "Extra"),
+            True,
+            id="add_sheet",
+        ),
+        pytest.param(
+            lambda sp: sp.batchUpdate,
+            lambda sid: google_sheets.google_sheets_delete_sheet(sid, 1),
+            True,
+            id="delete_sheet",
+        ),
+    ],
+)
+def test_tools_add_next_steps_to_another_400_for_a_drive_open_or_uc_link(
+    monkeypatch, link, request_of, invoke, editing
+):
+    spreadsheets = Mock()
+    request_of(spreadsheets).return_value.execute.side_effect = _http_error(
+        400,
+        {
+            "error": {
+                "code": 400,
+                "message": "Request contains an invalid argument.",
+                "status": "INVALID_ARGUMENT",
+            }
+        },
+    )
+    _mock_sheets_service(monkeypatch, spreadsheets)
+
+    result = json.loads(invoke(link))
+
+    assert result["status"] == "error"
+    assert request_of(spreadsheets).call_args.kwargs["spreadsheetId"] == "abc123"
+    message = result["message"]
+    assert message.startswith(
+        "Google Sheets rejected this request (Google API response: HTTP 400 "
+        "Request contains an invalid argument.). The spreadsheet id was taken "
+        "from a Google Drive link"
+    )
+    assert "File > Save as Google Sheets" in message
+    assert ("read the downloaded copy with read_file" in message) is not editing
+    assert ("To make this change with these tools" in message) is editing
+    assert message.endswith("the error is about the request itself.")

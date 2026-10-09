@@ -81,12 +81,18 @@ def _resolve_spreadsheet_id(spreadsheet_id: str, *, editing: bool = False) -> st
     )
 
 
-def _spreadsheet_error(exc: Exception, *, editing: bool = False) -> str:
+def _spreadsheet_error(
+    exc: Exception, spreadsheet_id: str, *, editing: bool = False
+) -> str:
+    """``spreadsheet_id`` is the tool's own argument, before it was resolved."""
     return json.dumps(
         {
             "status": "error",
             "message": google_file_error_message(
-                exc, _SPREADSHEET_KIND, editing=editing
+                exc,
+                _SPREADSHEET_KIND,
+                editing=editing,
+                file_link_or_id=spreadsheet_id,
             ),
         },
         ensure_ascii=False,
@@ -146,7 +152,7 @@ def google_sheets_get_spreadsheet(spreadsheet_id: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error getting spreadsheet: {e}")
-        return _spreadsheet_error(e)
+        return _spreadsheet_error(e, spreadsheet_id)
 
 
 @mcp.tool()
@@ -265,7 +271,7 @@ def google_sheets_read_range(
         )
     except Exception as e:
         logger.error(f"Error reading range: {e}")
-        return _spreadsheet_error(e)
+        return _spreadsheet_error(e, spreadsheet_id)
 
 
 @mcp.tool()
@@ -306,7 +312,7 @@ def google_sheets_update_range(
         )
     except Exception as e:
         logger.error(f"Error updating range: {e}")
-        return _spreadsheet_error(e, editing=True)
+        return _spreadsheet_error(e, spreadsheet_id, editing=True)
 
 
 @mcp.tool()
@@ -347,7 +353,7 @@ def google_sheets_append_rows(
         )
     except Exception as e:
         logger.error(f"Error appending rows: {e}")
-        return _spreadsheet_error(e, editing=True)
+        return _spreadsheet_error(e, spreadsheet_id, editing=True)
 
 
 @mcp.tool()
@@ -374,7 +380,7 @@ def google_sheets_clear_range(spreadsheet_id: str, range_name: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error clearing range: {e}")
-        return _spreadsheet_error(e, editing=True)
+        return _spreadsheet_error(e, spreadsheet_id, editing=True)
 
 
 @mcp.tool()
@@ -422,7 +428,7 @@ def google_sheets_add_sheet(
         )
     except Exception as e:
         logger.error(f"Error adding sheet: {e}")
-        return _spreadsheet_error(e, editing=True)
+        return _spreadsheet_error(e, spreadsheet_id, editing=True)
 
 
 @mcp.tool()
@@ -445,7 +451,7 @@ def google_sheets_delete_sheet(spreadsheet_id: str, sheet_id: int) -> str:
         )
     except Exception as e:
         logger.error(f"Error deleting sheet: {e}")
-        return _spreadsheet_error(e, editing=True)
+        return _spreadsheet_error(e, spreadsheet_id, editing=True)
 
 
 if __name__ == "__main__":
