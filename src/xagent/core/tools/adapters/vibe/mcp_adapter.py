@@ -281,6 +281,13 @@ _DURABLE_UPLOAD_FIELDS: dict[tuple[str, str], tuple[str, ...]] = {
     ("jira", "jira_add_attachment"): ("file_path",),
 }
 
+# Tools above whose own ``file_id`` argument names something other than a
+# workspace file. The generic FileRef wording says "file_id", so for these the
+# description and the staging error name the upload argument instead.
+_DURABLE_UPLOAD_OWN_FILE_ID_TOOLS: frozenset[tuple[str, str]] = frozenset(
+    {("google-drive", "google_drive_update_file_content")}
+)
+
 # Built-in connector tools that create a real binary under the current task
 # workspace. Their result is annotated with a durable FileRef at the host
 # boundary, so later turns and connectors can use the registered artifact even
@@ -299,27 +306,9 @@ _DURABLE_UPLOAD_NOTE = (
 _DURABLE_UPLOAD_NOT_FOUND = "file_id not found or not accessible."
 
 
-def _has_own_file_id_argument(input_schema: object, fields: tuple[str, ...]) -> bool:
-    """Whether the tool has a ``file_id`` argument that is not its upload field.
-
-    The generic FileRef wording says "file_id", which is ambiguous for such a
-    tool, since its own ``file_id`` names something else (such as the Drive
-    file whose content is replaced). Only such a tool gets wording that names
-    the upload argument, so every other tool keeps its text unchanged.
-    """
-    properties = (
-        input_schema.get("properties") if isinstance(input_schema, Mapping) else None
-    )
-    return (
-        isinstance(properties, Mapping)
-        and "file_id" in properties
-        and "file_id" not in fields
-    )
-
-
-def _durable_upload_note(input_schema: object, fields: tuple[str, ...]) -> str:
+def _durable_upload_note(fields: tuple[str, ...], *, own_file_id: bool) -> str:
     """The description sentence for a tool that accepts a durable FileRef."""
-    if not _has_own_file_id_argument(input_schema, fields):
+    if not own_file_id:
         return _DURABLE_UPLOAD_NOTE
     return (
         " A registered workspace file (file:<id>) may be supplied for "
@@ -330,27 +319,17 @@ def _durable_upload_note(input_schema: object, fields: tuple[str, ...]) -> str:
 
 
 def _durable_upload_not_found_message(
-    input_schema: object, fields: tuple[str, ...]
+    fields: tuple[str, ...], *, own_file_id: bool
 ) -> str:
-    """The error for a FileRef that could not be staged; the tool is not called.
-
-    For a tool with its own ``file_id`` argument, the generic "file_id not
-    found" would point at that argument (for example as if the Drive file
-    were missing), so the message names the upload argument instead. Such a
-    tool (the Drive content update) may be saving a file the user approved
-    in an earlier turn, so the message also says not to rebuild it unasked,
-    as the tool's own errors for a missing local file do.
-    """
-    if not _has_own_file_id_argument(input_schema, fields):
+    """The error for a FileRef that could not be staged; the tool is not called."""
+    if not own_file_id:
         return _DURABLE_UPLOAD_NOT_FOUND
+    names = " or ".join(fields)
     return (
-        f"{' or '.join(fields)}: the registered workspace file (file:<id>) "
-        "was not found or is not accessible, so the tool was not called and "
-        "nothing was changed. This is about the file passed as "
-        f"{' or '.join(fields)}, not the file_id argument. Check that the "
-        "file:<id> is the one recorded for that file. Do not rebuild the file "
-        "without asking the user again; if it is no longer available, tell "
-        "the user."
+        f"{names}: the registered workspace file (file:<id>) was not found or "
+        "is not accessible, so the tool was not called and nothing was "
+        f"changed. This is about the file passed as {names}, not the file_id "
+        "argument."
     )
 
 
@@ -363,6 +342,15 @@ def _durable_upload_fields(server_name: str, tool_name: str) -> tuple[str, ...]:
     return _DURABLE_UPLOAD_FIELDS.get(
         (canonicalize_builtin_identity(server_name) or "", tool_name), ()
     )
+
+
+def _durable_upload_has_own_file_id(server_name: str, tool_name: str) -> bool:
+    from .....builtin_identity import canonicalize_builtin_identity
+
+    return (
+        canonicalize_builtin_identity(server_name) or "",
+        tool_name,
+    ) in _DURABLE_UPLOAD_OWN_FILE_ID_TOOLS
 
 
 def _workspace_download_field(server_name: str, tool_name: str) -> str | None:
@@ -1408,6 +1396,7 @@ class MCPToolAdapter(AbstractBaseTool):
         source_server: Optional[str] = None,
         workspace: Any | None = None,
         durable_upload_fields: tuple[str, ...] = (),
+        durable_upload_own_file_id: bool = False,
         workspace_download_field: str | None = None,
         concurrency_safe: bool = False,
         concurrent_tools: Optional[List[str]] = None,
@@ -1429,6 +1418,9 @@ class MCPToolAdapter(AbstractBaseTool):
                 for local-path upload connectors.
             durable_upload_fields: Host-owned scalar argument names that accept
                 a durable FileRef and need task-local staging.
+            durable_upload_own_file_id: Whether the tool's own ``file_id``
+                argument is not a workspace file, so the FileRef wording names
+                ``durable_upload_fields`` instead of "file_id".
             workspace_download_field: Host-owned result field for a built-in
                 connector download that should be registered as a durable
                 FileRef.
@@ -1454,6 +1446,7 @@ class MCPToolAdapter(AbstractBaseTool):
         self.source_server = source_server
         self._workspace = workspace
         self._durable_upload_fields = durable_upload_fields
+        self._durable_upload_own_file_id = durable_upload_own_file_id
         self._workspace_download_field = workspace_download_field
         self.concurrency_safe = _mcp_tool_is_concurrency_safe(
             self.mcp_tool.name,
@@ -1517,8 +1510,8 @@ class MCPToolAdapter(AbstractBaseTool):
         )
         if self._workspace is not None and self._durable_upload_fields:
             description += _durable_upload_note(
-                getattr(self.mcp_tool, "inputSchema", None),
                 self._durable_upload_fields,
+                own_file_id=self._durable_upload_own_file_id,
             )
         if self._workspace is not None and self._workspace_download_field is not None:
             description += (
@@ -2283,8 +2276,8 @@ class MCPToolAdapter(AbstractBaseTool):
                 ) = await self._stage_external_upload_args(tool_args)
             except FileNotFoundError:
                 message = _durable_upload_not_found_message(
-                    getattr(self.mcp_tool, "inputSchema", None),
                     self._durable_upload_fields,
+                    own_file_id=self._durable_upload_own_file_id,
                 )
                 return {"content": [{"text": message}], "is_error": True}
 
@@ -2866,6 +2859,9 @@ def _build_mcp_tool_adapter(
         source_server=normalize_mcp_server_name(server_name),
         workspace=workspace,
         durable_upload_fields=_durable_upload_fields(server_name, mcp_tool.name),
+        durable_upload_own_file_id=_durable_upload_has_own_file_id(
+            server_name, mcp_tool.name
+        ),
         workspace_download_field=_workspace_download_field(server_name, mcp_tool.name),
         concurrency_safe=concurrency_safe,
         concurrent_tools=concurrent_tools,

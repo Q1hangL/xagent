@@ -561,7 +561,7 @@ async def test_mcp_upload_file_ref_is_staged_and_cleaned_after_connector_call(
     ]
 
 
-def test_durable_upload_note_names_the_field_only_for_a_tool_with_its_own_file_id():
+def test_durable_upload_note_names_the_field_only_for_a_tool_keyed_to_it():
     def adapter_for(tool_name, properties):
         return _build_mcp_tool_adapter(
             "Google Drive",
@@ -578,17 +578,25 @@ def test_durable_upload_note_names_the_field_only_for_a_tool_with_its_own_file_i
         "google_drive_upload_file",
         {"file_path": {"type": "string"}, "name": {"type": "string"}},
     )
+    # The wording is keyed by (server, tool), not read off the schema: an
+    # upload tool that gains a file_id argument keeps the generic text.
+    upload_with_file_id = adapter_for(
+        "google_drive_upload_file",
+        {"file_path": {"type": "string"}, "file_id": {"type": "string"}},
+    )
     update = adapter_for(
         "google_drive_update_file_content",
         {"file_id": {"type": "string"}, "file_path": {"type": "string"}},
     )
 
     # Existing upload tools keep their description word for word.
-    assert upload.description == (
+    generic = (
         "Tool. A registered file_id (or file:<id>) may be supplied for the "
         "local upload argument; it will be staged in the current task "
         "workspace before this connector runs."
     )
+    assert upload.description == generic
+    assert upload_with_file_id.description == generic
     assert "may be supplied for file_path;" in update.description
     assert "The file_id argument is not a workspace file id." in update.description
     assert "the local upload argument" not in update.description
@@ -860,15 +868,19 @@ async def test_mcp_upload_missing_file_id_has_public_safe_error(monkeypatch):
             {"file_path": {"type": "string"}, "name": {"type": "string"}},
             "file_id not found or not accessible.",
         ),
+        # Keyed by (server, tool), not read off the schema.
+        (
+            "google_drive_upload_file",
+            {"file_path": {"type": "string"}, "file_id": {"type": "string"}},
+            "file_id not found or not accessible.",
+        ),
         (
             "google_drive_update_file_content",
             {"file_id": {"type": "string"}, "file_path": {"type": "string"}},
             "file_path: the registered workspace file (file:<id>) was not found "
             "or is not accessible, so the tool was not called and nothing was "
             "changed. This is about the file passed as file_path, not the "
-            "file_id argument. Check that the file:<id> is the one recorded "
-            "for that file. Do not rebuild the file without asking the user "
-            "again; if it is no longer available, tell the user.",
+            "file_id argument.",
         ),
     ],
 )
@@ -877,9 +889,7 @@ async def test_missing_file_ref_error_names_the_upload_field_only_when_ambiguous
 ):
     """A tool whose own file_id names something else (the Drive file whose
     content is replaced) must not be told that "file_id" was not found when
-    the replacement file:<id> could not be staged. Since the replacement
-    may have been approved in an earlier turn, it is also told not to
-    rebuild it without asking the user again."""
+    the replacement file:<id> could not be staged."""
     mcp_tool = SimpleNamespace(
         name=tool_name,
         description="Drive tool",

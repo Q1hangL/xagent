@@ -2226,7 +2226,8 @@ def google_drive_update_file_content(
     file_path: the replacement content: an absolute path to a file in the
     task workspace, or file:<id> for a file registered in this task (for
     example an edited copy saved in an earlier turn). That file:<id> is not
-    a Drive id.
+    a Drive id; if it cannot be found, do not rebuild the file without
+    asking the user.
     mime_type: optional; defaults to the file's current type in Google
     Drive. A type different from the current one is refused, because
     replacing the content keeps the file's type.
