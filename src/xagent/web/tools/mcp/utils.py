@@ -1984,11 +1984,14 @@ _DRIVE_FILE_LINK_RE = re.compile(
     r"(?:file/(?:u/\d+/)?d/|(?:u/\d+/)?(?:open|uc)\?(?:[^#]*&)?id=)"
 )
 
-# The Docs, Sheets and Slides APIs answer a request for an Office file stored
-# in Drive (which their editors open in Office compatibility mode) with a 400
-# FAILED_PRECONDITION "This operation is not supported for this document".
-# Either signal is enough, so a change to one of them still matches.
-_OFFICE_FILE_ERROR_STATUSES = frozenset({"FAILED_PRECONDITION", "failedPrecondition"})
+# The Sheets API answers a request for an Excel file stored in Drive (which
+# Google Sheets opens in Office compatibility mode) with a 400 "This
+# operation is not supported for this document. The document must not be an
+# Office file." The Docs and Slides tools use the same check, in case their
+# APIs answer a Word or PowerPoint file the same way. Only the message is
+# matched: a FAILED_PRECONDITION status or reason alone is not enough, since
+# the batch-update tools send requests built by the caller, which can fail a
+# precondition for other reasons.
 _OFFICE_FILE_ERROR_MESSAGE = "not supported for this document"
 
 # Connecting Google Drive does not widen what these connectors can open: a
@@ -2192,20 +2195,15 @@ def is_google_file_access_error(exc: BaseException) -> bool:
 
 
 def is_google_office_file_error(exc: BaseException) -> bool:
-    """Whether ``exc`` is the HTTP 400 the Docs, Sheets and Slides APIs return
-    for an Office file stored in Drive (such as an .xlsx opened from a
-    Sheets link), which they cannot open: its status or reason is
-    ``FAILED_PRECONDITION``, or its message says the operation "is not
-    supported for this document". Any other 400 is not matched."""
+    """Whether ``exc`` is the HTTP 400 the Sheets API returns for an Office
+    file stored in Drive (such as an .xlsx opened from a Sheets link), which
+    it cannot open: its message says the operation "is not supported for
+    this document". The Docs and Slides tools use the same check. Any other
+    400 is not matched, including a ``FAILED_PRECONDITION`` with another
+    message."""
     if google_api_error_status(exc) != 400:
         return False
-    error = _google_api_error_body(exc)
-    status = error.get("status")
-    if (isinstance(status, str) and status in _OFFICE_FILE_ERROR_STATUSES) or (
-        google_api_error_reasons(exc) & _OFFICE_FILE_ERROR_STATUSES
-    ):
-        return True
-    message = error.get("message")
+    message = _google_api_error_body(exc).get("message")
     return isinstance(message, str) and _OFFICE_FILE_ERROR_MESSAGE in message.lower()
 
 

@@ -357,7 +357,9 @@ async def test_get_document_description_says_drive_is_not_needed():
     )
 
 
-# What the Docs API returns for a Word file stored in Drive.
+# The Sheets API's Office-file 400 (its first sentence). The Docs tools
+# use the same check, in case the Docs API answers a Word file
+# stored in Drive the same way.
 _OFFICE_FILE_400 = {
     "error": {
         "code": 400,
@@ -412,6 +414,52 @@ def test_tools_explain_a_word_file_stored_in_drive(monkeypatch, call, editing):
         "document"
     )
     service.documents.return_value.batchUpdate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("call", "error_body"),
+    [
+        # The Docs API answers the id of an Excel file with a 400 that says
+        # nothing about the file.
+        pytest.param(
+            lambda: google_docs.google_docs_get_document("doc123"),
+            {
+                "error": {
+                    "code": 400,
+                    "message": "Request contains an invalid argument.",
+                    "status": "INVALID_ARGUMENT",
+                }
+            },
+            id="get_document-invalid-argument",
+        ),
+        # A request built by the caller can fail a precondition for reasons
+        # that have nothing to do with an Office file.
+        pytest.param(
+            lambda: google_docs.google_docs_batch_update(
+                "doc123", '[{"deleteContentRange": {}}]'
+            ),
+            {
+                "error": {
+                    "code": 400,
+                    "message": "Precondition check failed.",
+                    "status": "FAILED_PRECONDITION",
+                }
+            },
+            id="batch_update-failed-precondition",
+        ),
+    ],
+)
+def test_tools_keep_the_raw_error_for_another_400(monkeypatch, call, error_body):
+    service, _ = _mock_docs_service(monkeypatch)
+    error = _http_error(400, error_body)
+    documents = service.documents.return_value
+    documents.get.return_value.execute.side_effect = error
+    documents.batchUpdate.return_value.execute.side_effect = error
+
+    result = json.loads(call())
+
+    assert result["status"] == "error"
+    assert result["message"] == str(error)
 
 
 @pytest.mark.parametrize(

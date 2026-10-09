@@ -2957,7 +2957,9 @@ def test_get_presentation_resolves_multi_account_presentation_url(monkeypatch):
     assert presentations.get.call_args.kwargs["presentationId"] == "abc123"
 
 
-# What the Slides API returns for a PowerPoint file stored in Drive.
+# The Sheets API's Office-file 400 (its first sentence). The Slides tools
+# use the same check, in case the Slides API answers a PowerPoint file
+# stored in Drive the same way.
 _OFFICE_FILE_400 = {
     "error": {
         "code": 400,
@@ -3014,6 +3016,52 @@ def test_editing_tool_explains_a_powerpoint_file_stored_in_drive(monkeypatch):
         in message
     )
     assert "read_pptx" not in message
+
+
+@pytest.mark.parametrize(
+    ("call", "error_body"),
+    [
+        # The Slides API answers the id of an Excel file with a 400 that says
+        # nothing about the file.
+        pytest.param(
+            lambda: google_slides.google_slides_get_presentation("pres1"),
+            {
+                "error": {
+                    "code": 400,
+                    "message": "Request contains an invalid argument.",
+                    "status": "INVALID_ARGUMENT",
+                }
+            },
+            id="get_presentation-invalid-argument",
+        ),
+        # A request built by the caller can fail a precondition for reasons
+        # that have nothing to do with an Office file.
+        pytest.param(
+            lambda: google_slides.google_slides_batch_update(
+                "pres1", '[{"deleteObject": {"objectId": "shape1"}}]'
+            ),
+            {
+                "error": {
+                    "code": 400,
+                    "message": "Precondition check failed.",
+                    "status": "FAILED_PRECONDITION",
+                }
+            },
+            id="batch_update-failed-precondition",
+        ),
+    ],
+)
+def test_tools_keep_the_raw_error_for_another_400(monkeypatch, call, error_body):
+    presentations = Mock()
+    error = _http_error(400, error_body)
+    presentations.get.return_value.execute.side_effect = error
+    presentations.batchUpdate.return_value.execute.side_effect = error
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(call())
+
+    assert result["status"] == "error"
+    assert result["message"] == str(error)
 
 
 @pytest.mark.parametrize(

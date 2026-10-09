@@ -2508,12 +2508,15 @@ def test_resolve_google_file_id_explains_a_drive_file_link_to_an_editing_tool(
     )
 
 
-# The response the Docs, Sheets and Slides APIs give for an Office file
-# stored in Drive.
+# The response the Sheets API gives for an Excel file stored in Drive. The
+# Docs and Slides tools are checked against the same body.
 _OFFICE_FILE_400 = {
     "error": {
         "code": 400,
-        "message": "This operation is not supported for this document",
+        "message": (
+            "This operation is not supported for this document. The document "
+            "must not be an Office file."
+        ),
         "status": "FAILED_PRECONDITION",
     }
 }
@@ -2524,10 +2527,6 @@ _OFFICE_FILE_400 = {
     [
         pytest.param(_OFFICE_FILE_400["error"], id="status-and-message"),
         pytest.param(
-            {"message": "Precondition check failed.", "status": "FAILED_PRECONDITION"},
-            id="status-only",
-        ),
-        pytest.param(
             {"message": "This operation is not supported for this document."},
             id="message-only",
         ),
@@ -2536,12 +2535,15 @@ _OFFICE_FILE_400 = {
             id="message-only-other-case",
         ),
         pytest.param(
-            {"message": "Bad request.", "errors": [{"reason": "failedPrecondition"}]},
-            id="legacy-reason",
+            {
+                "message": "This operation is not supported for this document",
+                "status": "INVALID_ARGUMENT",
+            },
+            id="message-with-another-status",
         ),
     ],
 )
-def test_is_google_office_file_error_matches_the_status_or_the_message(error_body):
+def test_is_google_office_file_error_matches_the_message(error_body):
     error = _google_http_error(400, json.dumps({"error": error_body}).encode("utf-8"))
 
     assert utils.is_google_office_file_error(error)
@@ -2558,7 +2560,38 @@ def test_is_google_office_file_error_matches_the_status_or_the_message(error_bod
                 "status": "INVALID_ARGUMENT",
             },
         ),
+        # What the Docs and Slides APIs answer for the id of an Excel file:
+        # nothing in it says which file it is.
+        (
+            400,
+            {
+                "code": 400,
+                "message": "Request contains an invalid argument.",
+                "status": "INVALID_ARGUMENT",
+            },
+        ),
         (400, {"message": "Bad request.", "errors": [{"reason": "badRequest"}]}),
+        # FAILED_PRECONDITION alone does not mean an Office file: a batch
+        # update, whose requests the caller builds, can fail a precondition
+        # for other reasons.
+        pytest.param(
+            400,
+            {"message": "Precondition check failed.", "status": "FAILED_PRECONDITION"},
+            id="status-only",
+        ),
+        pytest.param(
+            400,
+            {"message": "Bad request.", "errors": [{"reason": "failedPrecondition"}]},
+            id="legacy-reason-only",
+        ),
+        pytest.param(
+            400,
+            {
+                "message": "Precondition check failed.",
+                "details": [{"reason": "FAILED_PRECONDITION"}],
+            },
+            id="details-reason-only",
+        ),
         # A body that is not Google-shaped, such as one from a proxy.
         (400, {"message": "Bad request.", "status": ["FAILED_PRECONDITION"]}),
         (404, _OFFICE_FILE_400["error"]),
@@ -2571,6 +2604,29 @@ def test_is_google_office_file_error_ignores_other_errors(status, error_body):
     )
 
     assert not utils.is_google_office_file_error(error)
+
+
+@pytest.mark.parametrize("editing", [False, True])
+def test_google_file_error_message_keeps_raw_error_for_another_failed_precondition(
+    editing,
+):
+    error = _google_http_error(
+        400,
+        json.dumps(
+            {
+                "error": {
+                    "code": 400,
+                    "message": "Precondition check failed.",
+                    "status": "FAILED_PRECONDITION",
+                    "errors": [{"reason": "failedPrecondition"}],
+                }
+            }
+        ).encode("utf-8"),
+    )
+
+    assert utils.google_file_error_message(
+        error, _TEST_FILE_KIND, editing=editing
+    ) == str(error)
 
 
 def test_google_file_error_message_keeps_raw_error_for_a_non_string_status():
@@ -2629,18 +2685,20 @@ def test_is_google_office_file_error_needs_a_google_http_error():
 _OFFICE_FILE_400_RESPONSES = [
     pytest.param(
         _OFFICE_FILE_400,
-        "HTTP 400 This operation is not supported for this document",
+        "HTTP 400 This operation is not supported for this document. The "
+        "document must not be an Office file.",
         id="status-and-message",
     ),
     pytest.param(
         {
             "error": {
                 "code": 400,
-                "message": "Bad request.",
+                "message": "This operation is not supported for this document",
                 "errors": [{"reason": "failedPrecondition"}],
             }
         },
-        "HTTP 400 Bad request. (reason: failedPrecondition)",
+        "HTTP 400 This operation is not supported for this document "
+        "(reason: failedPrecondition)",
         id="legacy-reason",
     ),
 ]

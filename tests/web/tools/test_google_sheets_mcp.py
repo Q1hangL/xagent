@@ -688,7 +688,10 @@ async def test_get_spreadsheet_description_says_drive_is_not_needed():
 _OFFICE_FILE_400 = {
     "error": {
         "code": 400,
-        "message": "This operation is not supported for this document",
+        "message": (
+            "This operation is not supported for this document. The document "
+            "must not be an Office file."
+        ),
         "status": "FAILED_PRECONDITION",
     }
 }
@@ -707,7 +710,7 @@ def _assert_explains_an_excel_file(message):
     assert "is a Google Docs or Google Slides file instead" in message
     assert message.endswith(
         "Google API response: HTTP 400 This operation is not supported for this "
-        "document"
+        "document. The document must not be an Office file."
     )
 
 
