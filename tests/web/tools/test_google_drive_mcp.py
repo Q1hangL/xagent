@@ -652,6 +652,30 @@ def test_search_validates_max_results_before_building_service(monkeypatch):
     get_service.assert_not_called()
 
 
+def _assert_open_by_link_and_office_file_hints(text):
+    # Native Google files open by link with their own connector, which may
+    # not be connected; uploaded Office files cannot be opened that way.
+    assert "ask the user for its link" in text
+    assert (
+        "if those tools are not available, ask the user to connect the matching "
+        "Google Docs, Google Sheets or Google Slides connector and then paste the "
+        "link." in text
+    )
+    assert "offer to create a new file" not in text
+    assert (
+        "Excel (.xlsx), Word (.docx), PowerPoint (.pptx) or PDF file, cannot be "
+        "opened with the Google Docs, Sheets or Slides tools" in text
+    )
+    assert "attach it to their message" in text
+    assert (
+        "save it as a Google file (for example File > Save as Google Sheets) and "
+        "paste the new file's link." in text
+    )
+    # The connectors use the user's own Google account, so the user only
+    # pastes the link; sharing the file is never needed.
+    assert "share the" not in text
+
+
 def test_search_explains_an_empty_result(monkeypatch):
     service = _mock_drive_service(monkeypatch)
     service.files.return_value.list.return_value.execute.return_value = {"files": []}
@@ -665,7 +689,7 @@ def test_search_explains_an_empty_result(monkeypatch):
     assert note.startswith("No files matched.")
     assert "per-file Drive access" in note
     assert "does not mean the file does not exist" in note
-    assert "ask the user for its link" in note
+    _assert_open_by_link_and_office_file_hints(note)
 
 
 def test_search_empty_page_with_next_page_token_says_more_may_exist(monkeypatch):
@@ -724,7 +748,7 @@ def test_get_file_content_explains_a_file_this_connection_cannot_see(
     text = result["message"]
     assert text.startswith("Google Drive could not open this file")
     assert "per-file Drive access" in text
-    assert "ask the user for its link" in text
+    _assert_open_by_link_and_office_file_hints(text)
     assert text.endswith(f"Google API response: HTTP {status} {message}")
 
 
@@ -764,6 +788,43 @@ def test_download_file_explains_a_file_this_connection_cannot_see(monkeypatch):
 
     assert result["status"] == "error"
     assert result["message"].startswith("Google Drive could not open this file")
+    _assert_open_by_link_and_office_file_hints(result["message"])
+
+
+async def test_read_tool_descriptions_say_how_to_read_office_files_and_sheets():
+    tools = {tool.name: tool for tool in await google_drive.mcp.list_tools()}
+
+    download = " ".join(tools["google_drive_download_file"].description.split())
+    assert (
+        "A downloaded Excel (.xlsx), Word (.docx) or PDF file can be read with "
+        "read_file, and a PowerPoint (.pptx) file with read_pptx" in download
+    )
+    # read_file picks its reader by the extension, and a file that is not
+    # exported gets none added, so a bare filename, or a Drive name without
+    # an extension, would be read as text. Only a path with no extension at
+    # all calls for another download: a .pptx, .xls or .png keeps its own.
+    assert (
+        "read_file chooses how to read a file by its extension, so the saved "
+        "name must keep the file's own extension (for example .xlsx, .docx or "
+        ".pdf). If the returned path has no extension at all (an uploaded file "
+        "whose Drive name has none), download the file again with a filename "
+        "that adds the extension of its returned mimeType (see filename)." in download
+    )
+    assert "must end in" not in download
+    assert (
+        "For any other file nothing is appended: the file is saved under the "
+        "filename, or its Drive name, as it is. So a filename given here must "
+        'keep the file\'s own extension (e.g. "report.xlsx", not "report"), and '
+        "a file whose Drive name has no extension needs a filename that adds "
+        "one." in download
+    )
+    content = " ".join(tools["google_drive_get_file_content"].description.split())
+    assert (
+        "A Google Sheets spreadsheet is exported as CSV by default, which holds "
+        "only its first sheet (tab); to read the other sheets, use the Google "
+        "Sheets tools if they are available, or export it to an Excel file with "
+        "google_drive_download_file." in content
+    )
 
 
 def test_create_file_resolves_parent_id_url_and_supports_shared_drives(monkeypatch):
@@ -3250,6 +3311,38 @@ def test_download_file_appends_extension_to_explicit_filename_missing_one(
 
     assert result["status"] == "success"
     assert result["path"] == str(tmp_path / "output" / "report.pdf")
+
+
+@pytest.mark.parametrize(
+    ("drive_name", "filename", "saved_name"),
+    [
+        pytest.param("Budget.xlsx", "report", "report", id="filename"),
+        pytest.param("Q3 Budget", "", "Q3 Budget", id="drive-name"),
+    ],
+)
+def test_download_file_adds_no_extension_to_an_uploaded_file(
+    monkeypatch, tmp_path, drive_name, filename, saved_name
+):
+    """Only an export gets an extension appended. An uploaded file is saved
+    under the filename, or its Drive name, as it is, which is why the
+    description says how to keep the extension that read_file needs."""
+    files = Mock()
+    files.get.return_value.execute.return_value = {
+        "id": "f1",
+        "name": drive_name,
+        "mimeType": (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+    }
+    _mock_drive_service_with_files(monkeypatch, files)
+    _patch_downloader(monkeypatch, b"PK-fake-xlsx")
+
+    result = json.loads(
+        google_drive.google_drive_download_file("f1", filename=filename)
+    )
+
+    assert result["status"] == "success"
+    assert result["path"] == str(tmp_path / "output" / saved_name)
 
 
 def test_download_file_does_not_double_extension_on_case_mismatch(

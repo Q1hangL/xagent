@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ...core.tools.adapters.vibe.connector_runtime import (
+    ConnectorRef,
     ConnectorRuntimeError,
     validate_runtime_config_declaration,
 )
@@ -22,6 +23,12 @@ from ..auth_dependencies import get_current_user
 from ..models.custom_api import CustomApi, UserCustomApi
 from ..models.database import get_db
 from ..models.user import User
+from ..services.connector_name_policy import (
+    folded_name_conflict_detail,
+    has_folded_connector_name_conflict,
+    has_unfoldable_edge_whitespace,
+    unfoldable_edge_whitespace_detail,
+)
 
 if TYPE_CHECKING:
     from ..services.connector_team_scope import ConnectorAccess
@@ -234,6 +241,16 @@ async def create_custom_api(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Custom API with name '{api_data.name}' already exists",
+        )
+    if has_unfoldable_edge_whitespace(api_data.name):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=unfoldable_edge_whitespace_detail(),
+        )
+    if has_folded_connector_name_conflict(db, api_data.name):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=folded_name_conflict_detail(api_data.name),
         )
 
     # A masked value is a same-key retention token, never a transferable secret.
@@ -743,6 +760,20 @@ def update_custom_api(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Custom API with name '{api_data.name}' already exists",
+            )
+        if has_unfoldable_edge_whitespace(api_data.name):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=unfoldable_edge_whitespace_detail(),
+            )
+        if has_folded_connector_name_conflict(
+            db,
+            api_data.name,
+            exclude=ConnectorRef("custom_api", int(api.id)),
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=folded_name_conflict_detail(api_data.name),
             )
         api.name = api_data.name
 

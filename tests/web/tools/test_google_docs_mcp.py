@@ -355,3 +355,338 @@ async def test_get_document_description_says_drive_is_not_needed():
     assert "otherwise, or if it finds nothing, ask the user to paste the link" in (
         description
     )
+
+
+# The Sheets API's Office-file 400 (its first sentence). The Docs tools
+# use the same check, in case the Docs API answers a Word file
+# stored in Drive the same way.
+_OFFICE_FILE_400 = {
+    "error": {
+        "code": 400,
+        "message": "This operation is not supported for this document",
+        "status": "FAILED_PRECONDITION",
+    }
+}
+
+
+# Every Docs tool that opens an existing document, with the request that gets
+# the 400: an editing tool must pass editing=True to the error message too,
+# not only to the id resolver.
+@pytest.mark.parametrize(
+    ("call", "request_of", "editing"),
+    [
+        pytest.param(
+            lambda: google_docs.google_docs_get_document("doc123"),
+            lambda documents: documents.get,
+            False,
+            id="get_document",
+        ),
+        pytest.param(
+            lambda: google_docs.google_docs_append_text("doc123", "more"),
+            lambda documents: documents.get,
+            True,
+            id="append_text",
+        ),
+        pytest.param(
+            lambda: google_docs.google_docs_replace_text("doc123", "a", "b"),
+            lambda documents: documents.batchUpdate,
+            True,
+            id="replace_text",
+        ),
+        pytest.param(
+            lambda: google_docs.google_docs_batch_update(
+                "doc123", '[{"insertText": {"location": {"index": 1}, "text": "x"}}]'
+            ),
+            lambda documents: documents.batchUpdate,
+            True,
+            id="batch_update",
+        ),
+    ],
+)
+def test_tools_explain_a_word_file_stored_in_drive(
+    monkeypatch, call, request_of, editing
+):
+    service, _ = _mock_docs_service(monkeypatch)
+    request = request_of(service.documents.return_value)
+    request.return_value.execute.side_effect = _http_error(400, _OFFICE_FILE_400)
+
+    result = json.loads(call())
+
+    assert result["status"] == "error"
+    assert request.call_args.kwargs["documentId"] == "doc123"
+    message = result["message"]
+    # Google Docs itself opens the file in Office compatibility mode; only
+    # its API cannot.
+    assert message.startswith(
+        "The Google Docs tools cannot open this file: it is most likely a Word "
+        "file (.docx) stored in Google Drive rather than a Google Docs document. "
+        "Google Docs can open such a file in Office compatibility mode"
+    )
+    assert "File > Save as Google Docs" in message
+    assert "is a Google Sheets or Google Slides file instead" in message
+    # A tool that changes the file is not sent to read a downloaded copy, and
+    # is told that saving as a Google Doc makes a new copy.
+    assert ("read the downloaded copy with read_file" in message) is not editing
+    assert ("To make this change with these tools" in message) is editing
+    assert (
+        "this creates a new document: the change will be made in that copy" in message
+    ) is editing
+    assert message.endswith(
+        "Google API response: HTTP 400 This operation is not supported for this "
+        "document"
+    )
+
+
+@pytest.mark.parametrize(
+    ("call", "error_body"),
+    [
+        # The Docs API answers the id of an Excel file with a 400 that says
+        # nothing about the file.
+        pytest.param(
+            lambda: google_docs.google_docs_get_document("doc123"),
+            {
+                "error": {
+                    "code": 400,
+                    "message": "Request contains an invalid argument.",
+                    "status": "INVALID_ARGUMENT",
+                }
+            },
+            id="get_document-invalid-argument",
+        ),
+        # A request built by the caller can fail a precondition for reasons
+        # that have nothing to do with an Office file.
+        pytest.param(
+            lambda: google_docs.google_docs_batch_update(
+                "doc123", '[{"deleteContentRange": {}}]'
+            ),
+            {
+                "error": {
+                    "code": 400,
+                    "message": "Precondition check failed.",
+                    "status": "FAILED_PRECONDITION",
+                }
+            },
+            id="batch_update-failed-precondition",
+        ),
+    ],
+)
+def test_tools_keep_the_raw_error_for_another_400(monkeypatch, call, error_body):
+    service, _ = _mock_docs_service(monkeypatch)
+    error = _http_error(400, error_body)
+    documents = service.documents.return_value
+    documents.get.return_value.execute.side_effect = error
+    documents.batchUpdate.return_value.execute.side_effect = error
+
+    result = json.loads(call())
+
+    assert result["status"] == "error"
+    assert result["message"] == str(error)
+
+
+@pytest.mark.parametrize(
+    ("call", "editing"),
+    [
+        pytest.param(google_docs.google_docs_get_document, False, id="get_document"),
+        pytest.param(
+            lambda doc: google_docs.google_docs_append_text(doc, "more"),
+            True,
+            id="append_text",
+        ),
+        pytest.param(
+            lambda doc: google_docs.google_docs_replace_text(doc, "a", "b"),
+            True,
+            id="replace_text",
+        ),
+        pytest.param(
+            lambda doc: google_docs.google_docs_batch_update(doc, "[]"),
+            True,
+            id="batch_update",
+        ),
+    ],
+)
+def test_tools_give_their_own_next_steps_for_a_drive_file_link(
+    monkeypatch, call, editing
+):
+    _, get_service = _mock_docs_service(monkeypatch)
+
+    result = json.loads(call("https://drive.google.com/file/d/doc123/view"))
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert "is a Google Drive file link, not a Google Docs link" in message
+    assert "File > Save as Google Docs" in message
+    # A tool that changes the file is not sent to read a downloaded copy, and
+    # is told that saving as a Google Doc makes a new copy.
+    assert ("read the downloaded copy with read_file" in message) is not editing
+    assert (
+        "this creates a new document: the change will be made in that copy" in message
+    ) is editing
+    get_service.assert_not_called()
+
+
+# A 400 whose message names a cause is about the request, so it keeps the
+# raw error for an id taken from a Drive open?id= or uc?id= link too.
+@pytest.mark.parametrize(
+    "link",
+    [
+        "https://drive.google.com/open?id=doc123",
+        "https://drive.google.com/uc?export=download&id=doc123",
+    ],
+)
+@pytest.mark.parametrize(
+    ("call", "error_body"),
+    [
+        pytest.param(
+            lambda doc: google_docs.google_docs_batch_update(
+                doc, '[{"deleteContentRange": {}}]'
+            ),
+            {
+                "error": {
+                    "code": 400,
+                    "message": "Precondition check failed.",
+                    "status": "FAILED_PRECONDITION",
+                }
+            },
+            id="batch_update-failed-precondition",
+        ),
+        pytest.param(
+            lambda doc: google_docs.google_docs_replace_text(doc, "", "b"),
+            {
+                "error": {
+                    "code": 400,
+                    "message": (
+                        "Invalid requests[0].replaceAllText: The containsText "
+                        "text must not be empty."
+                    ),
+                    "status": "INVALID_ARGUMENT",
+                }
+            },
+            id="replace_text-request-field",
+        ),
+    ],
+)
+def test_tools_keep_the_raw_error_for_a_400_with_a_cause_for_a_drive_open_or_uc_link(
+    monkeypatch, link, call, error_body
+):
+    service, _ = _mock_docs_service(monkeypatch)
+    error = _http_error(400, error_body)
+    batch_update = service.documents.return_value.batchUpdate
+    batch_update.return_value.execute.side_effect = error
+
+    result = json.loads(call(link))
+
+    assert result["status"] == "error"
+    assert batch_update.call_args.kwargs["documentId"] == "doc123"
+    assert result["message"] == str(error)
+
+
+# A Drive open?id= or uc?id= link can name a native document or an uploaded
+# file, so its id goes to the API. The Docs API answers the id of an
+# uploaded file (an Excel file, at least) with a 400 that does not name the
+# cause, so every tool must pass its own argument to the error message, which
+# then adds the next steps for an uploaded file.
+@pytest.mark.parametrize(
+    "link",
+    [
+        "https://drive.google.com/open?id=doc123",
+        "https://drive.google.com/uc?export=download&id=doc123",
+    ],
+)
+@pytest.mark.parametrize(
+    ("call", "request_of", "editing"),
+    [
+        pytest.param(
+            google_docs.google_docs_get_document,
+            lambda documents: documents.get,
+            False,
+            id="get_document",
+        ),
+        pytest.param(
+            lambda doc: google_docs.google_docs_append_text(doc, "more"),
+            lambda documents: documents.get,
+            True,
+            id="append_text",
+        ),
+        pytest.param(
+            lambda doc: google_docs.google_docs_replace_text(doc, "a", "b"),
+            lambda documents: documents.batchUpdate,
+            True,
+            id="replace_text",
+        ),
+        pytest.param(
+            lambda doc: google_docs.google_docs_batch_update(
+                doc, '[{"insertText": {"location": {"index": 1}, "text": "x"}}]'
+            ),
+            lambda documents: documents.batchUpdate,
+            True,
+            id="batch_update",
+        ),
+    ],
+)
+def test_tools_add_next_steps_to_a_400_for_a_drive_open_or_uc_link(
+    monkeypatch, link, call, request_of, editing
+):
+    service, _ = _mock_docs_service(monkeypatch)
+    request = request_of(service.documents.return_value)
+    request.return_value.execute.side_effect = _http_error(
+        400,
+        {
+            "error": {
+                "code": 400,
+                "message": "Request contains an invalid argument.",
+                "status": "INVALID_ARGUMENT",
+            }
+        },
+    )
+
+    result = json.loads(call(link))
+
+    assert result["status"] == "error"
+    assert request.call_args.kwargs["documentId"] == "doc123"
+    message = result["message"]
+    assert message.startswith(
+        "Google Docs rejected this request (Google API response: HTTP 400 "
+        "Request contains an invalid argument.). The document id was taken "
+        "from a Google Drive link"
+    )
+    assert "File > Save as Google Docs" in message
+    assert ("read the downloaded copy with read_file" in message) is not editing
+    assert ("To make this change with these tools" in message) is editing
+    assert message.endswith("the error is about the request itself.")
+
+
+# Once a tool has read the document, it is a Google Doc whatever link named
+# it, so a 400 for the tool's later request keeps Google's own error, even
+# one that names no cause.
+@pytest.mark.parametrize(
+    "link",
+    [
+        "https://drive.google.com/open?id=doc123",
+        "https://drive.google.com/uc?export=download&id=doc123",
+    ],
+)
+def test_append_text_keeps_the_raw_400_after_the_document_opened(monkeypatch, link):
+    service, _ = _mock_docs_service(monkeypatch)
+    documents = service.documents.return_value
+    documents.get.return_value.execute.return_value = {
+        "documentId": "doc123",
+        "body": {"content": [{"endIndex": 5}]},
+    }
+    error = _http_error(
+        400,
+        {
+            "error": {
+                "code": 400,
+                "message": "Request contains an invalid argument.",
+                "status": "INVALID_ARGUMENT",
+            }
+        },
+    )
+    documents.batchUpdate.return_value.execute.side_effect = error
+
+    result = json.loads(google_docs.google_docs_append_text(link, "more"))
+
+    assert result["status"] == "error"
+    assert documents.get.call_args.kwargs["documentId"] == "doc123"
+    assert documents.batchUpdate.call_args.kwargs["documentId"] == "doc123"
+    assert result["message"] == str(error)

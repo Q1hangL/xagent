@@ -110,6 +110,7 @@ on:
       - 'tests/web/services/test_task_settlement_locking.py'
       - 'src/xagent/web/services/task_auto_recovery.py'
       - 'tests/web/services/test_task_lease_expiry_interruption.py'
+      - 'tests/web/services/test_persistence_failure_pause.py'
       - 'tests/web/services/test_task_execution_event_store.py'
       - 'tests/web/services/task_database_shared.py'
       - 'src/xagent/web/services/chat_history_service.py'
@@ -315,6 +316,7 @@ jobs:
             tests/web/services/test_task_settlement_locking.py
             src/xagent/web/services/task_auto_recovery.py
             tests/web/services/test_task_lease_expiry_interruption.py
+            tests/web/services/test_persistence_failure_pause.py
             tests/web/services/test_task_execution_event_store.py
             tests/web/services/task_database_shared.py
             src/xagent/web/services/chat_history_service.py
@@ -635,6 +637,13 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/services/test_task_lease_expiry_interruption.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test persistence-failure pause settlement (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_persistence_failure_pause.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

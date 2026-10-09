@@ -3073,7 +3073,9 @@ def test_upload_file_returns_error_payload_on_api_failure(
     result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
 
     assert result["status"] == "error"
-    assert "boom" in result["message"]
+    assert "HTTP 500" in result["message"]
+    # The response body is never forwarded; it may carry a preauthenticated URL.
+    assert "boom" not in result["message"]
 
 
 def test_upload_file_requires_completed_item_confirmation(

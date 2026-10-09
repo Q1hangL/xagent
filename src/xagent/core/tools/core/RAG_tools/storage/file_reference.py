@@ -170,8 +170,8 @@ def guard_document_upsert(operation: _Operation) -> _Operation:
 
 def guard_document_restore(operation: _Operation) -> _Operation:
     @wraps(operation)
-    def restore(self: Any, snapshot: Any, **kwargs: Any) -> None:
+    def restore(self: Any, snapshot: Any, **kwargs: Any) -> Any:
         with protect_file_references(snapshot.rows_by_table.get("documents", [])):
-            operation(self, snapshot, **kwargs)
+            return operation(self, snapshot, **kwargs)
 
     return cast(_Operation, restore)

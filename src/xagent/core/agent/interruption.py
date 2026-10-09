@@ -129,6 +129,16 @@ def _is_database_unavailable(error: BaseException) -> bool:
     return isinstance(error, sa_exc.TimeoutError)
 
 
+def is_database_unavailable(error: BaseException) -> bool:
+    """Whether ``error`` or its explicit ``__cause__`` chain is a database
+    connectivity failure -- the kind that a later attempt can get past.
+
+    Settling code uses it to tell a transient read failure (worth deferring)
+    from a fault that would reproduce on every attempt.
+    """
+    return any(_is_database_unavailable(link) for link in _cause_chain(error))
+
+
 def _is_llm_unavailable(error: BaseException) -> bool:
     if isinstance(error, Exception) and retry_on(error):
         return True

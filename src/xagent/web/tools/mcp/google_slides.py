@@ -45,6 +45,8 @@ _PRESENTATION_KIND = GoogleFileKind(
     noun="presentation",
     link_example="https://docs.google.com/presentation/d/...",
     create_tool="google_slides_create_presentation",
+    office_file="a PowerPoint file (.pptx)",
+    office_reader="read_pptx",
 )
 _PPTX_MIME_TYPE = (
     "application/vnd.openxmlformats-officedocument.presentationml.presentation"
@@ -196,8 +198,26 @@ def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
 
 
-def _presentation_error(exc: Exception, *, editing: bool = False) -> str:
-    return _error(google_file_error_message(exc, _PRESENTATION_KIND, editing=editing))
+def _presentation_error(
+    exc: Exception,
+    presentation_id: str,
+    *,
+    editing: bool = False,
+    opened: bool = False,
+) -> str:
+    """``presentation_id`` is the tool's own argument, before it was resolved.
+
+    Pass ``opened=True`` once the tool has read the presentation: it is then
+    a Google Slides presentation, whatever link named it, so a 400 for a
+    later request is about that request and keeps Google's own error."""
+    return _error(
+        google_file_error_message(
+            exc,
+            _PRESENTATION_KIND,
+            editing=editing,
+            file_link_or_id=None if opened else presentation_id,
+        )
+    )
 
 
 def _delete_imported_presentation(drive_service: Any, presentation_id: str) -> bool:
@@ -494,13 +514,16 @@ def _record_created_default_slide(presentation_id: str, slide_id: str) -> None:
     _CREATED_DEFAULT_SLIDES[presentation_id] = slide_id
 
 
-def _resolve_presentation_id(presentation_id: str) -> str:
-    """Accept either a bare presentation id or a full Google Slides URL."""
+def _resolve_presentation_id(presentation_id: str, *, editing: bool = False) -> str:
+    """Accept either a bare presentation id or a full Google Slides URL.
+
+    Pass ``editing=True`` from a tool that changes the presentation."""
     return resolve_google_file_id(
         presentation_id,
         _PRESENTATION_URL_ID_PATTERN,
         "presentation_id",
         _PRESENTATION_KIND,
+        editing=editing,
     )
 
 
@@ -670,7 +693,7 @@ def google_slides_get_presentation(presentation_id: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error getting presentation: {e}")
-        return _presentation_error(e)
+        return _presentation_error(e, presentation_id)
 
 
 @mcp.tool()
@@ -1031,6 +1054,7 @@ def google_slides_add_slide(
     title/body text and confirm it matches what you intended (e.g. against
     the user's outline) before telling the user the deck is done.
     """
+    opened = False
     try:
         if not isinstance(layout, str):
             return _error(f"'layout' must be a string, got {type(layout).__name__}.")
@@ -1084,7 +1108,7 @@ def google_slides_add_slide(
                 "empty slide."
             )
 
-        pres_id = _resolve_presentation_id(presentation_id)
+        pres_id = _resolve_presentation_id(presentation_id, editing=True)
         service = get_slides_service()
 
         tracked_default_slide_id = _CREATED_DEFAULT_SLIDES.get(pres_id)
@@ -1111,6 +1135,7 @@ def google_slides_add_slide(
         existing: dict[str, Any] = {"slides": []}
         if candidate_default_slide_id or not preserve_blank_slide:
             existing = service.presentations().get(presentationId=pres_id).execute()
+            opened = True
         slide_to_remove = None
         existing_slides = existing.get("slides", [])
         if not preserve_blank_slide:
@@ -1210,7 +1235,7 @@ def google_slides_add_slide(
         )
     except Exception as e:
         logger.error(f"Error adding slide: {e}")
-        return _presentation_error(e, editing=True)
+        return _presentation_error(e, presentation_id, editing=True, opened=opened)
 
 
 @mcp.tool()
@@ -1233,6 +1258,7 @@ def google_slides_update_slide(
     lines stripped) when the slide's body placeholder is a real "BODY"
     type, not a plain "SUBTITLE".
     """
+    opened = False
     try:
         if not title and not body:
             return _error("Provide at least one of 'title' or 'body' to update.")
@@ -1245,9 +1271,10 @@ def google_slides_update_slide(
         if body and not body.strip():
             return _error("'body' is whitespace-only; provide real text or omit it.")
 
-        pres_id = _resolve_presentation_id(presentation_id)
+        pres_id = _resolve_presentation_id(presentation_id, editing=True)
         service = get_slides_service()
         presentation = service.presentations().get(presentationId=pres_id).execute()
+        opened = True
 
         slide = _find_slide(presentation, slide_id)
         if slide is None:
@@ -1321,7 +1348,7 @@ def google_slides_update_slide(
         )
     except Exception as e:
         logger.error(f"Error updating slide: {e}")
-        return _presentation_error(e, editing=True)
+        return _presentation_error(e, presentation_id, editing=True, opened=opened)
 
 
 @mcp.tool()
@@ -1332,10 +1359,12 @@ def google_slides_delete_slide(presentation_id: str, slide_id: str) -> str:
     by calling google_slides_add_slide a second time instead of using
     google_slides_update_slide to fix the original.
     """
+    opened = False
     try:
-        pres_id = _resolve_presentation_id(presentation_id)
+        pres_id = _resolve_presentation_id(presentation_id, editing=True)
         service = get_slides_service()
         presentation = service.presentations().get(presentationId=pres_id).execute()
+        opened = True
 
         if _find_slide(presentation, slide_id) is None:
             return _error(
@@ -1359,7 +1388,7 @@ def google_slides_delete_slide(presentation_id: str, slide_id: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error deleting slide: {e}")
-        return _presentation_error(e, editing=True)
+        return _presentation_error(e, presentation_id, editing=True, opened=opened)
 
 
 @mcp.tool()
@@ -1374,7 +1403,7 @@ def google_slides_batch_update(presentation_id: str, requests_json: str) -> str:
     first content slide; this tool cannot infer that id from a later session.
     """
     try:
-        pres_id = _resolve_presentation_id(presentation_id)
+        pres_id = _resolve_presentation_id(presentation_id, editing=True)
         requests = json.loads(requests_json)
         if not isinstance(requests, list):
             raise ValueError("requests_json must be a JSON array of request objects")
@@ -1396,7 +1425,7 @@ def google_slides_batch_update(presentation_id: str, requests_json: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error applying batch update: {e}")
-        return _presentation_error(e, editing=True)
+        return _presentation_error(e, presentation_id, editing=True)
 
 
 if __name__ == "__main__":

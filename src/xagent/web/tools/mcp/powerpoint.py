@@ -8,7 +8,7 @@ import zipfile
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import quote
 
 import requests
@@ -16,6 +16,7 @@ from mcp.server.fastmcp import FastMCP
 from pptx import Presentation
 from pptx.oxml.ns import qn
 from pptx.presentation import Presentation as PresentationType
+from pydantic import Field
 
 from ....config import get_tool_max_output_length
 from ....core.tools.core.file_analysis import iter_pptx_shapes
@@ -35,6 +36,28 @@ DEFAULT_TIMEOUT_SECONDS = 30
 # this module's download and upload can each move up to
 # _MAX_PRESENTATION_BYTES.
 _BINARY_TIMEOUT_SECONDS = 120
+
+# Appended to a 404 from the presentation lookup. In #2875 the agent guessed a
+# "Documents/" folder and then passed its own workspace path here, so it
+# never got an eTag and fell back to editing a local copy.
+_PATH_NOT_FOUND_HINT = (
+    "No presentation exists at this file_path. It is relative to the drive "
+    "root (the user's OneDrive, or the drive named by site_id/drive_id), not a "
+    "local task-workspace path. List the parent folder with whichever "
+    "connector is enabled to get the exact path: onedrive_list_items for the "
+    "user's OneDrive, or sharepoint_list_items for a site drive. If site_id or "
+    "drive_id is set, check that it names the intended drive."
+)
+_PresentationPath = Annotated[
+    str,
+    Field(
+        description=(
+            "Path of the .pptx relative to the drive root, e.g. 'Reports/Q3.pptx'; "
+            "not a local task-workspace path. The drive is the user's OneDrive "
+            "unless site_id or drive_id is given."
+        )
+    ),
+]
 
 _POWERPOINT_MIME_TYPE = (
     "application/vnd.openxmlformats-officedocument.presentationml.presentation"
@@ -75,11 +98,14 @@ _DEFAULT_SLIDE_LAYOUT_INDEX = 1
 
 
 class _GraphRequestError(RuntimeError):
-    """Graph HTTP failure that retains its status without response parsing."""
+    """Graph HTTP failure that keeps its status and parsed Graph error code."""
 
-    def __init__(self, message: str, *, status_code: int) -> None:
+    def __init__(
+        self, message: str, *, status_code: int, code: str | None = None
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.code = code
 
 
 class _ConflictError(RuntimeError):
@@ -357,9 +383,13 @@ def _graph_request(
             code = error.get("code") if isinstance(error, dict) else None
         except (ValueError, TypeError):
             code = None
-        if isinstance(code, str) and code:
+        if not isinstance(code, str) or not code:
+            code = None
+        if code:
             message = f"{message} ({code})"
-        raise _GraphRequestError(message, status_code=response.status_code) from None
+        raise _GraphRequestError(
+            message, status_code=response.status_code, code=code
+        ) from None
 
     if response.status_code == 204 or not response.content:
         return {}
@@ -465,11 +495,22 @@ def _require_etag(value: Any, field_name: str = "expected_etag") -> str:
 def _presentation_metadata(
     file_path: str, site_id: str | None, drive_id: str | None
 ) -> dict[str, Any]:
-    item = _graph_request(
-        "GET",
-        _item_path(file_path, site_id, drive_id),
-        params={"$select": "id,size,eTag,parentReference,@microsoft.graph.downloadUrl"},
-    )
+    try:
+        item = _graph_request(
+            "GET",
+            _item_path(file_path, site_id, drive_id),
+            params={
+                "$select": "id,size,eTag,parentReference,@microsoft.graph.downloadUrl"
+            },
+        )
+    except _GraphRequestError as exc:
+        # itemNotFound, or no parsable code: the item is missing. Any other
+        # 404 code (e.g. the drive itself) is not a wrong file_path.
+        if exc.status_code == 404 and exc.code in (None, "itemNotFound"):
+            raise _GraphRequestError(
+                f"{exc}. {_PATH_NOT_FOUND_HINT}", status_code=404, code=exc.code
+            ) from None
+        raise
     if not isinstance(item, dict) or not item.get("id"):
         raise RuntimeError("Graph did not return presentation metadata")
     size = item.get("size")
@@ -1167,7 +1208,9 @@ def _delete_slide(presentation: PresentationType, slide_index: int) -> None:
 
 @mcp.tool()
 def powerpoint_create_presentation(
-    file_path: str, site_id: str | None = None, drive_id: str | None = None
+    file_path: _PresentationPath,
+    site_id: str | None = None,
+    drive_id: str | None = None,
 ) -> str:
     """Create a new, blank PowerPoint presentation at file_path. Fails if a
     file already exists there -- edit it with the other powerpoint_* tools
@@ -1186,7 +1229,7 @@ def powerpoint_create_presentation(
 
 @mcp.tool()
 def powerpoint_get_presentation_text(
-    file_path: str,
+    file_path: _PresentationPath,
     site_id: str | None = None,
     drive_id: str | None = None,
     cursor: str | None = None,
@@ -1236,7 +1279,7 @@ def powerpoint_get_presentation_text(
 
 @mcp.tool()
 def powerpoint_list_slides(
-    file_path: str,
+    file_path: _PresentationPath,
     site_id: str | None = None,
     drive_id: str | None = None,
     cursor: str | None = None,
@@ -1283,7 +1326,7 @@ def powerpoint_list_slides(
 
 @mcp.tool()
 def powerpoint_get_slide_text(
-    file_path: str,
+    file_path: _PresentationPath,
     slide_index: int,
     site_id: str | None = None,
     drive_id: str | None = None,
@@ -1338,7 +1381,7 @@ def powerpoint_get_slide_text(
 
 @mcp.tool()
 def powerpoint_set_shape_text(
-    file_path: str,
+    file_path: _PresentationPath,
     slide_index: int,
     shape_index: int,
     text: str,
@@ -1416,7 +1459,7 @@ def powerpoint_set_shape_text(
 
 @mcp.tool()
 def powerpoint_add_slide(
-    file_path: str,
+    file_path: _PresentationPath,
     expected_etag: str,
     title: str | None = None,
     body_text: str | None = None,
@@ -1494,7 +1537,7 @@ def powerpoint_add_slide(
 
 @mcp.tool()
 def powerpoint_list_slide_layouts(
-    file_path: str,
+    file_path: _PresentationPath,
     site_id: str | None = None,
     drive_id: str | None = None,
     cursor: str | None = None,
@@ -1540,7 +1583,7 @@ def powerpoint_list_slide_layouts(
 
 @mcp.tool()
 def powerpoint_delete_slide(
-    file_path: str,
+    file_path: _PresentationPath,
     slide_index: int,
     expected_etag: str,
     site_id: str | None = None,

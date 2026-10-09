@@ -48,6 +48,7 @@ from ...config import (
     get_session_secret,
 )
 from ...core.tools.adapters.vibe.connector_runtime import (
+    ConnectorRef,
     validate_runtime_config_declaration,
 )
 from ...core.tools.core.mcp.data_config import MCPServerConfig
@@ -77,6 +78,10 @@ from ..models.mcp_oauth import (
 from ..models.public_mcp import PublicMCPApp
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
+from ..services.connector_name_policy import (
+    folded_name_conflict_detail,
+    has_folded_connector_name_conflict,
+)
 from ..services.google_picker import get_google_picker_config
 from ..services.mcp_oauth import (
     MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
@@ -4308,6 +4313,12 @@ def create_mcp_server(
                 detail=f"Invalid configuration: {str(e)}",
             )
 
+        if has_folded_connector_name_conflict(db, server_data.name):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=folded_name_conflict_detail(server_data.name),
+            )
+
         # Add server using manager
         manager.add_server(config)
 
@@ -4645,6 +4656,15 @@ def update_mcp_server(
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"MCP server '{server_data.name}' already exists",
+                )
+            if has_folded_connector_name_conflict(
+                db,
+                server_data.name,
+                exclude=ConnectorRef("mcp", int(server_id)),
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=folded_name_conflict_detail(server_data.name),
                 )
 
         if writes_definition_row:

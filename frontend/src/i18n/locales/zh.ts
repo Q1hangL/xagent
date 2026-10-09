@@ -27,6 +27,7 @@ const zh = {
     taskAccessDenied: "你无权访问此任务。",
     invalidMessage: "消息格式无效。",
     messageOutcomeUnknown: "该消息是否已成功发送尚不确定，请先查看对话内容后再决定是否重新发送。",
+    externalTurnInterrupted: "此回答已被中断。",
     uploadTooLarge: "文件过大，请减小上传大小后重试。",
     uploadProxyError: "上传请求未到达应用，请检查服务器的上传大小限制。",
     uploadFailed: "上传失败，请重试。",
@@ -1273,6 +1274,7 @@ const zh = {
         deleteService: "删除服务",
         deleteSuccess: "已成功删除 {name}",
         deleteFailed: "删除 {name} 失败",
+        deleteConfirm: "确定要移除 {name} 吗？",
         fetchFailed: "获取 MCP 应用失败",
         fetchError: "获取 MCP 应用时发生错误",
         customApiDetailFetchError: "无法加载已保存的 Custom API 配置",
@@ -1389,6 +1391,7 @@ const zh = {
         update: "更新",
         create: "创建",
         save: "保存",
+        delete: "删除",
       },
       empty: {
         title: "暂无 MCP 服务器配置",

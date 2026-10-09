@@ -10,7 +10,9 @@ surface needs.
   - The visitor has no other channel to learn the turn ended, so the core
     broadcasts the terminal event itself once its finalize commits. The
     settlement path in ``task_orchestrator`` broadcasts only for setup/run
-    errors, never for a cancellation.
+    errors, never for a cancellation. The event carries the
+    ``external_turn_interrupted`` client error code beside its sentence, so
+    a client that does not render server prose still names the outcome.
   - The wait for the running coroutine is longer than the A2A one, because
     the external turn's finalize races the settlement that the cancelled
     coroutine is about to perform. See ``EXTERNAL_CANCEL_WAIT_SECONDS``.
@@ -459,6 +461,12 @@ def _finalize_external_cancel_sync(
 async def _broadcast_external_cancel_terminal_event(
     task_id: int, terminal_event_state: dict[str, Any]
 ) -> None:
+    """Broadcast the interruption frame for a cancel target already FAILED.
+
+    Call it only once the exact cancel target is FAILED with one of the
+    sentences this module persists; the frame asserts the interruption code.
+    """
+    from .client_error_messages import ClientErrorCode
     from .task_event_display import publish_task_result
     from .task_execution import create_terminal_task_error_event
 
@@ -466,7 +474,9 @@ async def _broadcast_external_cancel_terminal_event(
         await publish_task_result(
             {
                 **create_terminal_task_error_event(
-                    task_id, EXTERNAL_TURN_INTERRUPTED_MESSAGE
+                    task_id,
+                    EXTERNAL_TURN_INTERRUPTED_MESSAGE,
+                    asserted_code=ClientErrorCode.EXTERNAL_TURN_INTERRUPTED,
                 ),
                 **terminal_event_state,
             },

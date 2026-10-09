@@ -608,13 +608,19 @@ def run_has_unknown_tool_effect(db: Session, lease: TaskLease) -> bool:
         raise
     if verdict is not CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT:
         return False
+    log_unknown_tool_effect_settlement(lease.task_id, lease.run_id)
+    return True
+
+
+def log_unknown_tool_effect_settlement(task_id: int, run_id: str | None) -> None:
+    """The operator signal of a run settled as an unknown tool effect."""
+
     logger.warning(
         "Task %s run %s settles as an unknown tool effect (verdict %s)",
-        lease.task_id,
-        lease.run_id,
-        verdict.value,
+        task_id,
+        run_id,
+        CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT.value,
     )
-    return True
 
 
 def resolve_checkpoint_recovery_with_data(
@@ -1476,6 +1482,40 @@ def fail_and_release_task_lease_no_commit(
                 "state_version": func.coalesce(Task.state_version, 0) + 1,
                 "error_message": error_message,
                 "output": None,
+                **task_settlement_ownership_values(
+                    lease.task_id, last_heartbeat_at=utc_now()
+                ),
+            }
+        )
+    )
+    result = db.execute(stmt.execution_options(synchronize_session=False))
+    return _rowcount(result) == 1
+
+
+def pause_and_release_task_lease_no_commit(db: Session, lease: TaskLease) -> bool:
+    """Atomically pause and release the exact live lease without committing.
+
+    The PAUSED counterpart of ``fail_and_release_task_lease_no_commit`` for a
+    run interrupted by an infrastructure failure: same fence, same ownership
+    release, but the row rests PAUSED with no error and keeps ``output``, as
+    lease recovery leaves a recoverable run. The caller owns the transaction.
+    """
+    if lease.run_id is None:
+        return False
+
+    stmt = (
+        update(Task)
+        .where(Task.id == lease.task_id)
+        .where(Task.runner_id == lease.runner_id)
+        .where(task_lease_attempt_predicate(lease))
+        .where(Task.run_id == lease.run_id)
+        .where(task_status_predicate.eq(TaskStatus.RUNNING))
+        .values(
+            {
+                "status": task_status_predicate.value(TaskStatus.PAUSED),
+                "control_state": control_state_for_status(TaskStatus.PAUSED).value,
+                "state_version": func.coalesce(Task.state_version, 0) + 1,
+                "error_message": None,
                 **task_settlement_ownership_values(
                     lease.task_id, last_heartbeat_at=utc_now()
                 ),

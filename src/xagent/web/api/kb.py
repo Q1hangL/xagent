@@ -13,11 +13,12 @@ import shutil
 import threading
 import unicodedata
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
     Any,
     Callable,
+    Collection,
     Dict,
     List,
     Literal,
@@ -52,6 +53,7 @@ from ...config import (
 )
 from ...core.file_storage.keys import build_upload_storage_key
 from ...core.tools.core.RAG_tools.core.config import DEFAULT_VECTOR_STORE_SCAN_LIMIT
+from ...core.tools.core.RAG_tools.core.exceptions import DatabaseOperationError
 from ...core.tools.core.RAG_tools.core.parser_registry import (
     get_supported_parsers,
     validate_parser_compatibility,
@@ -79,6 +81,7 @@ from ...core.tools.core.RAG_tools.kb import (
     KBApiOperationResult,
     get_kb_coordinator,
 )
+from ...core.tools.core.RAG_tools.kb.collection_handle import ledger_holds_vectors
 from ...core.tools.core.RAG_tools.kb.config_merge import (
     merge_collection_config_json,
 )
@@ -347,6 +350,7 @@ def _create_status_compensation(
     is_admin: bool,
     ingestion_runs_snapshot: Optional["_IngestionRunsSnapshot"] = None,
     status_cleared: Optional[set[str]] = None,
+    rag_document_snapshot: Optional["_RagDocumentSnapshot"] = None,
 ) -> Callable[[Optional[IngestionResult]], Callable[[], None]]:
     """Create a STATUS-boundary compensation factory."""
 
@@ -355,7 +359,14 @@ def _create_status_compensation(
     ) -> Callable[[], None]:
         def _compensate() -> None:
             if ingestion_runs_snapshot is not None:
-                _restore_ingestion_runs_snapshot(ingestion_runs_snapshot)
+                _restore_ingestion_runs_snapshot(
+                    ingestion_runs_snapshot,
+                    keep=(
+                        rag_document_snapshot.incomplete
+                        if rag_document_snapshot
+                        else ()
+                    ),
+                )
             elif ingestion_result is not None:
                 doc_id = _normalized_doc_id(ingestion_result.doc_id)
                 if doc_id and doc_id not in (status_cleared or ()):
@@ -1105,6 +1116,10 @@ def _rollback_ingested_document(
         user_id=user_id,
         is_admin=is_admin,
     )
+    if not ledger_holds_vectors():
+        get_kb_coordinator().discard_uncommitted_embeddings_sync(
+            collection_name, doc_id, user_id=user_id
+        )
 
 
 def _extract_embedding_model_id_from_error(message: str) -> Optional[str]:
@@ -1776,6 +1791,7 @@ class _IngestionRunsSnapshot:
 class _RagDocumentSnapshot:
     doc_refs: List[tuple[str, str]]
     collections: List[KBDocumentRowsSnapshot]
+    incomplete: List[tuple[str, str]] = field(default_factory=list)
 
 
 def _snapshot_rag_documents_for_uploaded_file(
@@ -1819,9 +1835,18 @@ def _restore_rag_document_snapshot(
     """Restore RAG document rows after a failed refresh of an existing web file."""
     coordinator = get_kb_coordinator()
     for collection_snapshot in snapshot.collections:
-        coordinator.restore_document_rows_sync(
-            collection_snapshot, user_id=user_id, is_admin=is_admin
-        )
+        marked: list[str] = []
+        try:
+            marked = coordinator.restore_document_rows_sync(
+                collection_snapshot, user_id=user_id, is_admin=is_admin
+            )
+        except DatabaseOperationError as error:
+            marked = error.details.get("marked", [])
+            raise
+        finally:
+            snapshot.incomplete.extend(
+                (collection_snapshot.collection, doc_id) for doc_id in marked
+            )
 
 
 def _list_document_refs_for_uploaded_file(file_id: str) -> List[tuple[str, str]]:
@@ -1855,10 +1880,19 @@ def _snapshot_ingestion_runs_for_uploaded_file(
         return None
 
 
-def _restore_ingestion_runs_snapshot(snapshot: _IngestionRunsSnapshot) -> None:
-    """Restore ingestion status rows after a failed existing-file refresh."""
+def _restore_ingestion_runs_snapshot(
+    snapshot: _IngestionRunsSnapshot,
+    *,
+    keep: Collection[tuple[str, str]] = (),
+) -> None:
+    """Restore ingestion status rows, except the ``keep`` documents the vector restore marked."""
     _get_api_compatibility_facade().replace_ingestion_status_rows(
-        snapshot.doc_refs, snapshot.rows
+        [ref for ref in snapshot.doc_refs if ref not in keep],
+        [
+            row
+            for row in snapshot.rows
+            if (row.get("collection"), row.get("doc_id")) not in keep
+        ],
     )
 
 
@@ -2025,6 +2059,7 @@ def _existing_web_file_result_with_rollback(
         user_id=user_id,
         is_admin=is_admin,
         ingestion_runs_snapshot=ingestion_runs_snapshot,
+        rag_document_snapshot=rag_document_snapshot,
     )
 
     return FileHandlerResult(
@@ -2328,6 +2363,7 @@ def _refresh_existing_file_if_changed(
         user_id=user_id,
         is_admin=is_admin,
         ingestion_runs_snapshot=ingestion_runs_snapshot,
+        rag_document_snapshot=rag_document_snapshot,
     )
     snapshot_compensation = _create_snapshot_compensation(
         backup_path=backup_path,
@@ -2498,6 +2534,7 @@ def _recreate_missing_existing_file(
         user_id=user_id,
         is_admin=is_admin,
         ingestion_runs_snapshot=ingestion_runs_snapshot,
+        rag_document_snapshot=rag_document_snapshot,
     )
     snapshot_compensation = _create_snapshot_compensation(
         backup_path=backup_for_failure,

@@ -2,9 +2,15 @@
 
 When a run is interrupted rather than finished, the settling transaction
 records why in ``task_auto_recovery`` (one row per task) and appends a
-``task_recovery_events`` row. Those rows are metadata only: nothing here
-changes a task's status, control state, error message or lifecycle
-projections, which stay the settling writer's own decision.
+``task_recovery_events`` row. Those rows are metadata only: recording them
+changes no task status, control state, error message or lifecycle
+projection.
+
+Which outcome a run-settling path (a run that raised, or returned an
+unsuccessful result) writes for an interruption is decided by
+:func:`decide_interruption`: an eligible run with a recoverable checkpoint
+rests PAUSED instead of FAILED, so its user can resume it. Lease-expiry
+recovery keeps its own verdict mapping.
 
 Phase 1 has no executor, so a recorded interruption is never ``scheduled``.
 Its state says only that nothing automatic will act on the run: ``manual``
@@ -17,8 +23,10 @@ never touch) or ``disabled`` (the settling path is gated by
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -28,9 +36,15 @@ from ...config import (
     get_task_infra_failure_pause_enabled,
 )
 from ...core.agent.checkpoint import checkpoint_progress_marker
-from ...core.agent.interruption import InterruptionReason
+from ...core.agent.interruption import (
+    InterruptionReason,
+    classify_run_failure,
+    classify_run_result,
+    is_database_unavailable,
+)
 from ..models.task import Task, TaskStatus
 from ..models.task_auto_recovery import (
+    TASK_AUTO_RECOVERY_LAST_ERROR_MAX_CHARS,
     TaskAutoRecovery,
     TaskAutoRecoveryState,
     TaskRecoveryEvent,
@@ -40,18 +54,39 @@ from ..models.trigger import TriggerType
 from ..models.workforce import WorkforceRun
 from .task_execution_controller import TaskControlState
 from .task_lease_service import (
+    TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR,
     CheckpointRecoveryResolution,
     CheckpointRecoveryVerdict,
     TaskLeaseRecoveryCandidate,
+    log_unknown_tool_effect_settlement,
+    resolve_checkpoint_recovery_with_data,
+    utc_now,
 )
 from .workforce_runtime import extract_workforce_run_id
 
 logger = logging.getLogger(__name__)
 
+
+def interruption_pause_result() -> dict[str, Any]:
+    """The ``execution_settled`` result of a run paused by an interruption.
+
+    The same shape lease recovery stages, so the next turn's context does not
+    read the pause as a failed execution. A fresh dict per call: the fact
+    writer stores it by reference in the row payload.
+    """
+    return {"error": None}
+
+
 # Callers that own their own protocol for a stopped run: SDK and A2A clients,
 # external cancellation, and anonymous visitors of a widget or shared link.
 _INELIGIBLE_SOURCES = frozenset({"sdk", "a2a", "external", "widget", "shared_link"})
 _TRIGGER_TYPES = frozenset(member.value for member in TriggerType)
+
+# TriggerRun error for a run a settling path paused after an interruption
+# (lease expiry has its own, TASK_LEASE_PAUSED_TRIGGER_ERROR).
+TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR = (
+    "Task paused after a system interruption; manual resume is required."
+)
 
 
 @dataclass(frozen=True)
@@ -134,12 +169,14 @@ def record_interruption_no_commit(
     interrupted_at: datetime,
     progress_marker: str | None,
     gated_by_infra_pause_switch: bool,
+    last_error: str | None = None,
 ) -> TaskAutoRecovery | None:
     """Upsert ``task``'s recovery row for one interruption and log the event.
 
     ``task`` must be the row as the settling write left it, in the same
     transaction: its ``run_id`` and ``state_version`` become the row's run
     and fence. A run without an id is not recorded -- it cannot be fenced.
+    ``last_error`` is an operator-only diagnostic, truncated to fit the row.
 
     ``gated_by_infra_pause_switch`` says whether the caller's PAUSED outcome
     depends on ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED``. Settlement paths
@@ -198,7 +235,11 @@ def record_interruption_no_commit(
     row.interrupted_at = interrupted_at
     row.progress_marker = progress_marker
     row.next_attempt_at = None
-    row.last_error = None
+    row.last_error = (
+        last_error[:TASK_AUTO_RECOVERY_LAST_ERROR_MAX_CHARS]
+        if last_error is not None
+        else None
+    )
 
     detail: dict[str, Any] = {"task_status": task_status.value, "state": state.value}
     if state_detail is not None:
@@ -242,10 +283,30 @@ def lease_expiry_interruption_reason(
     nothing, so it has no reason.
     """
 
+    return verdict_interruption_reason(
+        verdict,
+        control_state=candidate.control_state,
+        recoverable_reason=InterruptionReason.LEASE_EXPIRED,
+    )
+
+
+def verdict_interruption_reason(
+    verdict: CheckpointRecoveryVerdict,
+    *,
+    control_state: str | None,
+    recoverable_reason: InterruptionReason,
+) -> InterruptionReason | None:
+    """The reason a checkpoint verdict records, shared by every writer.
+
+    ``RECOVERABLE`` records ``recoverable_reason``, or a user pause when the
+    run was PAUSE_REQUESTED; the FAILED verdicts record their own terminal
+    reasons; ``INDETERMINATE`` writes nothing, so it has none.
+    """
+
     if verdict is CheckpointRecoveryVerdict.RECOVERABLE:
-        if candidate.control_state == TaskControlState.PAUSE_REQUESTED.value:
+        if control_state == TaskControlState.PAUSE_REQUESTED.value:
             return InterruptionReason.USER_PAUSE
-        return InterruptionReason.LEASE_EXPIRED
+        return recoverable_reason
     if verdict is CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT:
         return InterruptionReason.UNKNOWN_TOOL_EFFECT
     if verdict is CheckpointRecoveryVerdict.NOT_RECOVERABLE:
@@ -356,3 +417,253 @@ def record_lease_expiry_interruption_no_commit(
         )
         return
     savepoint.commit()
+
+
+# Interruption reasons the run-settling paths act on. Settlement keeps its
+# terminal FAILED outcome for every other reason, ``None`` included.
+# ``llm_unavailable`` and ``model_output_invalid`` join in a later phase.
+SETTLEMENT_INTERRUPTION_REASONS = frozenset({InterruptionReason.PERSISTENCE_FAILURE})
+
+
+def settlement_interruption_for_failure(
+    exc: BaseException,
+) -> InterruptionReason | None:
+    """The interruption a settling path acts on for a run that raised."""
+
+    reason = classify_run_failure(exc)
+    return reason if reason in SETTLEMENT_INTERRUPTION_REASONS else None
+
+
+def settlement_interruption_for_result(result: Any) -> InterruptionReason | None:
+    """The interruption a settling path acts on for an unsuccessful result.
+
+    Reads only the result's top-level fields (the ``AgentService`` contract),
+    never ``agent_result``. A quota stop wins over any interruption it
+    carries: the web layer rewrites ``status`` to ``quota_exceeded`` but keeps
+    the runner's ``interruption_reason``, and a quota refusal is final.
+    """
+
+    if not isinstance(result, Mapping) or result.get("success"):
+        return None
+    if result.get("status") == "quota_exceeded":
+        return None
+    reason = classify_run_result(result)
+    return reason if reason in SETTLEMENT_INTERRUPTION_REASONS else None
+
+
+class InterruptionSettlementDeferred(RuntimeError):
+    """The interrupted run cannot be decided right now.
+
+    Raised inside the settling transaction -- for an unresolvable checkpoint
+    or for any error while reading eligibility or the checkpoint, chained as
+    its cause -- so the caller rolls it back and keeps the exact lease; TTL
+    recovery settles the run once the database answers.
+    """
+
+
+class InterruptionOutcome(str, Enum):
+    """What a settling path writes for an interrupted run."""
+
+    # Automatic recovery does not apply (switch off, ineligible task): the
+    # caller settles exactly as it always has, its own classification
+    # included.
+    LEGACY = "legacy"
+    # PAUSED, manually resumable from the decision's checkpoint.
+    PAUSE = "pause"
+    # FAILED with TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR.
+    FAIL_UNKNOWN_TOOL_EFFECT = "fail_unknown_tool_effect"
+    # FAILED with the caller's own error.
+    FAIL_NOT_RECOVERABLE = "fail_not_recoverable"
+
+
+@dataclass(frozen=True)
+class InterruptionDecision:
+    """How a settling path ends a run interrupted for ``reason``.
+
+    ``reason`` is what the recovery row records; ``resolution`` is the
+    checkpoint a pause resumes from (``None`` otherwise).
+    """
+
+    outcome: InterruptionOutcome
+    reason: InterruptionReason
+    resolution: CheckpointRecoveryResolution | None = None
+
+    @property
+    def pause(self) -> bool:
+        return self.outcome is InterruptionOutcome.PAUSE
+
+
+_VERDICT_OUTCOMES = {
+    CheckpointRecoveryVerdict.RECOVERABLE: InterruptionOutcome.PAUSE,
+    CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT: (
+        InterruptionOutcome.FAIL_UNKNOWN_TOOL_EFFECT
+    ),
+    CheckpointRecoveryVerdict.NOT_RECOVERABLE: InterruptionOutcome.FAIL_NOT_RECOVERABLE,
+}
+
+
+def legacy_interruption_decision(reason: InterruptionReason) -> InterruptionDecision:
+    """The decision when automatic recovery does not apply."""
+
+    return InterruptionDecision(InterruptionOutcome.LEGACY, reason)
+
+
+def _settlement_candidate(task: Task) -> TaskLeaseRecoveryCandidate:
+    """The locked row as the candidate checkpoint resolution reads."""
+
+    row: Any = task
+    return TaskLeaseRecoveryCandidate(
+        task_id=int(row.id),
+        runner_id=row.runner_id,
+        run_id=row.run_id,
+        lease_expires_at=row.lease_expires_at or utc_now(),
+        state_version=int(row.state_version or 0),
+        last_checkpoint_event_id=row.last_checkpoint_event_id,
+        last_checkpoint_trace_event_id=row.last_checkpoint_trace_event_id,
+        attempt_id=row.lease_attempt_id,
+        control_state=row.control_state,
+    )
+
+
+def decide_interruption(
+    db: Session, *, task: Task, reason: InterruptionReason
+) -> InterruptionDecision:
+    """Decide how to settle ``task``'s RUNNING run interrupted for ``reason``.
+
+    ``task`` must be the run's row, locked by the settling transaction. In
+    order:
+
+    1. ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` off, or an ineligible
+       task: ``LEGACY``.
+    2. The run's checkpoint, resolved as lease recovery resolves it:
+       ``UNKNOWN_TOOL_EFFECT`` and ``NOT_RECOVERABLE`` fail, ``RECOVERABLE``
+       pauses -- as a user pause when the run was PAUSE_REQUESTED (the user
+       already decided), else for ``reason``.
+    3. ``INDETERMINATE``, or a database connectivity failure while reading
+       eligibility or the checkpoint, raises
+       :class:`InterruptionSettlementDeferred` so every settling path keeps
+       the lease for TTL recovery alike.
+    4. Any other error reading them is ``LEGACY``: it would reproduce on
+       every attempt, and TTL recovery reads the checkpoint the same way, so
+       deferring would leave the run RUNNING forever. Settling as before
+       (FAILED) keeps it terminal and visible.
+    """
+
+    if not get_task_infra_failure_pause_enabled():
+        return legacy_interruption_decision(reason)
+    try:
+        if not auto_recovery_eligibility(db, task).eligible:
+            return legacy_interruption_decision(reason)
+        candidate = _settlement_candidate(task)
+        resolution = resolve_checkpoint_recovery_with_data(db, candidate)
+    except Exception as exc:
+        if not is_database_unavailable(exc):
+            logger.exception(
+                "task_id=%s component=auto-recovery deciding interrupted run "
+                "%s failed; settling it as before",
+                task.id,
+                task.run_id,
+            )
+            return legacy_interruption_decision(reason)
+        raise InterruptionSettlementDeferred(
+            f"task {task.id}: interrupted run {task.run_id} is not decidable "
+            f"now ({type(exc).__name__})"
+        ) from exc
+    outcome = _VERDICT_OUTCOMES.get(resolution.verdict)
+    recorded = verdict_interruption_reason(
+        resolution.verdict,
+        control_state=candidate.control_state,
+        recoverable_reason=reason,
+    )
+    if outcome is None or recorded is None:
+        raise InterruptionSettlementDeferred(
+            f"task {task.id}: checkpoint of interrupted run {task.run_id} "
+            "is not resolvable now"
+        )
+    if outcome is InterruptionOutcome.FAIL_UNKNOWN_TOOL_EFFECT:
+        log_unknown_tool_effect_settlement(candidate.task_id, candidate.run_id)
+    return InterruptionDecision(
+        outcome,
+        recorded,
+        resolution if outcome is InterruptionOutcome.PAUSE else None,
+    )
+
+
+def apply_interruption_outcome_no_commit(
+    db: Session,
+    *,
+    task: Task,
+    decision: InterruptionDecision,
+    error: str | None,
+) -> None:
+    """The tail every settling path shares once it has written the outcome.
+
+    ``task`` must be the row as the caller's settling write left it (PAUSED
+    or FAILED, new ``state_version``), in the same transaction. This sets
+    the unknown-tool-effect message on a run failed for it, records the
+    interruption, and for a pause projects the workforce run and TriggerRun
+    as lease recovery does. The caller keeps its own write, lease release,
+    FAILED projections, transcript, result fact and commit.
+
+    The recording runs in a SAVEPOINT with the semantics of
+    ``record_lease_expiry_interruption_no_commit``: a failure inside it is
+    logged and skipped, so the settlement commits exactly as it would without
+    the row; a SAVEPOINT that cannot be opened, released or rolled back
+    propagates. Its preconditions hold here: the settling write has opened
+    the transaction, and everything staged so far is flushed first.
+    ``error`` becomes the row's operator-only ``last_error``. The row is
+    gated by ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` (``disabled`` when
+    an eligible task's switch is off).
+    """
+
+    if decision.outcome is InterruptionOutcome.FAIL_UNKNOWN_TOOL_EFFECT:
+        setattr(task, "error_message", TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR)
+    db.flush()
+    savepoint = db.begin_nested()
+    try:
+        record_interruption_no_commit(
+            db,
+            task=task,
+            reason=decision.reason,
+            task_status=TaskStatus(task.status),
+            interrupted_at=utc_now(),
+            progress_marker=(
+                resolution_progress_marker(db, int(task.id), decision.resolution)
+                if decision.resolution is not None
+                else None
+            ),
+            gated_by_infra_pause_switch=True,
+            last_error=error,
+        )
+    except Exception:
+        savepoint.rollback()
+        logger.exception(
+            "Recording the settlement interruption of task %s failed; "
+            "settling it without auto-recovery metadata",
+            task.id,
+        )
+    else:
+        savepoint.commit()
+    if decision.pause:
+        _project_interruption_pause_no_commit(db, task)
+
+
+def _project_interruption_pause_no_commit(db: Session, task: Task) -> None:
+    """Project an interruption's PAUSED outcome as lease recovery does.
+
+    The workforce run follows the task to ``paused``; a PENDING or RUNNING
+    TriggerRun ends FAILED with the manual-resume message, since nothing
+    resumes the task without its user yet. The message names a system
+    interruption, not a lease expiry, which keeps its own message.
+    """
+
+    from .task_orchestrator import sync_trigger_run_status
+    from .workforce_runtime import sync_workforce_run_status
+
+    sync_workforce_run_status(db, task, TaskStatus.PAUSED)
+    sync_trigger_run_status(
+        db,
+        task,
+        TaskStatus.PAUSED,
+        error_message=TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR,
+    )

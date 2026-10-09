@@ -3798,8 +3798,8 @@ _AUTO_RESUME_INT_SETTINGS = [
 ]
 
 _AUTO_RESUME_BOOL_SETTINGS = [
-    ("TASK_INFRA_FAILURE_PAUSE_ENABLED", "get_task_infra_failure_pause_enabled"),
-    ("TASK_AUTO_RESUME_ENABLED", "get_task_auto_resume_enabled"),
+    ("TASK_INFRA_FAILURE_PAUSE_ENABLED", "get_task_infra_failure_pause_enabled", False),
+    ("TASK_AUTO_RESUME_ENABLED", "get_task_auto_resume_enabled", True),
 ]
 
 
@@ -3825,16 +3825,16 @@ class TestTaskAutoRecoveryConfig:
                 assert read() == default
             assert env_var in caplog.text
 
-    @pytest.mark.parametrize("const,getter", _AUTO_RESUME_BOOL_SETTINGS)
+    @pytest.mark.parametrize("const,getter,default", _AUTO_RESUME_BOOL_SETTINGS)
     def test_bool_setting_defaults_overrides_and_invalid(
-        self, monkeypatch, caplog, const, getter
+        self, monkeypatch, caplog, const, getter, default
     ):
         env_var = getattr(config, const)
         assert env_var == f"XAGENT_{const}"
         read = getattr(config, getter)
 
         monkeypatch.delenv(env_var, raising=False)
-        assert read() is True
+        assert read() is default
 
         for falsy in ("false", "0", "no", "off", " FALSE "):
             monkeypatch.setenv(env_var, falsy)
@@ -3847,20 +3847,20 @@ class TestTaskAutoRecoveryConfig:
             monkeypatch.setenv(env_var, blank)
             caplog.clear()
             with caplog.at_level(logging.WARNING, logger="xagent.config"):
-                assert read() is True
+                assert read() is default
             assert env_var not in caplog.text
 
         for invalid in ("maybe", "2"):
             monkeypatch.setenv(env_var, invalid)
             caplog.clear()
             with caplog.at_level(logging.WARNING, logger="xagent.config"):
-                assert read() is True
+                assert read() is default
             assert env_var in caplog.text
 
     def test_example_env_documents_every_setting(self):
         example = (Path(config.__file__).parents[2] / "example.env").read_text()
         names = [f"XAGENT_{const}" for const, *_ in _AUTO_RESUME_INT_SETTINGS]
-        names += [f"XAGENT_{const}" for const, _ in _AUTO_RESUME_BOOL_SETTINGS]
+        names += [f"XAGENT_{const}" for const, *_ in _AUTO_RESUME_BOOL_SETTINGS]
         for name in names:
             assert f"# {name}=" in example
 

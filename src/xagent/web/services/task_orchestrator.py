@@ -56,8 +56,12 @@ from uuid import uuid4
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from ...config import get_shared_task_execution_enabled
+from ...config import (
+    get_shared_task_execution_enabled,
+    get_task_infra_failure_pause_enabled,
+)
 from ...core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
+from ...core.agent.interruption import InterruptionReason
 from ...core.execution_scope import resolve_execution_scope
 from ...core.tools.adapters.vibe.config import RequiredMCPUnavailableError
 from ...core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
@@ -97,6 +101,16 @@ from .mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
+from .task_auto_recovery import (
+    InterruptionDecision,
+    InterruptionOutcome,
+    InterruptionSettlementDeferred,
+    apply_interruption_outcome_no_commit,
+    decide_interruption,
+    interruption_pause_result,
+    legacy_interruption_decision,
+    settlement_interruption_for_failure,
+)
 from .task_command_transport import ClaimedTaskCommand
 from .task_execution_controller import (
     TaskControlSnapshot,
@@ -117,6 +131,7 @@ from .task_lease_service import (
     fail_and_release_task_lease_no_commit,
     get_runner_id,
     lock_task_lease_for_settlement_no_commit,
+    pause_and_release_task_lease_no_commit,
     release_task_lease,
     run_has_unknown_tool_effect,
     run_task_lease_heartbeat,
@@ -1750,6 +1765,111 @@ async def pause_unknown_task_lease(
     return settled
 
 
+TASK_INTERRUPTION_PAUSED_MESSAGE = (
+    "Execution interrupted by a system failure; task paused"
+)
+TASK_USER_PAUSED_MESSAGE = "Task paused"
+
+
+async def publish_interruption_pause(
+    task_id: int,
+    control_state: dict[str, Any],
+    reason: InterruptionReason,
+) -> None:
+    """Broadcast a committed interruption pause, as an input pause is.
+
+    The message says whether the user's own pause request or a system
+    interruption stopped the run. Best effort: the PAUSED row is already
+    committed, so a failed broadcast is only logged.
+    """
+    from .task_events import publish_task_event
+
+    try:
+        await publish_task_event(
+            {
+                "type": "task_paused",
+                "task_id": task_id,
+                "message": (
+                    TASK_USER_PAUSED_MESSAGE
+                    if reason is InterruptionReason.USER_PAUSE
+                    else TASK_INTERRUPTION_PAUSED_MESSAGE
+                ),
+                "timestamp": datetime.now(timezone.utc).timestamp(),
+                **control_state,
+            },
+            task_id,
+        )
+    except Exception:
+        logger.warning(
+            "Interruption pause committed but broadcast failed for task %s",
+            task_id,
+            exc_info=True,
+        )
+
+
+def _decide_owned_run_interruption(
+    db: Session, lease: TaskLease, reason: InterruptionReason
+) -> InterruptionDecision | None:
+    """Decide the interruption of ``lease``'s run, if it is still RUNNING.
+
+    With ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` off the decision is
+    ``LEGACY`` without touching the row, so the settlement issues the same
+    statements as without an interruption (plus the metadata row). Otherwise
+    the run's row is locked and read first; ``None`` means the lease no
+    longer owns a RUNNING row: the caller's fenced write then misses as it
+    always has and ``finish_turn`` reconciles.
+    """
+    if not get_task_infra_failure_pause_enabled():
+        return legacy_interruption_decision(reason)
+    if not lock_task_lease_for_settlement_no_commit(db, lease):
+        return None
+    task = (
+        db.query(Task)
+        .filter(
+            Task.id == lease.task_id,
+            Task.runner_id == lease.runner_id,
+            task_lease_attempt_predicate(lease),
+            Task.run_id == lease.run_id,
+        )
+        .first()
+    )
+    if task is None or task.status != TaskStatus.RUNNING:
+        return None
+    return decide_interruption(db, task=task, reason=reason)
+
+
+def _pause_interrupted_run_no_commit(
+    db: Session, lease: TaskLease, decision: InterruptionDecision, *, error: str
+) -> dict[str, Any] | None:
+    """Pause and release an interrupted run with its projections, uncommitted.
+
+    Returns the paused control snapshot, or ``None`` when the fenced write
+    missed. This path keeps its own writer rather than the ORM transition
+    the result paths use: like ``fail_and_release_task_lease_no_commit`` it
+    settles and releases in one fenced UPDATE (RUNNING, exact run and
+    attempt), which is what this function's FAILED branch has always
+    written, and it emits no control-state fact for that write.
+    """
+    from .task_execution_controller import task_control_snapshot
+    from .task_execution_event_writer import stage_result_fact_no_commit
+
+    if not pause_and_release_task_lease_no_commit(db, lease):
+        return None
+    db.expire_all()
+    task = db.query(Task).filter(Task.id == lease.task_id).one()
+    apply_interruption_outcome_no_commit(db, task=task, decision=decision, error=error)
+    stage_result_fact_no_commit(db, task, interruption_pause_result())
+    logger.warning(
+        "task_id=%s run_id=%s component=settlement paused interrupted run "
+        "(reason=%s): %s",
+        lease.task_id,
+        lease.run_id,
+        decision.reason.value,
+        error,
+    )
+    return task_control_snapshot(task).as_dict()
+
+
 def settle_task_lease_isolated(
     lease: TaskLease,
     *,
@@ -1758,6 +1878,8 @@ def settle_task_lease_isolated(
     client_message_type: str = TASK_FAILURE_MESSAGE_TYPE,
     terminal_event_state: dict[str, Any] | None = None,
     classify_unknown_tool_effect: bool = False,
+    interruption: InterruptionReason | None = None,
+    paused_for: list[InterruptionReason] | None = None,
 ) -> bool:
     """Settle exactly one run/runner lease in one worker-owned Session.
 
@@ -1769,9 +1891,9 @@ def settle_task_lease_isolated(
 
     The return value means that the requested outcome was committed. With an
     ``error_message`` it is ``True`` only when this call changed the exact owned
-    run to FAILED. A pre-existing terminal/control outcome may still be
-    reconciled and released, but returns ``False`` so callers do not publish a
-    contradictory failure event.
+    run to FAILED (or, for an interruption, PAUSED). A pre-existing
+    terminal/control outcome may still be reconciled and released, but returns
+    ``False`` so callers do not publish a contradictory failure event.
 
     When supplied, ``terminal_event_state`` receives the committed V2 control
     identity after commit; the caller can publish without re-reading latest state.
@@ -1784,6 +1906,19 @@ def settle_task_lease_isolated(
     matched the RUNNING row, inside that transaction. When it cannot
     complete, this raises and the lease is retained, so TTL recovery
     classifies the run instead.
+
+    ``interruption`` names why a run that raised was interrupted rather than
+    finished (see ``task_auto_recovery.settlement_interruption_for_failure``).
+    ``decide_interruption`` then runs on the locked RUNNING row: a
+    recoverable run is paused and released instead of failed -- no failure
+    transcript -- an unknown tool effect fails with that message, and an
+    undecidable run raises ``InterruptionSettlementDeferred``, retaining the
+    lease for TTL recovery as above. When automatic recovery does not apply
+    the run fails as without ``interruption``: with the switch off by the
+    very same statements; for an ineligible task with the same outcome but
+    after an extra row lock and eligibility read. Every decided interruption
+    is recorded in ``task_auto_recovery``. ``paused_for``, when supplied,
+    receives the recorded reason of a committed pause.
 
     On checkout or commit failure the transaction is rolled back and the lease
     is intentionally retained for TTL recovery; this function never creates an
@@ -1798,18 +1933,61 @@ def settle_task_lease_isolated(
     with SessionLocal() as settle_db:
         try:
             if error_message is not None:
-                failed = fail_and_release_task_lease_no_commit(
-                    settle_db,
-                    lease,
-                    error_message=error_message,
+                decision = (
+                    _decide_owned_run_interruption(settle_db, lease, interruption)
+                    if interruption is not None
+                    else None
                 )
+                if decision is not None and decision.pause:
+                    paused_state = _pause_interrupted_run_no_commit(
+                        settle_db, lease, decision, error=error_message
+                    )
+                    if paused_state is not None:
+                        settle_db.commit()
+                        if terminal_event_state is not None:
+                            terminal_event_state.update(paused_state)
+                        if paused_for is not None:
+                            paused_for.append(decision.reason)
+                        invalidate_task_cache_best_effort(lease.task_id)
+                        return True
+                    failed = False
+                else:
+                    if (
+                        decision is not None
+                        and decision.outcome
+                        is InterruptionOutcome.FAIL_UNKNOWN_TOOL_EFFECT
+                    ):
+                        error_message = TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR
+                    failed = fail_and_release_task_lease_no_commit(
+                        settle_db,
+                        lease,
+                        error_message=error_message,
+                    )
                 if failed:
+                    # The fenced UPDATE bypassed the identity map, and the
+                    # decision may have loaded this row before it.
+                    settle_db.expire_all()
                     task = settle_db.query(Task).filter(Task.id == lease.task_id).one()
-                    if classify_unknown_tool_effect and run_has_unknown_tool_effect(
-                        settle_db, lease
+                    if (
+                        classify_unknown_tool_effect
+                        and (
+                            decision is None
+                            or decision.outcome is InterruptionOutcome.LEGACY
+                        )
+                        and run_has_unknown_tool_effect(settle_db, lease)
                     ):
                         error_message = TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR
                         setattr(task, "error_message", error_message)
+                        if decision is not None:
+                            decision = replace(
+                                decision,
+                                outcome=InterruptionOutcome.FAIL_UNKNOWN_TOOL_EFFECT,
+                                reason=InterruptionReason.UNKNOWN_TOOL_EFFECT,
+                            )
+                    if decision is not None:
+                        apply_interruption_outcome_no_commit(
+                            settle_db, task=task, decision=decision, error=error_message
+                        )
                     sync_workforce_run_status(settle_db, task, TaskStatus.FAILED)
                     sync_trigger_run_status(settle_db, task, TaskStatus.FAILED)
                     if task.user_id is not None:
@@ -2197,6 +2375,7 @@ def _schedule_bg(
         broadcast_error_message: str | None = None
         broadcast_error_code: str | None = None
         classify_unknown_tool_effect = False
+        settlement_interruption: InterruptionReason | None = None
         defer_settlement_to_ttl_recovery = False
         skip_delivery_reconciliation = False
         # Positive evidence for finalize's delivery target: once
@@ -2417,6 +2596,20 @@ def _schedule_bg(
                         setup_or_run_err,
                         exc_info=True,
                     )
+                elif isinstance(setup_or_run_err, InterruptionSettlementDeferred):
+                    # The result's settlement could not resolve the run's
+                    # checkpoint. Settling here would fail a run that may be
+                    # resumable; keep the lease and let TTL recovery decide.
+                    defer_settlement_to_ttl_recovery = True
+                    logger.error(
+                        "task_id=%s component=settlement interrupted run's "
+                        "checkpoint unresolvable; retaining lease for TTL "
+                        "recovery: %s",
+                        task_id,
+                        setup_or_run_err,
+                        # The chained cause is the actual read failure.
+                        exc_info=setup_or_run_err,
+                    )
                 else:
                     is_public_safe_mcp_error = isinstance(
                         setup_or_run_err, RequiredMCPUnavailableError
@@ -2487,6 +2680,11 @@ def _schedule_bg(
                         # E.g. a tool ran but its result commit failed: the
                         # settlement must say the effect is unknown.
                         classify_unknown_tool_effect = True
+                        # A checkpoint/event write or the database itself
+                        # failed: a recoverable run is paused, not failed.
+                        settlement_interruption = settlement_interruption_for_failure(
+                            setup_or_run_err
+                        )
                     logger.error(
                         "bg task %s setup/run failed: %s",
                         task_id,
@@ -2526,6 +2724,7 @@ def _schedule_bg(
                 if not defer_settlement_to_ttl_recovery:
                     lease_settled = False
                     terminal_event_state: dict[str, Any] = {}
+                    paused_for: list[InterruptionReason] = []
                     try:
                         settled = await run_db_io_cancellation_safe(
                             lambda: settle_task_lease_isolated(
@@ -2541,6 +2740,8 @@ def _schedule_bg(
                                 classify_unknown_tool_effect=(
                                     classify_unknown_tool_effect
                                 ),
+                                interruption=settlement_interruption,
+                                paused_for=paused_for,
                             )
                         )
                         # Gate on the returned value, not on "didn't raise":
@@ -2552,7 +2753,13 @@ def _schedule_bg(
                         # coroutine is no longer authoritative for the turn and
                         # must not close its delivery row.
                         lease_settled = bool(settled)
-                        if settled and broadcast_error_message is not None:
+                        if settled and paused_for:
+                            # Interrupted, not failed: resumable by its user.
+                            execution_failed = False
+                            await publish_interruption_pause(
+                                task_id, terminal_event_state, paused_for[0]
+                            )
+                        elif settled and broadcast_error_message is not None:
                             try:
                                 await publish_task_result(
                                     {

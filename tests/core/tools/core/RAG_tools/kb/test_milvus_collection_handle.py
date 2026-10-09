@@ -11,17 +11,20 @@ import asyncio
 import inspect
 import logging
 import re
-from dataclasses import fields
+from dataclasses import fields, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import lancedb
 import pytest
 
 from xagent.core.tools.core.RAG_tools import kb
 from xagent.core.tools.core.RAG_tools.core.exceptions import (
     ConfigurationError,
+    DatabaseOperationError,
     DocumentValidationError,
     VectorValidationError,
 )
@@ -41,18 +44,23 @@ from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
     milvus_collection_name,
 )
 from xagent.core.tools.core.RAG_tools.kb.coordinator import KBCoordinator
-from xagent.core.tools.core.RAG_tools.kb.kb_ids import get_or_create_kb_id
+from xagent.core.tools.core.RAG_tools.kb.kb_ids import get_or_create_kb_id, read_kb_ids
 from xagent.core.tools.core.RAG_tools.kb.models import (
     KBAccessMode,
     KBBackendCapabilities,
     KBCollectionContext,
     KBContextRequest,
+    KBDocumentRowsSnapshot,
     KBStorageBackend,
     KBUserScope,
 )
 from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import (
     embeddings_table_name,
     to_model_tag,
+)
+from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
+    KB_IDS_TABLE,
+    ensure_documents_table,
 )
 from xagent.core.tools.core.RAG_tools.management import (
     collection_manager,
@@ -89,16 +97,17 @@ FAMILIES = {
     "supports_chunks": """chunk_exists read_existing_chunks write_chunks
         delete_chunk_records snapshot_chunks restore_chunks delete_created_chunks""",
     "supports_embeddings": """read_chunks_needing_embedding write_embeddings
-        commit_embeddings delete_embedding_records snapshot_embeddings
-        restore_embeddings delete_created_embeddings cleanup_embeddings_for_operation""",
+        commit_embeddings discard_uncommitted_embeddings delete_embedding_records
+        snapshot_embeddings restore_embeddings delete_created_embeddings
+        cleanup_embeddings_for_operation""",
     "supports_search": "validate_query_vector search_dense search_sparse search_hybrid",
     "supports_versions": f"{VERSIONS} {CASCADES}",
     "supports_async_search": ASYNC_SEARCH,
 }
 LEDGER = set(
     f"""{FAMILIES["supports_documents"]} {FAMILIES["supports_parses"]}
-    {FAMILIES["supports_chunks"]} rename_collection_data rename_collection_status
-    rename_collection_metadata delete_collection_config count_documents
+    {FAMILIES["supports_chunks"]} capture_document_rows rename_collection_status
+    rename_collection_metadata count_documents
     list_collection_documents write_ingestion_status load_ingestion_status
     clear_ingestion_status write_ingestion_status_async load_ingestion_status_async
     clear_ingestion_status_async get_main_pointer set_main_pointer list_main_pointers
@@ -125,13 +134,16 @@ IMPLEMENTED = {
     "search_dense",
     "search_sparse",
     "search_hybrid",
+    "discard_uncommitted_embeddings",
+    "delete_documents_data",
+    "delete_collection_data",
+    "cleanup_collection_data_after_rollback",
+    "delete_collection_config",
+    "restore_document_rows",
+    "rename_collection_data",
 }
 PENDING = (
-    set(
-        f"""{FAMILIES["supports_embeddings"]} {FAMILIES["supports_search"]}
-    capture_document_rows restore_document_rows delete_documents_data
-    delete_collection_data cleanup_collection_data_after_rollback""".split()
-    )
+    set(f"""{FAMILIES["supports_embeddings"]} {FAMILIES["supports_search"]}""".split())
     - IMPLEMENTED
 )
 
@@ -183,10 +195,10 @@ def test_every_interface_method_is_delegated_refused_pending_or_implemented() ->
     }
 
     assert (len(LEDGER), len(UNSUPPORTED), len(PENDING), len(IMPLEMENTED)) == (
-        44,
+        43,
         12,
-        10,
-        9,
+        5,
+        16,
     )
     assert LEDGER | set(UNSUPPORTED) | PENDING | IMPLEMENTED == interface
     for name in interface:
@@ -246,6 +258,405 @@ def test_capabilities_report_exactly_what_the_handle_serves() -> None:
     assert KBCoordinator._capabilities_for_backend(KBStorageBackend.MILVUS) == (
         capabilities
     )
+
+
+def _kb_names(user_id: int | None = 1, is_admin: bool = False) -> dict[str, list[str]]:
+    conn = get_vector_index_store().get_raw_connection()
+    return read_kb_ids(conn, user_id=user_id, is_admin=is_admin)
+
+
+def _owners_of_kb(*owners: int) -> dict[int, str]:
+    conn = get_vector_index_store().get_raw_connection()
+    return {owner: get_or_create_kb_id(conn, "kb", owner) for owner in owners}
+
+
+def test_a_rename_moves_the_kb_ids_before_the_ledger_data() -> None:
+    handle, ledger, connections = _handle()
+    ids = _owners_of_kb(1, 2)
+    seen: list[dict[str, list[str]]] = []
+
+    def rename(*_: Any) -> list[str]:
+        seen.append(_kb_names())
+        return []
+
+    ledger.rename_collection_data.side_effect = rename
+
+    warnings: list[str] = []
+    assert handle.rename_collection_data("new", 1, False, warnings) == []
+
+    assert seen == [{"new": [ids[1]]}]
+    assert _kb_names(2) == {"kb": [ids[2]]}
+    ledger.rename_collection_data.assert_called_once_with("new", 1, False, warnings)
+    assert connections.mock_calls == []
+
+
+@pytest.mark.parametrize("failure", ["raises", "warns"])
+def test_a_failed_ledger_rename_moves_the_kb_ids_back(failure: str) -> None:
+    handle, ledger, _ = _handle()
+    ids = _owners_of_kb(1, 2)
+    if failure == "raises":
+        ledger.rename_collection_data.side_effect = RuntimeError("no disk")
+    else:
+        ledger.rename_collection_data.return_value = ["chunks: no disk"]
+
+    if failure == "raises":
+        with pytest.raises(RuntimeError, match="no disk"):
+            handle.rename_collection_data("new", None, True)
+    else:
+        assert handle.rename_collection_data("new", None, True) == ["chunks: no disk"]
+
+    assert sorted(_kb_names(None, True)["kb"]) == sorted(ids.values())
+    assert list(_kb_names(None, True)) == ["kb"]
+
+
+def test_an_admin_rename_moves_every_owners_kb_id_and_keeps_the_values() -> None:
+    handle, ledger, _ = _handle()
+    ids = _owners_of_kb(1, 2)
+    ledger.rename_collection_data.return_value = []
+
+    assert handle.rename_collection_data("new", None, True) == []
+
+    assert list(_kb_names(None, True)) == ["new"]
+    assert sorted(_kb_names(None, True)["new"]) == sorted(ids.values())
+
+
+def _write_documents(*owners: int, collection: str = "kb", conn: Any = None) -> None:
+    """Add one document per owner through ``conn`` (the store's by default)."""
+    store_conn = get_vector_index_store().get_raw_connection()
+    ensure_documents_table(store_conn)
+    rows = [
+        {
+            "collection": collection,
+            "doc_id": f"doc-{owner}",
+            "file_id": None,
+            "source_path": f"/uploads/{owner}.txt",
+            "file_type": "txt",
+            "content_hash": "a" * 64,
+            "uploaded_at": datetime.now(timezone.utc),
+            "title": None,
+            "language": None,
+            "user_id": owner,
+        }
+        for owner in owners
+    ]
+    (conn if conn is not None else store_conn).open_table("documents").add(rows)
+
+
+class _FailingCount:
+    def __init__(self, table: Any) -> None:
+        self._table = table
+
+    def count_rows(self, *_: Any) -> int:
+        raise OSError("table is busy")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._table, name)
+
+
+def _fail_the_document_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = get_vector_index_store().get_raw_connection()
+    open_table = conn.open_table
+    monkeypatch.setattr(
+        conn,
+        "open_table",
+        lambda name: (
+            _FailingCount(open_table(name)) if name == "documents" else open_table(name)
+        ),
+    )
+
+
+def test_the_config_rows_and_the_kb_ids_are_deleted_together() -> None:
+    handle, ledger, _ = _handle()
+    ids = _owners_of_kb(1, 2)
+    ledger.delete_collection_config = AsyncMock(return_value=3)
+
+    assert asyncio.run(handle.delete_collection_config(tenant_only=True)) == 3
+    assert _kb_names(None, True) == {"kb": [ids[2]]}
+    ledger.delete_collection_config.assert_awaited_once_with(tenant_only=True)
+
+    assert asyncio.run(handle.delete_collection_config()) == 3
+    assert _kb_names(None, True) == {}
+    ledger.count_documents.assert_not_called()
+
+
+def test_deleting_every_owners_kb_ids_does_not_wait_for_documents() -> None:
+    handle, ledger, _ = _handle()
+    _owners_of_kb(1, 2)
+    ledger.delete_collection_config = AsyncMock(return_value=1)
+    _write_documents(1, 2)
+
+    asyncio.run(handle.delete_collection_config())
+
+    assert _kb_names(None, True) == {}
+
+
+def test_a_caller_whose_documents_remain_keeps_the_kb_id() -> None:
+    handle, ledger, _ = _handle()
+    ids = _owners_of_kb(1, 2)
+    ledger.delete_collection_config = AsyncMock(return_value=1)
+    _write_documents(1, 2)
+
+    assert asyncio.run(handle.delete_collection_config(tenant_only=True)) == 1
+
+    assert sorted(_kb_names(None, True)["kb"]) == sorted(ids.values())
+
+
+def test_other_owners_and_other_collections_documents_do_not_keep_the_kb_id() -> None:
+    handle, ledger, _ = _handle()
+    ids = _owners_of_kb(1, 2)
+    ledger.delete_collection_config = AsyncMock(return_value=1)
+    _write_documents(2)
+    _write_documents(1, collection="other")
+
+    asyncio.run(handle.delete_collection_config(tenant_only=True))
+
+    assert _kb_names(None, True) == {"kb": [ids[2]]}
+
+
+def test_a_document_another_connection_wrote_keeps_the_kb_id() -> None:
+    handle, ledger, _ = _handle()
+    ids = _owners_of_kb(1)
+    ledger.delete_collection_config = AsyncMock(return_value=1)
+    _write_documents(2)
+    store = get_vector_index_store()
+    assert store.count_rows("documents", {"collection": "kb"}, 1, False) == 0
+    other = lancedb.connect(store.get_raw_connection().uri)
+
+    _write_documents(1, conn=other)
+    asyncio.run(handle.delete_collection_config(tenant_only=True))
+
+    assert _kb_names(None, True) == {"kb": [ids[1]]}
+
+
+def test_a_failed_document_count_keeps_the_kb_id_and_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handle, ledger, _ = _handle()
+    _owners_of_kb(1, 2)
+    ledger.delete_collection_config = AsyncMock(return_value=1)
+    _write_documents(2)
+    _fail_the_document_count(monkeypatch)
+
+    with pytest.raises(
+        DatabaseOperationError, match="Cannot count the documents of kb.*table is busy"
+    ):
+        asyncio.run(handle.delete_collection_config(tenant_only=True))
+
+    assert len(_kb_names(None, True)["kb"]) == 2
+
+
+def test_an_admin_scope_deletes_only_its_own_kb_id_and_leaves_other_owners() -> None:
+    ledger = MagicMock(spec=KBCollectionHandle)
+    admin = replace(_context(KBStorageBackend.MILVUS), user_scope=KBUserScope(7, True))
+    handle = MilvusCollectionHandle(
+        admin, ledger=ledger, connections=MagicMock(spec=MilvusConnectionManager)
+    )
+    ids = _owners_of_kb(1, 2, 7)
+    ledger.delete_collection_config = AsyncMock(return_value=0)
+    _write_documents(1, 2)
+
+    asyncio.run(handle.delete_collection_config(tenant_only=True))
+
+    assert sorted(_kb_names(None, True)["kb"]) == sorted([ids[1], ids[2]])
+
+
+def test_the_discard_reads_the_kb_id_and_creates_none() -> None:
+    handle, _, connections = _handle()
+
+    assert handle.discard_uncommitted_embeddings("doc", user_id=5) == 0
+
+    assert _kb_names(None, True) == {}
+    connections.get_shared_client_from_env.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["raises", "warns"])
+def test_a_failed_move_back_does_not_replace_the_rename_failure(
+    failure: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    handle, ledger, _ = _handle()
+    ids = _owners_of_kb(1)
+
+    def lock_timeout(*_: Any) -> None:
+        raise OSError("lock timeout")
+
+    monkeypatch.setattr(collection_handle, "set_kb_ids_collection", lock_timeout)
+    if failure == "raises":
+        ledger.rename_collection_data.side_effect = RuntimeError("no disk")
+        with pytest.raises(RuntimeError, match="no disk"):
+            handle.rename_collection_data("new", 1, False)
+    else:
+        ledger.rename_collection_data.return_value = ["chunks: no disk"]
+        assert handle.rename_collection_data("new", 1, False) == ["chunks: no disk"]
+
+    assert "Could not move the kb_ids back to kb: lock timeout" in caplog.text
+    assert _kb_names() == {"new": [ids[1]]}
+
+
+def test_two_kb_ids_for_one_owner_fail_a_delete_before_any_store_is_touched() -> None:
+    handle, ledger, connections = _handle()
+    _owners_of_kb(1)
+    get_vector_index_store().get_raw_connection().open_table(KB_IDS_TABLE).add(
+        [
+            {
+                "collection": "kb",
+                "user_id": 1,
+                "kb_id": "duplicate",
+                "created_at": datetime.now(timezone.utc),
+            }
+        ]
+    )
+
+    with pytest.raises(DatabaseOperationError, match="several kb_ids"):
+        handle.delete_documents_data(["doc"], user_id=1, is_admin=False)
+
+    ledger.delete_documents_data.assert_not_called()
+    connections.get_shared_client_from_env.assert_not_called()
+
+
+def _restore_snapshot(statuses: dict[str, str]) -> KBDocumentRowsSnapshot:
+    """A snapshot whose documents have the given statuses and one chunk each."""
+    return KBDocumentRowsSnapshot(
+        collection="kb",
+        doc_ids=tuple(statuses),
+        rows_by_table={
+            "ingestion_runs": [
+                {
+                    "collection": "kb",
+                    "doc_id": doc_id,
+                    "status": status,
+                    "message": f"{doc_id} message",
+                    "parse_hash": "p1",
+                    "user_id": 1,
+                }
+                for doc_id, status in statuses.items()
+            ],
+            "chunks": [
+                {
+                    "collection": "kb",
+                    "doc_id": doc_id,
+                    "parse_hash": "p1",
+                    "chunk_id": f"{doc_id}-c",
+                }
+                for doc_id in statuses
+            ],
+        },
+    )
+
+
+def _marked(ledger: MagicMock) -> list[str]:
+    return [call.args[0] for call in ledger.write_ingestion_status.call_args_list]
+
+
+def test_a_restore_marks_only_a_success_or_partially_embedded_status() -> None:
+    handle, ledger, connections = _handle()
+    connections.get_shared_client_from_env.return_value.list_collections.return_value = []
+    snapshot = _restore_snapshot(
+        {
+            "ok": "success",
+            "part": "partially_embedded",
+            "failed": "failed",
+            "chunked": "chunked",
+            "cancelled": "cancelled",
+        }
+    )
+
+    restored = handle.restore_document_rows(snapshot, user_id=1, is_admin=False)
+
+    assert restored == ["ok", "part"] and _marked(ledger) == ["ok", "part"]
+    message = ledger.write_ingestion_status.call_args.kwargs["message"]
+    assert "re-ingest" in message
+
+
+def _failing_client(connections: MagicMock, *, fails_on: str) -> MagicMock:
+    client = connections.get_shared_client_from_env.return_value
+    client.list_collections.return_value = ["xagent_kb_m"]
+    client.has_collection.return_value = True
+
+    def query(name: str, **kwargs: Any) -> list[dict[str, Any]]:
+        if kwargs["filter_params"]["doc_id"] == fails_on:
+            raise RuntimeError("transient")
+        return []
+
+    client.query.side_effect = query
+    return client
+
+
+def test_a_failed_alignment_marks_the_documents_not_aligned_yet_and_reports_them() -> (
+    None
+):
+    handle, ledger, connections = _handle()
+    _owners_of_kb(1)
+    _failing_client(connections, fails_on="d2")
+    snapshot = _restore_snapshot(
+        {"d1": "success", "d2": "success", "d3": "failed", "d4": "partially_embedded"}
+    )
+
+    with pytest.raises(
+        DatabaseOperationError,
+        match="^Could not align Milvus with the restored chunks: transient",
+    ) as raised:
+        handle.restore_document_rows(snapshot, user_id=1, is_admin=False)
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert raised.value.details == {"marked": ["d1", "d2", "d4"]}
+    assert _marked(ledger) == ["d1", "d2", "d4"]
+
+
+def test_a_failed_mark_is_logged_and_the_others_are_still_reported(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    handle, ledger, connections = _handle()
+    _owners_of_kb(1)
+    _failing_client(connections, fails_on="d2")
+    ledger.write_ingestion_status.side_effect = [None, OSError("disk full"), None]
+    snapshot = _restore_snapshot({"d1": "success", "d2": "success", "d3": "success"})
+
+    with pytest.raises(DatabaseOperationError, match="transient") as raised:
+        handle.restore_document_rows(snapshot, user_id=1, is_admin=False)
+
+    assert raised.value.details == {"marked": ["d1", "d3"]}
+    assert "Could not mark d2 partially embedded: disk full" in caplog.text
+
+
+def test_a_failed_mark_is_reported_as_a_mark_and_the_rest_are_still_marked() -> None:
+    handle, ledger, connections = _handle()
+    _owners_of_kb(1)
+    _failing_client(connections, fails_on="none")
+    ledger.write_ingestion_status.side_effect = [OSError("disk full"), None, None]
+    snapshot = _restore_snapshot({"d1": "success", "d2": "success"})
+
+    with pytest.raises(
+        DatabaseOperationError,
+        match="^Could not mark d1 partially embedded: disk full",
+    ) as raised:
+        handle.restore_document_rows(snapshot, user_id=1, is_admin=False)
+
+    assert raised.value.details == {"marked": ["d1", "d2"]}
+
+
+@pytest.mark.parametrize("method", ["documents", "collection"])
+@pytest.mark.parametrize("failure", ["no model", "describe fails"])
+def test_a_delete_resolves_the_count_keys_before_it_deletes(
+    method: str, failure: str
+) -> None:
+    handle, ledger, connections = _handle()
+    _owners_of_kb(1)
+    client = connections.get_shared_client_from_env.return_value
+    client.list_collections.return_value = ["xagent_kb_m"]
+    if failure == "no model":
+        client.describe_collection.return_value = {"properties": {}}
+    else:
+        client.describe_collection.side_effect = RuntimeError("describe failed")
+
+    with pytest.raises(DatabaseOperationError, match="Cannot resolve the models"):
+        if method == "documents":
+            handle.delete_documents_data(["d"], user_id=1, is_admin=False)
+        else:
+            handle.delete_collection_data(user_id=1, is_admin=False)
+
+    client.delete.assert_not_called()
+    ledger.delete_documents_data.assert_not_called()
+    ledger.delete_collection_data.assert_not_called()
 
 
 def test_the_client_comes_from_the_connection_manager_on_first_use() -> None:
@@ -823,3 +1234,105 @@ def test_compaction_without_embeddings_tables_compacts_the_ledger(
     assert requested == [[*_INGEST_TABLES, embeddings_table_name("model")]]
     assert not [name for name in store.list_table_names() if "embeddings_" in name]
     assert "compaction skipped" not in caplog.text
+
+
+class _Unloaded(Exception):
+    code = 101
+
+
+def _described_client(properties: dict[str, str]) -> MagicMock:
+    client = MagicMock()
+    client.describe_collection.return_value = {
+        "properties": properties,
+        "fields": [{"name": "dense", "params": {"dim": "3"}}],
+    }
+    return client
+
+
+def _attempts(*outcomes: Any) -> Any:
+    remaining = iter(outcomes)
+
+    def call() -> Any:
+        outcome = next(remaining)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    return call
+
+
+def test_a_call_on_an_unloaded_collection_loads_it_once_and_runs_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ensured: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        collection_handle,
+        "ensure_milvus_collection",
+        lambda *args: ensured.append(args),
+    )
+    client = _described_client({PROPERTY: MODEL})
+
+    result = collection_handle._with_loaded(
+        "xagent_kb_x", client, _attempts(_Unloaded(), "done")
+    )
+
+    assert result == "done" and ensured == [(client, MODEL, 3)]
+
+
+def test_other_errors_and_a_second_unloaded_failure_are_not_retried_blindly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ensured: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        collection_handle,
+        "ensure_milvus_collection",
+        lambda *args: ensured.append(args),
+    )
+    client = _described_client({PROPERTY: MODEL})
+
+    with pytest.raises(RuntimeError, match="down"):
+        collection_handle._with_loaded("n", client, _attempts(RuntimeError("down")))
+    assert ensured == []
+    with pytest.raises(_Unloaded):
+        collection_handle._with_loaded("n", client, _attempts(_Unloaded(), _Unloaded()))
+    assert len(ensured) == 1
+
+
+@pytest.mark.parametrize("invisible_only", [False, True])
+def test_a_delete_skips_an_unloaded_collection_only_for_invisible_rows(
+    invisible_only: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(collection_handle, "ensure_milvus_collection", lambda *_: None)
+    client = _described_client({PROPERTY: MODEL})
+    client.delete.side_effect = _Unloaded("not loaded")
+
+    if invisible_only:
+        counts = collection_handle._delete_milvus_rows(
+            client, ["xagent_kb_x"], ["kb"], invisible_only=True
+        )
+        assert counts == {} and "xagent_kb_x is not loaded; skipped" in caplog.text
+    else:
+        with pytest.raises(DatabaseOperationError, match="Cannot delete from Milvus"):
+            collection_handle._delete_milvus_rows(client, ["xagent_kb_x"], ["kb"])
+
+
+def test_a_collection_without_a_recorded_model_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ensured: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        collection_handle,
+        "ensure_milvus_collection",
+        lambda *args: ensured.append(args),
+    )
+    client = _described_client({})
+
+    with pytest.raises(VectorValidationError, match=r"records no xagent\.model_id"):
+        collection_handle._embeddings_key(client, "xagent_kb_x")
+    with pytest.raises(VectorValidationError, match=r"records no xagent\.model_id"):
+        collection_handle._with_loaded(
+            "xagent_kb_x", client, _attempts(_Unloaded(), "never")
+        )
+    assert ensured == []

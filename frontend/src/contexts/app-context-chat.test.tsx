@@ -7595,12 +7595,16 @@ describe("terminal error frames", () => {
     })
   })
 
-  // A cancellation carries no code (external_task_cancel.py:404 passes only
-  // a message), so isTerminal alone -- not a code -- has to make this frame
-  // the turn's result and route it through ADD_MESSAGE's isResult branch,
-  // the one place trace events accumulated on state.traceEvents move onto
-  // the settling message and state.traceEvents is cleared.
-  it("drains accumulated trace events onto the cancellation bubble", async () => {
+  // isTerminal alone -- not a code -- makes a terminal frame the turn's
+  // result and routes it through ADD_MESSAGE's isResult branch, the one place
+  // trace events accumulated on state.traceEvents move onto the settling
+  // message and state.traceEvents is cleared. One cell per shape the server
+  // sends: the external cancel frame carries a code, a generic setup/run
+  // failure does not.
+  it.each([
+    { label: "cancellation", code: "external_turn_interrupted", sentence: "This response was interrupted.", shown: "clientErrors.externalTurnInterrupted" },
+    { label: "codeless failure", code: undefined, sentence: "Task execution failed.", shown: "Task execution failed." },
+  ])("drains accumulated trace events onto the $label bubble", async ({ code, sentence, shown }) => {
     render(
       <AppProvider token="token">
         <SeedRunningTask />
@@ -7640,22 +7644,21 @@ describe("terminal error frames", () => {
         timestamp: "2026-05-27T05:00:02Z",
         task_id: 1,
         task: { id: 1, status: "failed" },
-        message: "This response was interrupted.",
-        error: "This response was interrupted.",
+        message: sentence,
+        error: sentence,
+        ...(code ? { code } : {}),
       } as TestWebSocketMessage)
     })
 
     await waitFor(() => {
-      expect(screen.getByTestId("messages").textContent).toContain(
-        "This response was interrupted."
-      )
+      expect(screen.getByTestId("messages").textContent).toContain(shown)
     })
 
     expect(getSessionControls().state.traceEvents).toEqual([])
     const bubble = getSessionControls().state.messages.find(
       (message) =>
         typeof message.content === "string" &&
-        message.content.includes("This response was interrupted.")
+        message.content.includes(shown)
     )
     expect(bubble?.traceEvents?.map((event) => event.event_id)).toEqual([
       "trace-1",
@@ -8974,9 +8977,41 @@ describe("error frame display projection", () => {
         terminalErrorCode: null,
       },
     },
+    // The external cancel core's frame, field for field as the server sends
+    // it once broadcast_to_task has attached the state tuple. On a transport
+    // that marks legacy prose untrusted the dedup text stays the constant,
+    // but the bubble reads the client's own sentence for the code.
+    ...([false, true] as const).map((trustLegacyErrorProse) => ({
+      name: `the external cancel frame on ${trustLegacyErrorProse ? "a trusted" : "an untrusted"} transport`,
+      frame: {
+        type: "task_error",
+        timestamp: 1767225600.5,
+        task_id: 1,
+        task: { id: 1, status: "failed", run_id: "run-external", state_version: 5, control_state: "failed" },
+        message: "This response was interrupted.",
+        error: "This response was interrupted.",
+        code: "external_turn_interrupted",
+        run_id: "run-external",
+        state_version: 5,
+        control_state: "failed",
+        status: "failed",
+      } as unknown as TaskControlMessage,
+      trustLegacyErrorProse,
+      expected: {
+        isTerminal: true,
+        taskStatus: "failed" as const,
+        stopsProcessing: true,
+        dedupText: trustLegacyErrorProse ? "This response was interrupted." : "Unknown error",
+        occurrenceIdentity: "run-external:5",
+        bubbleContent: "clientErrors.externalTurnInterrupted",
+        isResult: true,
+        terminalErrorCode: "external_turn_interrupted" as const,
+      },
+    })),
     {
-      // The client error table has 22 non-connector codes plus this one the
-      // server can also emit on this frame (task_execution.py's docstring);
+      // The server can also emit this code on this frame (see
+      // create_terminal_task_error_event's docstring), but the client error
+      // table does not list it;
       // this row proves the new field is never widened to "whatever code
       // the frame carries" -- it stays null for a code outside the table,
       // even though the frame is terminal and the code did survive.

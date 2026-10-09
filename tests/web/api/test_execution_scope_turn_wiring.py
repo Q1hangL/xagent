@@ -979,10 +979,13 @@ async def test_resume_db_lifecycle_runs_in_short_session_workers() -> None:
         error_message: str | None,
         injection_outcome_unknown: bool = False,
         terminal_event_state: dict[str, Any] | None = None,
+        interruption: Any = None,
+        paused_for: list[Any] | None = None,
     ) -> None:
         assert acquired_lease is lease
         assert error_message is None
         assert terminal_event_state == {}
+        assert interruption is None
         worker_events.append(("release", threading.get_ident()))
 
     class FakeTracker:

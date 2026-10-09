@@ -63,7 +63,7 @@ def _kb_ids_lock(conn: Any) -> Iterator[None]:
         lock.acquire()
     except (Timeout, OSError, NotImplementedError) as error:
         raise DatabaseOperationError(
-            f"Cannot lock {path} to create a kb_id: {error!r}"
+            f"Cannot lock {path} to change kb_ids: {error!r}"
         ) from error
     try:
         yield
@@ -99,6 +99,74 @@ def get_or_create_kb_id(conn: Any, collection: str, user_id: int | None) -> str:
         finally:
             _safe_close_table(table)
         return kb_id
+
+
+def _owner(user_id: int | None) -> str:
+    return "user_id IS NULL" if user_id is None else f"user_id = {int(user_id)}"
+
+
+def _scoped(collection: str, user_id: int | None, is_admin: bool) -> str:
+    """Rows of ``collection`` the caller may change: a caller without a user gets none."""
+    where = _collection_filter(collection)
+    if is_admin:
+        return where
+    return f"{where} AND " + ("false" if user_id is None else _owner(user_id))
+
+
+def delete_kb_ids(
+    conn: Any, collection: str, *, user_id: int | None, is_admin: bool
+) -> int:
+    """Delete the caller's kb_id rows of ``collection`` (every owner's for an admin)."""
+    where = _scoped(collection, user_id, is_admin)
+    with _kb_ids_lock(conn):
+        ensure_kb_ids_table(conn)
+        table = conn.open_table(KB_IDS_TABLE)
+        try:
+            deleted = int(table.count_rows(where))
+            if deleted:
+                table.delete(where)
+        finally:
+            _safe_close_table(table)
+        return deleted
+
+
+def _set_collection(conn: Any, kb_ids: list[str], collection: str) -> None:
+    table = conn.open_table(KB_IDS_TABLE)
+    try:
+        # kb_ids are uuid hex strings read from this table, safe to inline.
+        quoted = ", ".join(f"'{kb_id}'" for kb_id in kb_ids)
+        table.update(where=f"kb_id IN ({quoted})", values={"collection": collection})
+    finally:
+        _safe_close_table(table)
+
+
+def rename_kb_ids(
+    conn: Any, old: str, new: str, *, user_id: int | None, is_admin: bool
+) -> list[str]:
+    """Rename the caller's kb_id rows of ``old`` (every owner's for an admin).
+
+    An owner's leftover row under ``new`` goes first. Returns the kb_ids, which keep their value.
+    """
+    with _kb_ids_lock(conn):
+        rows = _read_rows(conn, _scoped(old, user_id, is_admin))
+        if rows:
+            table = conn.open_table(KB_IDS_TABLE)
+            try:
+                for row in rows:
+                    table.delete(
+                        f"{_collection_filter(new)} AND {_owner(row['user_id'])}"
+                    )
+            finally:
+                _safe_close_table(table)
+            _set_collection(conn, [row["kb_id"] for row in rows], new)
+        return [row["kb_id"] for row in rows]
+
+
+def set_kb_ids_collection(conn: Any, kb_ids: list[str], collection: str) -> None:
+    """Move the rows of ``kb_ids`` to ``collection``, to undo :func:`rename_kb_ids`."""
+    if kb_ids:
+        with _kb_ids_lock(conn):
+            _set_collection(conn, kb_ids, collection)
 
 
 def read_kb_ids(

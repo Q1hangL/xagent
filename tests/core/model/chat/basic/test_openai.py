@@ -1,8 +1,11 @@
 """Test cases for OpenAI LLM implementation using OpenAI SDK."""
 
+import ast
 import asyncio
 import json
 import logging
+import re
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -14,14 +17,23 @@ from pydantic import BaseModel, ConfigDict
 
 from xagent.core.agent.context.execution import ExecutionContext
 from xagent.core.model.chat.basic.base import BaseLLM
+from xagent.core.model.chat.basic.call_boundary import classify_provider_failure
 from xagent.core.model.chat.basic.openai import (
     PROVIDER_STATE_METADATA_KEY,
     OpenAILLM,
     _format_openai_error,
+    _model_provider_error,
+    _provider_failure_kind,
     field_content,
 )
 from xagent.core.model.chat.error import retry_on
-from xagent.core.model.chat.exceptions import LLMEmptyContentError, LLMRetryableError
+from xagent.core.model.chat.exceptions import (
+    MODEL_PROVIDER_FAILURE_KINDS,
+    LLMEmptyContentError,
+    LLMRetryableError,
+    ModelProviderError,
+    ModelProviderRetryableError,
+)
 from xagent.core.model.chat.stream_progress import STREAM_ABORTED_KEY
 from xagent.core.model.chat.types import (
     CONTENT_SOURCE_KEY,
@@ -3063,3 +3075,700 @@ class TestStreamNoProgressAbort:
         assert not [
             r for r in caplog.records if "no content or tool calls" in r.getMessage()
         ]
+
+
+_PROVIDER_REQUEST = httpx.Request(
+    "POST", "https://api.example.test/v1/chat/completions"
+)
+
+
+def _status_error(
+    error_class: type[openai.APIStatusError],
+    status: int,
+    body: object,
+) -> openai.APIStatusError:
+    """An SDK status error built the way the SDK builds one.
+
+    ``body`` is the already-unwrapped error object (or the raw text of a body
+    that was not JSON); the message embeds it like the SDK's own
+    ``"Error code: NNN - ..."`` text.
+    """
+    return error_class(
+        f"Error code: {status} - {body}",
+        response=httpx.Response(status, request=_PROVIDER_REQUEST),
+        body=body,
+    )
+
+
+class _Shape:
+    """One provider failure and what the adapter must report for it."""
+
+    def __init__(
+        self,
+        build,
+        *,
+        kind: str,
+        status: int | None,
+        code: str | None,
+        message: str | None,
+        prefix: str,
+        stream_prefix: str | None = None,
+        retryable_on_stream: bool = False,
+        retry_on: bool = False,
+    ):
+        self.build = build
+        self.kind = kind
+        self.status = status
+        self.code = code
+        self.message = message
+        self.prefix = prefix
+        self.stream_prefix = stream_prefix or prefix
+        self.retryable_on_stream = retryable_on_stream
+        self.retry_on = retry_on
+
+
+_ECHOED_KEY = "sk-test-key-echo"
+
+_PROVIDER_SHAPES = {
+    "400": _Shape(
+        lambda: _status_error(
+            openai.BadRequestError,
+            400,
+            {"message": "Unsupported image format", "code": "invalid_value"},
+        ),
+        kind="bad_request",
+        status=400,
+        code="invalid_value",
+        message="Unsupported image format",
+        prefix="OpenAI bad request",
+    ),
+    "401": _Shape(
+        lambda: _status_error(
+            openai.AuthenticationError,
+            401,
+            {
+                "message": f"Incorrect API key provided: {_ECHOED_KEY}",
+                "code": "invalid_api_key",
+            },
+        ),
+        kind="authentication_failed",
+        status=401,
+        code="invalid_api_key",
+        message=f"Incorrect API key provided: {_ECHOED_KEY}",
+        prefix="OpenAI authentication failed",
+    ),
+    "403": _Shape(
+        lambda: _status_error(
+            openai.PermissionDeniedError,
+            403,
+            {"message": "Model is decommissioned", "code": "provider_code_4204"},
+        ),
+        kind="access_denied",
+        status=403,
+        code="provider_code_4204",
+        message="Model is decommissioned",
+        prefix="OpenAI API error",
+    ),
+    "404": _Shape(
+        lambda: _status_error(
+            openai.NotFoundError,
+            404,
+            {"message": "The model does not exist", "code": "model_not_found"},
+        ),
+        kind="not_found",
+        status=404,
+        code="model_not_found",
+        message="The model does not exist",
+        prefix="OpenAI API error",
+    ),
+    "408": _Shape(
+        lambda: _status_error(
+            openai.APIStatusError,
+            408,
+            {"message": "Request timeout", "code": "request_timeout"},
+        ),
+        kind="timeout",
+        status=408,
+        code="request_timeout",
+        message="Request timeout",
+        prefix="OpenAI API error",
+        retry_on=True,
+    ),
+    "429": _Shape(
+        lambda: _status_error(
+            openai.RateLimitError,
+            429,
+            {"message": "Slow down", "code": "rate_limit_exceeded"},
+        ),
+        kind="rate_limited",
+        status=429,
+        code="rate_limit_exceeded",
+        message="Slow down",
+        prefix="OpenAI rate limit exceeded",
+        retryable_on_stream=True,
+        retry_on=True,
+    ),
+    "503-plain-text": _Shape(
+        lambda: _status_error(openai.InternalServerError, 503, "upstream unavailable"),
+        kind="server_error",
+        status=503,
+        code=None,
+        message=None,
+        prefix="OpenAI API error",
+        retry_on=True,
+    ),
+    "timeout": _Shape(
+        lambda: openai.APITimeoutError(request=_PROVIDER_REQUEST),
+        kind="timeout",
+        status=None,
+        code=None,
+        message=None,
+        prefix="OpenAI API timeout",
+        retryable_on_stream=True,
+        retry_on=True,
+    ),
+    "connection": _Shape(
+        lambda: openai.APIConnectionError(request=_PROVIDER_REQUEST),
+        kind="connection_failed",
+        status=None,
+        code=None,
+        message=None,
+        prefix="OpenAI API error",
+        stream_prefix="OpenAI stream connection failed",
+        retryable_on_stream=True,
+        retry_on=True,
+    ),
+}
+
+
+async def _raise_from_adapter(mocker, openai_llm_config, method: str, error):
+    """Run one adapter method against a client whose request raises ``error``."""
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [error]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+    messages = [{"role": "user", "content": "Hi"}]
+    with pytest.raises(Exception) as caught:
+        if method == "stream_chat":
+            _ = [chunk async for chunk in llm.stream_chat(messages)]
+        else:
+            await getattr(llm, method)(messages)
+    return caught.value
+
+
+class TestModelProviderError:
+    """Every provider failure leaves the adapter as a typed exception whose
+    fields carry the response, with the text and retry behaviour unchanged."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["chat", "vision_chat", "stream_chat"])
+    @pytest.mark.parametrize("shape_id", list(_PROVIDER_SHAPES))
+    async def test_failure_is_typed_with_fields_text_and_cause(
+        self, openai_llm_config, mocker, method, shape_id
+    ):
+        shape = _PROVIDER_SHAPES[shape_id]
+        error = shape.build()
+
+        exc = await _raise_from_adapter(mocker, openai_llm_config, method, error)
+
+        prefix = shape.stream_prefix if method == "stream_chat" else shape.prefix
+        assert isinstance(exc, ModelProviderError)
+        assert exc.kind == shape.kind
+        assert exc.kind in MODEL_PROVIDER_FAILURE_KINDS
+        assert exc.status_code == shape.status
+        assert exc.provider_code == shape.code
+        assert exc.provider_message == shape.message
+        assert exc.prefix == prefix
+        assert str(exc).startswith(prefix)
+        assert exc.__cause__ is error
+        assert exc.details == []
+        assert str(exc) == _format_openai_error(prefix, error)
+        retryable = method == "stream_chat" and shape.retryable_on_stream
+        assert isinstance(exc, LLMRetryableError) is retryable
+        assert isinstance(exc, ModelProviderRetryableError) is retryable
+        assert retry_on(exc) is shape.retry_on
+        if shape_id == "401":
+            assert _ECHOED_KEY in exc.sdk_message
+            assert _ECHOED_KEY in str(exc)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["chat", "vision_chat", "stream_chat"])
+    async def test_an_oversized_message_is_capped_in_text_and_sdk_message(
+        self, openai_llm_config, mocker, method
+    ):
+        error = _status_error(openai.InternalServerError, 503, {"message": "x" * 5000})
+
+        exc = await _raise_from_adapter(mocker, openai_llm_config, method, error)
+
+        assert len(exc.sdk_message) < 4100
+        assert re.search(r"\.\.\.<truncated \d+ chars>$", str(exc))
+        assert exc.status_code == 503
+
+    def test_an_oversized_body_message_is_capped_in_provider_message(self):
+        error = _status_error(openai.InternalServerError, 503, {"message": "x" * 5000})
+
+        exc = _model_provider_error("OpenAI API error", error)
+
+        assert exc.provider_message is not None
+        assert re.search(r"\.\.\.<truncated \d+ chars>$", exc.provider_message)
+        assert len(exc.provider_message) < 4100
+
+    def test_format_openai_error_text_is_exact_with_and_without_status(self):
+        with_status = _status_error(
+            openai.PermissionDeniedError,
+            403,
+            {
+                "message": "Model is decommissioned",
+                "metadata": {"provider_name": "upstream-a", "raw": "raw body"},
+            },
+        )
+        without_status = openai.APIError(
+            "stream broke", request=_PROVIDER_REQUEST, body=None
+        )
+
+        assert _format_openai_error("OpenAI API error", with_status) == (
+            "OpenAI API error (403): Error code: 403 - {'message': "
+            "'Model is decommissioned', 'metadata': {'provider_name': 'upstream-a', "
+            "'raw': 'raw body'}} | provider_name=upstream-a | provider_raw=raw body"
+        )
+        assert _format_openai_error("OpenAI API error", without_status) == (
+            "OpenAI API error: stream broke"
+        )
+        # The raw status attribute is printed as received; validation of the
+        # status belongs to the typed exception, not to this text.
+        raw_status = openai.APIError("odd", request=_PROVIDER_REQUEST, body=None)
+        raw_status.status_code = 999  # type: ignore[attr-defined]
+        assert _format_openai_error("OpenAI API error", raw_status) == (
+            "OpenAI API error (999): odd"
+        )
+
+    @pytest.mark.asyncio
+    async def test_diagnostic_suffixes_are_kept_in_details_and_text(
+        self, openai_llm_config, mocker
+    ):
+        error = _status_error(
+            openai.PermissionDeniedError,
+            403,
+            {
+                "message": "Model is decommissioned",
+                "code": "provider_code_4204",
+                "metadata": {"provider_name": "upstream-a", "raw": "raw body"},
+            },
+        )
+
+        exc = await _raise_from_adapter(mocker, openai_llm_config, "chat", error)
+
+        assert exc.details == ["provider_name=upstream-a", "provider_raw=raw body"]
+        assert str(exc).endswith(" | provider_name=upstream-a | provider_raw=raw body")
+        assert str(exc) == _format_openai_error("OpenAI API error", error)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status", "body", "kind", "code", "message"),
+        [
+            (
+                403,
+                {
+                    "error": {
+                        "message": "Model is decommissioned",
+                        "code": "provider_code_4204",
+                    }
+                },
+                "access_denied",
+                "provider_code_4204",
+                "Model is decommissioned",
+            ),
+            (
+                401,
+                {
+                    "error": {
+                        "message": f"Incorrect API key provided: {_ECHOED_KEY}",
+                        "code": "invalid_api_key",
+                    }
+                },
+                "authentication_failed",
+                "invalid_api_key",
+                f"Incorrect API key provided: {_ECHOED_KEY}",
+            ),
+        ],
+    )
+    async def test_a_real_sdk_response_populates_the_fields(
+        self, openai_llm_config, status, body, kind, code, message
+    ):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status, json=body, request=request)
+
+        llm = OpenAILLM(**openai_llm_config)
+        llm._client = openai.AsyncOpenAI(
+            api_key="test-api-key",
+            base_url="https://api.example.test/v1",
+            max_retries=0,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+
+        with pytest.raises(ModelProviderError) as caught:
+            await llm.chat([{"role": "user", "content": "Hi"}])
+
+        exc = caught.value
+        assert exc.kind == kind
+        assert exc.status_code == status
+        assert exc.provider_code == code
+        assert exc.provider_message == message
+        assert isinstance(exc.__cause__, openai.APIStatusError)
+        assert str(exc) == _format_openai_error(exc.prefix, exc.__cause__)
+
+    @pytest.mark.asyncio
+    async def test_an_error_object_inside_an_sse_stream_is_unknown(
+        self, openai_llm_config
+    ):
+        first = {
+            "id": "c1",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "gpt-4o-mini",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "he"},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        error_event = {
+            "error": {
+                "message": "flagged",
+                "type": "invalid_request_error",
+                "code": "invalid_prompt",
+            }
+        }
+        body = f"data: {json.dumps(first)}\n\ndata: {json.dumps(error_event)}\n\n"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=body.encode(),
+                request=request,
+            )
+
+        llm = OpenAILLM(**openai_llm_config)
+        llm._client = openai.AsyncOpenAI(
+            api_key="test-api-key",
+            base_url="https://api.example.test/v1",
+            max_retries=0,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+
+        with pytest.raises(ModelProviderError) as caught:
+            _ = [
+                chunk
+                async for chunk in llm.stream_chat([{"role": "user", "content": "Hi"}])
+            ]
+
+        exc = caught.value
+        assert exc.kind == "unknown"
+        assert exc.status_code is None
+        assert exc.provider_code == "invalid_prompt"
+        assert exc.provider_message == "flagged"
+        assert isinstance(exc.__cause__, openai.APIError)
+        assert not isinstance(exc, LLMRetryableError)
+        assert str(exc) == "OpenAI API error: flagged"
+
+
+class _FailsToDescribeItself(Exception):
+    """An error whose every accessor raises."""
+
+    @property
+    def message(self):
+        raise RuntimeError("message accessor failed")
+
+    @property
+    def status_code(self):
+        raise RuntimeError("status accessor failed")
+
+    @property
+    def code(self):
+        raise RuntimeError("code accessor failed")
+
+    @property
+    def body(self):
+        raise RuntimeError("body accessor failed")
+
+    @property
+    def response(self):
+        raise RuntimeError("response accessor failed")
+
+
+class _UnprintableError(_FailsToDescribeItself):
+    def __str__(self):
+        raise RuntimeError("str failed")
+
+
+class _ResponseJsonFails:
+    def json(self):
+        raise ValueError("not json")
+
+
+class _OnlyMessageFails(Exception):
+    """A rate-limit-shaped error whose message accessor raises; the other
+    fields are intact."""
+
+    status_code = 429
+    body = {"message": "Slow down", "code": "rate_limit_exceeded"}
+
+    @property
+    def message(self):
+        raise RuntimeError("message accessor failed")
+
+
+class TestModelProviderErrorFactory:
+    @pytest.mark.parametrize(
+        ("error_class", "status", "kind"),
+        [
+            (openai.InternalServerError, 500, "server_error"),
+            (openai.APIStatusError, 599, "server_error"),
+            (openai.APIStatusError, 402, "rejected"),
+            (openai.ConflictError, 409, "rejected"),
+            (openai.UnprocessableEntityError, 422, "rejected"),
+            (openai.APIStatusError, 418, "rejected"),
+            (openai.APIStatusError, 302, "unknown"),
+        ],
+    )
+    def test_status_errors_map_to_a_kind_by_status(self, error_class, status, kind):
+        error = _status_error(error_class, status, {"message": "m"})
+
+        exc = _model_provider_error("OpenAI API error", error)
+
+        assert exc.kind == kind
+        assert exc.status_code == status
+
+    @pytest.mark.parametrize(
+        ("build", "kind", "boundary_code"),
+        [
+            (
+                lambda: _status_error(
+                    openai.AuthenticationError, 401, {"message": "m"}
+                ),
+                "authentication_failed",
+                "credential_rejected",
+            ),
+            (
+                lambda: _status_error(
+                    openai.PermissionDeniedError, 403, {"message": "m"}
+                ),
+                "access_denied",
+                "credential_rejected",
+            ),
+            (
+                lambda: _status_error(openai.NotFoundError, 404, {"message": "m"}),
+                "not_found",
+                "model_not_available",
+            ),
+            (
+                lambda: _status_error(openai.APIStatusError, 402, {"message": "m"}),
+                "rejected",
+                "provider_quota",
+            ),
+            (
+                lambda: _status_error(
+                    openai.InternalServerError, 503, {"message": "m"}
+                ),
+                "server_error",
+                "provider_unavailable",
+            ),
+            (
+                lambda: openai.APIConnectionError(request=_PROVIDER_REQUEST),
+                "connection_failed",
+                "provider_unavailable",
+            ),
+        ],
+        ids=["401", "403", "404", "402", "503", "connection"],
+    )
+    def test_the_failure_kind_is_distinct_from_the_call_boundary_code(
+        self, build, kind, boundary_code
+    ):
+        error = build()
+
+        assert (
+            _provider_failure_kind(error, getattr(error, "status_code", None)) == kind
+        )
+        assert classify_provider_failure(error) == boundary_code
+
+    def test_an_error_without_a_status_is_unknown(self):
+        error = openai.APIError("stream broke", request=_PROVIDER_REQUEST, body=None)
+
+        exc = _model_provider_error("OpenAI API error", error)
+
+        assert exc.kind == "unknown"
+        assert exc.status_code is None
+        assert exc.provider_code is None
+        assert exc.provider_message is None
+
+    def test_a_response_validation_error_keeps_its_status_and_is_unknown(self):
+        error = openai.APIResponseValidationError(
+            httpx.Response(200, request=_PROVIDER_REQUEST),
+            body=None,
+            message="bad shape",
+        )
+
+        exc = _model_provider_error("OpenAI API error", error)
+
+        assert exc.kind == "unknown"
+        assert exc.status_code == 200
+
+    def test_a_non_sdk_exception_is_unknown(self):
+        exc = _model_provider_error("OpenAI API error", ValueError("odd"))
+
+        assert exc.kind == "unknown"
+        assert exc.status_code is None
+        assert exc.sdk_message == "odd"
+
+    @pytest.mark.parametrize("status", [True, "403", 403.0, 99, 600, None])
+    def test_only_an_integer_http_status_is_accepted(self, status):
+        class _Odd(Exception):
+            status_code = None
+
+        error = _Odd("odd")
+        error.status_code = status
+
+        exc = _model_provider_error("OpenAI API error", error)
+
+        assert exc.status_code is None
+        assert exc.kind == "unknown"
+
+    @pytest.mark.parametrize("message", [None, "", "   ", 7, ["x"]])
+    def test_a_blank_or_non_string_body_message_is_absent(self, message):
+        error = _status_error(
+            openai.PermissionDeniedError, 403, {"message": message, "code": "c"}
+        )
+
+        exc = _model_provider_error("OpenAI API error", error)
+
+        assert exc.provider_message is None
+        assert exc.provider_code == "c"
+
+    def test_it_never_raises_when_every_accessor_fails(self):
+        error = _FailsToDescribeItself("transport exploded")
+        error.__dict__["response"] = _ResponseJsonFails()
+
+        exc = _model_provider_error("OpenAI API error", error)
+
+        assert type(exc) is ModelProviderError
+        assert exc.kind == "unknown"
+        assert exc.status_code is None
+        assert exc.provider_message is None
+        assert exc.provider_code is None
+        assert exc.details == []
+        assert exc.sdk_message == "transport exploded"
+
+    def test_it_never_raises_when_the_response_body_cannot_be_read(self):
+        class _Error(Exception):
+            body = None
+            response = _ResponseJsonFails()
+
+        exc = _model_provider_error("OpenAI API error", _Error("no body"))
+
+        assert exc.kind == "unknown"
+        assert exc.provider_message is None
+        assert exc.provider_code is None
+        assert exc.details == []
+        assert exc.sdk_message == "no body"
+
+    def test_it_never_raises_when_the_error_cannot_even_be_printed(self):
+        exc = _model_provider_error("OpenAI API error", _UnprintableError())
+
+        assert type(exc) is ModelProviderError
+        assert exc.kind == "unknown"
+        assert exc.sdk_message
+        assert "_UnprintableError" in exc.sdk_message
+
+    def test_one_failing_field_does_not_affect_the_others(self):
+        exc = _model_provider_error("OpenAI API error", _OnlyMessageFails("Slow down"))
+
+        assert exc.kind == "rate_limited"
+        assert exc.status_code == 429
+        assert exc.provider_code == "rate_limit_exceeded"
+        assert exc.provider_message == "Slow down"
+        assert exc.sdk_message == "Slow down"
+
+
+def _openai_adapter_methods_and_handlers():
+    """(method name, handler) for every ``except openai.*`` handler inside the
+    three public request methods of ``OpenAICompatibleLLM``."""
+    import xagent.core.model.chat.basic.openai as adapter
+
+    tree = ast.parse(Path(adapter.__file__).read_text(encoding="utf-8"))
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "OpenAICompatibleLLM"
+    )
+    wanted = {"chat", "vision_chat", "stream_chat"}
+    methods = [
+        node
+        for node in cls.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name in wanted
+    ]
+    assert {method.name for method in methods} == wanted
+
+    def is_openai_attribute(node: ast.expr) -> bool:
+        return (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "openai"
+        )
+
+    for method in methods:
+        for node in ast.walk(method):
+            if not isinstance(node, ast.ExceptHandler) or node.type is None:
+                continue
+            if is_openai_attribute(node.type) or (
+                isinstance(node.type, ast.Tuple)
+                and all(is_openai_attribute(elt) for elt in node.type.elts)
+            ):
+                yield method.name, node
+
+
+def _raises_directly_in(handler: ast.ExceptHandler):
+    """Raise nodes in the handler body, not descending into nested scopes."""
+    pending: list[ast.AST] = list(handler.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, ast.Raise):
+            yield node
+        if isinstance(
+            node,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef),
+        ):
+            continue
+        pending.extend(ast.iter_child_nodes(node))
+
+
+class TestEveryProviderRaiseSiteIsTyped:
+    def test_each_openai_handler_raises_through_the_factory_from_its_error(self):
+        offenders: list[str] = []
+        checked = 0
+        for method_name, handler in _openai_adapter_methods_and_handlers():
+            for raise_node in _raises_directly_in(handler):
+                if raise_node.exc is None:
+                    continue
+                checked += 1
+                call = raise_node.exc
+                through_factory = (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Name)
+                    and call.func.id == "_model_provider_error"
+                )
+                from_handler_error = (
+                    isinstance(raise_node.cause, ast.Name)
+                    and handler.name is not None
+                    and raise_node.cause.id == handler.name
+                )
+                if not (through_factory and from_handler_error):
+                    offenders.append(f"{method_name}: line {raise_node.lineno}")
+
+        assert offenders == []
+        assert checked == 16

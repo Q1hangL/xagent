@@ -12,12 +12,13 @@ import time
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import quote
 from uuid import uuid4
 
 import requests
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 from .utils import allowed_dirs_from_env, setup_proxy_env, url_path_id
 
@@ -79,6 +80,26 @@ _MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 _MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
+# Appended to a 404 from a path-addressed lookup. In #2875 the agent guessed a
+# "Documents/" folder and then passed its own workspace path to this
+# connector, after onedrive_search_files missed a file at the drive root.
+_PATH_NOT_FOUND_HINT = (
+    "No OneDrive item exists at this path. Paths are relative to the drive "
+    "root (e.g. 'Reports/Q3.pptx'), not a local task-workspace path. "
+    "onedrive_search_files can miss existing items, so list the parent folder "
+    "with onedrive_list_items (omit folder_path for the root) to get the exact "
+    "path."
+)
+_DriveFilePath = Annotated[
+    str,
+    Field(
+        description=(
+            "File path relative to the drive root, with '/' between folders; "
+            "not a local task-workspace path."
+        )
+    ),
+]
+
 _UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"
 _OUTPUT_DIR_ENV_VAR = "XAGENT_ONEDRIVE_OUTPUT_DIR"
 
@@ -88,11 +109,12 @@ class _UploadError(RuntimeError):
 
 
 class _GraphRequestError(RuntimeError):
-    """Graph HTTP failure that retains its status without response parsing."""
+    """Graph HTTP failure that keeps its status and Graph error code."""
 
-    def __init__(self, message: str, status_code: int) -> None:
+    def __init__(self, message: str, status_code: int, code: str | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.code = code
 
 
 class _QuickXorHash:
@@ -576,7 +598,14 @@ def _graph_request(
     extra_headers: dict[str, str] | None = None,
     raw: bool = False,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    path_lookup: bool = False,
 ) -> Any:
+    """Send one Graph request.
+
+    path_lookup marks a request whose drive path the agent supplied and which
+    must already exist (a lookup, or the parent of a new folder); only then
+    does a missing item get _PATH_NOT_FOUND_HINT.
+    """
     response = requests.request(
         method=method,
         url=f"{GRAPH_BASE_URL}{path}",
@@ -589,17 +618,41 @@ def _graph_request(
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
-        response_text = response.text.strip()
-        message = str(exc)
-        if response_text:
-            message = f"{message} - {response_text}"
-        raise _GraphRequestError(message, response.status_code) from exc
+        # Never forward the response body or requests' own message: Graph and
+        # its backing storage may echo a preauthenticated download URL into
+        # either. Callers branch on the parsed error code instead; the message
+        # format matches powerpoint.py's.
+        code = _graph_error_code(response)
+        message = f"Graph {method} {path} failed with HTTP {response.status_code}"
+        if code:
+            message = f"{message} ({code})"
+        if path_lookup and _is_path_miss(response.status_code, code):
+            message = f"{message}. {_PATH_NOT_FOUND_HINT}"
+        raise _GraphRequestError(message, response.status_code, code) from exc
 
     if raw:
         return response.content
     if response.status_code == 204 or not response.content:
         return {}
     return response.json()
+
+
+def _is_path_miss(status_code: int, code: str | None) -> bool:
+    """Whether a 404 says the item is missing, rather than e.g. the drive.
+
+    A body without a parsable Graph code is still treated as a miss.
+    """
+    return status_code == 404 and code in (None, "itemNotFound")
+
+
+def _graph_error_code(response: Any) -> str | None:
+    try:
+        payload = response.json()
+    except (ValueError, TypeError):
+        return None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) and code else None
 
 
 def _normalize_path(path: str | None) -> str | None:
@@ -869,9 +922,11 @@ def _resolve_upload_file_path(local_file_path: str) -> Path:
             ", ".join(str(path) for path in allowed_dirs),
         )
         raise PermissionError(
-            "local_file_path is outside the allowed upload directories; ask the "
-            "user for a file inside the task workspace or another allowed "
-            "location"
+            "local_file_path is outside the allowed upload directories; pass "
+            "an absolute path inside the task workspace, or, if this tool's "
+            "description says a registered file_id may be supplied, pass the "
+            "xagent file_id as file:<file_id> (from list_all_user_files or a "
+            "file reference; not a OneDrive item id)"
         )
 
     if local_path.exists() and not local_path.is_file():
@@ -1186,13 +1241,25 @@ def onedrive_get_profile() -> str:
 
 
 @mcp.tool()
-def onedrive_list_items(folder_path: str | None = None, top: int = 50) -> str:
+def onedrive_list_items(
+    folder_path: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Folder path relative to the drive root, e.g. 'Reports'; omit "
+                "for the root; not a local task-workspace path."
+            )
+        ),
+    ] = None,
+    top: int = 50,
+) -> str:
     """List files and folders in OneDrive, optionally under a folder path."""
     try:
         result = _graph_request(
             "GET",
             _children_path(folder_path),
             params={"$top": max(1, min(top, 200))},
+            path_lookup=True,
         )
         return _success(items=_caller_safe_drive_item(result.get("value", [])))
     except Exception as e:
@@ -1219,7 +1286,18 @@ def onedrive_search_files(query: str, top: int = 25) -> str:
 
 
 @mcp.tool()
-def onedrive_get_item(path: str | None = None, item_id: str | None = None) -> str:
+def onedrive_get_item(
+    path: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Item path relative to the drive root, e.g. 'Reports/Q3.pptx'; "
+                "not a local task-workspace path."
+            )
+        ),
+    ] = None,
+    item_id: str | None = None,
+) -> str:
     """Get OneDrive metadata by path or item_id."""
     try:
         if item_id:
@@ -1228,7 +1306,7 @@ def onedrive_get_item(path: str | None = None, item_id: str | None = None) -> st
                 f"/me/drive/items/{url_path_id(item_id, 'item_id')}",
             )
         elif path:
-            result = _graph_request("GET", _item_path(path))
+            result = _graph_request("GET", _item_path(path), path_lookup=True)
         else:
             raise ValueError("either path or item_id is required")
         return _success(item=_caller_safe_drive_item(result))
@@ -1238,10 +1316,12 @@ def onedrive_get_item(path: str | None = None, item_id: str | None = None) -> st
 
 
 @mcp.tool()
-def onedrive_get_file_content(file_path: str) -> str:
+def onedrive_get_file_content(file_path: _DriveFilePath) -> str:
     """Read text content by path; use onedrive_download_file for binaries."""
     try:
-        content = _graph_request("GET", _content_path(file_path), raw=True)
+        content = _graph_request(
+            "GET", _content_path(file_path), raw=True, path_lookup=True
+        )
         text_content, base64_content = _decode_bytes(content)
         return _success(
             file_path=file_path,
@@ -1255,7 +1335,7 @@ def onedrive_get_file_content(file_path: str) -> str:
 
 
 @mcp.tool()
-def onedrive_download_file(file_path: str, filename: str = "") -> str:
+def onedrive_download_file(file_path: _DriveFilePath, filename: str = "") -> str:
     """Download a OneDrive binary file into the current task workspace.
 
     This tool is intended for Office files and other binary content that must
@@ -1272,6 +1352,7 @@ def onedrive_download_file(file_path: str, filename: str = "") -> str:
             "GET",
             _item_path(file_path),
             params={"$select": "id,name,size,file,@microsoft.graph.downloadUrl"},
+            path_lookup=True,
         )
         if (
             not isinstance(metadata, dict)
@@ -1338,7 +1419,11 @@ def onedrive_download_file(file_path: str, filename: str = "") -> str:
         raw_message = str(e)
         public_message = "OneDrive file download failed"
         if isinstance(e, _GraphRequestError):
+            # Only the metadata lookup by path goes through _graph_request
+            # here; a failed content stream raises a plain RuntimeError.
             public_message = f"OneDrive file download failed with HTTP {e.status_code}"
+            if _is_path_miss(e.status_code, e.code):
+                public_message = f"{public_message}. {_PATH_NOT_FOUND_HINT}"
         elif raw_message.startswith(
             (
                 "No task workspace configured for this connector",
@@ -1366,7 +1451,7 @@ def onedrive_download_file(file_path: str, filename: str = "") -> str:
 
 @mcp.tool()
 def onedrive_upload_text_file(
-    file_path: str,
+    file_path: _DriveFilePath,
     content: str,
 ) -> str:
     """
@@ -1406,7 +1491,18 @@ def onedrive_upload_text_file(
 
 @mcp.tool()
 def onedrive_upload_file(
-    local_file_path: str, remote_path: str = "", mime_type: str = ""
+    local_file_path: str,
+    remote_path: Annotated[
+        str,
+        Field(
+            description=(
+                "Destination path relative to the drive root, e.g. "
+                "'Reports/report.pdf'; not a local task-workspace path. Empty "
+                "uploads to the root under the local file name."
+            )
+        ),
+    ] = "",
+    mime_type: str = "",
 ) -> str:
     """
     Upload a local file's real bytes to OneDrive -- use this (not
@@ -1420,7 +1516,7 @@ def onedrive_upload_file(
     the process working directory is used as a fallback, so this is not an
     absolute guarantee against access to host files. Pass an absolute path;
     a relative path resolves against this process's working directory.
-    remote_path: the OneDrive path to upload to (e.g. "Documents/report.pdf"),
+    remote_path: the OneDrive path to upload to (e.g. "Reports/report.pdf"),
     overwriting any existing file there; defaults to the local file's own
     name at the OneDrive root.
     mime_type: defaults to a guess from the remote filename, then the local
@@ -1519,7 +1615,15 @@ def onedrive_upload_file(
 @mcp.tool()
 def onedrive_create_folder(
     folder_name: str,
-    parent_path: str | None = None,
+    parent_path: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Existing parent folder path relative to the drive root, e.g. "
+                "'Reports'; omit for the root; not a local task-workspace path."
+            )
+        ),
+    ] = None,
     conflict_behavior: str = "rename",
 ) -> str:
     """Create a OneDrive folder under the specified parent path."""
@@ -1537,6 +1641,7 @@ def onedrive_create_folder(
                 "folder": {},
                 "@microsoft.graph.conflictBehavior": normalized_behavior,
             },
+            path_lookup=True,
         )
         return _success(folder=_caller_safe_drive_item(result))
     except Exception as e:
@@ -1697,8 +1802,8 @@ def onedrive_move_item(
             # Graph also answers 409 for other conflicts (its error docs give
             # a missing parent folder as the example), so only its
             # nameAlreadyExists code is reported as a name clash; any other
-            # 409 keeps Graph's own error.
-            if exc.status_code == 409 and "nameAlreadyExists" in str(exc):
+            # 409 keeps Graph's own status and error code.
+            if exc.status_code == 409 and exc.code == "nameAlreadyExists":
                 target_name = body.get("name", source.get("name"))
                 raise ValueError(
                     f"The destination folder already contains an item named "

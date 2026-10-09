@@ -1,3 +1,8 @@
+import re
+from pathlib import Path
+
+import pytest
+
 from xagent.core.tools.adapters.vibe.config import RequiredMCPUnavailableError
 from xagent.web.services.client_error_messages import (
     CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
@@ -8,6 +13,7 @@ from xagent.web.services.client_error_messages import (
     client_error_message,
     required_mcp_unavailable_client_message,
 )
+from xagent.web.services.external_task_cancel import EXTERNAL_TURN_INTERRUPTED_MESSAGE
 
 
 def test_client_error_codes_have_fixed_safe_fallbacks() -> None:
@@ -26,6 +32,12 @@ def test_client_error_codes_have_fixed_safe_fallbacks() -> None:
     assert (
         client_error_message(ClientErrorCode.GUIDANCE_IN_PROGRESS)
         == CLIENT_SAFE_GUIDANCE_IN_PROGRESS
+    )
+    # The cancel core broadcasts and persists its own constant; this table
+    # keeps an independent literal, so the two are tied here.
+    assert (
+        client_error_message(ClientErrorCode.EXTERNAL_TURN_INTERRUPTED)
+        == EXTERNAL_TURN_INTERRUPTED_MESSAGE
     )
     assert {code.value: client_error_message(code) for code in ClientErrorCode} == {
         "message_processing_failed": "The message could not be processed. Please try again.",
@@ -84,6 +96,7 @@ def test_client_error_codes_have_fixed_safe_fallbacks() -> None:
             "The message may or may not have been applied. Check the "
             "conversation before sending it again."
         ),
+        "external_turn_interrupted": "This response was interrupted.",
     }
 
 
@@ -103,3 +116,28 @@ def test_required_mcp_adapter_rejects_incidental_exceptions() -> None:
         )
         == CLIENT_SAFE_TASK_FAILURE
     )
+
+
+_FRONTEND_TABLE = (
+    Path(__file__).resolve().parents[2]
+    / "frontend"
+    / "src"
+    / "lib"
+    / "client-errors.ts"
+)
+
+
+def test_the_interruption_code_is_in_the_frontend_error_table() -> None:
+    """The cancel core's code is only useful if the client table lists it.
+
+    A client that does not render server prose shows a generic fallback for
+    any code ``CLIENT_ERROR_CODES`` does not list, so renaming either side
+    alone would silently undo the localized wording.
+    """
+    if not _FRONTEND_TABLE.exists():
+        pytest.skip(f"frontend source not present: {_FRONTEND_TABLE}")
+    source = _FRONTEND_TABLE.read_text(encoding="utf-8")
+    table = source.split("export const CLIENT_ERROR_CODES = [", 1)
+    assert len(table) == 2, "could not parse: CLIENT_ERROR_CODES moved"
+    listed = set(re.findall(r'^\s*"(\w+)",', table[1].split("] as const", 1)[0], re.M))
+    assert ClientErrorCode.EXTERNAL_TURN_INTERRUPTED.value in listed

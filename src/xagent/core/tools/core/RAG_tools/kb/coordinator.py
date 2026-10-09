@@ -2165,8 +2165,8 @@ class KBCoordinator:
         *,
         user_id: int,
         is_admin: bool,
-    ) -> None:
-        """Open the snapshot's collection handle and restore its rows."""
+    ) -> list[str]:
+        """Restore the snapshot's rows; return the doc_ids marked partially embedded."""
         handle = self.open_collection_sync(
             KBContextRequest(
                 collection=snapshot.collection,
@@ -2176,7 +2176,27 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        handle.restore_document_rows(snapshot, user_id=user_id, is_admin=is_admin)
+        return handle.restore_document_rows(
+            snapshot, user_id=user_id, is_admin=is_admin
+        )
+
+    def discard_uncommitted_embeddings_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        user_id: int | None,
+    ) -> int:
+        """Delete the document's invisible vector rows through its collection handle."""
+        handle = self.open_collection_sync(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return handle.discard_uncommitted_embeddings(doc_id, user_id=user_id)
 
     async def restore_candidate_cleanup_snapshot(
         self,

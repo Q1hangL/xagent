@@ -74,6 +74,11 @@ from ..models.database import (
 from ..models.system_setting import SystemSetting
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
+from ..oauth_account_hosts import (
+    OAuthAccountError,
+    get_oauth_account_host,
+    resolve_oauth_account_endpoints,
+)
 from ..oauth_provider_quirks import (
     matches_provider_family,
     requires_json_accept_header,
@@ -396,6 +401,13 @@ def _oauth_provider_config_error(
             "environment variables and restart the backend.</p>"
         ),
         status_code=500,
+    )
+
+
+def _oauth_account_error_response(message: str) -> HTMLResponse:
+    return HTMLResponse(
+        content=f"<h1>Error: Invalid account</h1><p>{html.escape(message)}</p>",
+        status_code=400,
     )
 
 
@@ -2462,6 +2474,7 @@ def generic_oauth_login(
     redirect: Optional[str] = None,
     db: Optional[Session] = None,
     db_provider: Optional[Any] = None,
+    account: Optional[str] = None,
 ) -> Any:
     """Start the ordinary public OAuth flow without actor claims or cookies."""
     return _generic_oauth_login(
@@ -2474,6 +2487,7 @@ def generic_oauth_login(
         trusted_user_id=None,
         resource_owner_key=None,
         actor_flow_nonce=None,
+        account=account,
     )
 
 
@@ -2858,6 +2872,7 @@ def start_builtin_oauth_for_resource_owner(
     redirect: str | None = None,
     db: Session,
     db_provider: Any,
+    account: str | None = None,
 ) -> Any:
     """Start actor OAuth; the caller owns the surrounding transaction."""
     if not isinstance(app_id, str) or not app_id.strip():
@@ -2891,6 +2906,7 @@ def start_builtin_oauth_for_resource_owner(
         trusted_user_id=int(user.id),
         resource_owner_key=owner_key,
         actor_flow_nonce=nonce_digest,
+        account=account,
     )
     if not isinstance(response, RedirectResponse):
         return response
@@ -3278,6 +3294,7 @@ def _generic_oauth_login(
     trusted_user_id: int | None,
     resource_owner_key: str | None,
     actor_flow_nonce: str | None,
+    account: str | None,
 ) -> Any:
     """Build an ordinary or trusted actor provider authorization redirect."""
     if db is None:
@@ -3345,6 +3362,23 @@ def _generic_oauth_login(
                 status_code=404,
             )
 
+    # A provider hosted on the customer's own account authorizes on that
+    # account's host; the validated label rides the signed state so the
+    # callback exchanges the code on the same account (oauth_account_hosts).
+    account_host = get_oauth_account_host(provider)
+    bound_account: str | None = None
+    if account_host is None and account is not None:
+        return _oauth_account_error_response(
+            f"{provider} does not take an account identifier."
+        )
+    if account_host is not None:
+        try:
+            account_endpoints = resolve_oauth_account_endpoints(account_host, account)
+        except OAuthAccountError as exc:
+            return _oauth_account_error_response(str(exc))
+        auth_url = account_endpoints.authorize_url
+        bound_account = account_endpoints.account
+
     state_payload = {
         "type": "oauth_state",
         "user_id": user_id,
@@ -3352,6 +3386,8 @@ def _generic_oauth_login(
         "app_id": app_id,
         "redirect": redirect,
     }
+    if bound_account is not None:
+        state_payload["oauth_account"] = bound_account
     # Newer Salesforce orgs enforce PKCE on this authorization-code grant at
     # the org level, with no per-app way to disable it (Setup > External
     # Client Apps > Security > "Require Proof Key for Code Exchange" is
@@ -4087,6 +4123,32 @@ def generic_oauth_callback(
     token_url = db_provider.token_url
     userinfo_url = db_provider.userinfo_url
 
+    # The account bound at login comes only from the signed state, never
+    # from this callback's query string, and is re-resolved here since DNS
+    # may have changed since the redirect (oauth_account_hosts).
+    account_host = get_oauth_account_host(provider)
+    bound_account: str | None = None
+    if account_host is None and "oauth_account" in payload:
+        _log_oauth_callback_rejection(
+            provider, "account_unexpected", app_id=app_id, actor_flow=is_actor_flow
+        )
+        return _oauth_account_error_response(
+            f"{provider} does not take an account identifier."
+        )
+    if account_host is not None:
+        try:
+            account_endpoints = resolve_oauth_account_endpoints(
+                account_host, payload.get("oauth_account")
+            )
+        except OAuthAccountError as exc:
+            _log_oauth_callback_rejection(
+                provider, "account_invalid", app_id=app_id, actor_flow=is_actor_flow
+            )
+            return _oauth_account_error_response(str(exc))
+        token_url = account_endpoints.token_url
+        userinfo_url = account_endpoints.userinfo_url
+        bound_account = account_endpoints.account
+
     redirect_uri = _resolve_oauth_redirect_uri(provider, db_provider)
 
     try:
@@ -4194,6 +4256,9 @@ def generic_oauth_callback(
             # only (no provider needs both quirks at once yet).
             headers["Content-Type"] = "application/json"
             post_kwargs = {"json": data}
+        if bound_account is not None:
+            # The client secret and code go only to the bound account host.
+            post_kwargs["allow_redirects"] = False
 
         token_response = requests.post(
             token_url,
@@ -4614,7 +4679,13 @@ def generic_oauth_callback(
             info_headers = {"Authorization": f"Bearer {access_token}"}
             # Replace {{access_token}} placeholder if present
             actual_url = userinfo_url.replace("{{access_token}}", access_token)
-            info_response = requests.get(actual_url, headers=info_headers, timeout=10.0)
+            info_get_kwargs: dict[str, Any] = {}
+            if bound_account is not None:
+                # A redirect would skip the account host's private-network check.
+                info_get_kwargs["allow_redirects"] = False
+            info_response = requests.get(
+                actual_url, headers=info_headers, timeout=10.0, **info_get_kwargs
+            )
             if info_response.status_code != 200:
                 # A non-200 userinfo response (401/403/429/5xx -- an
                 # expired/insufficiently-scoped token, or the provider's
@@ -4690,6 +4761,24 @@ def generic_oauth_callback(
                 )
             provider_user_id = info_data.get(db_provider.user_id_path or "id")
             email = info_data.get(db_provider.email_path or "email")
+
+        if bound_account is not None and not provider_user_id:
+            # Fail closed before any write: an account-bound grant without an
+            # identity could not be told apart from another account's.
+            _log_oauth_callback_rejection(
+                provider,
+                "account_identity_missing",
+                app_id=app_id,
+                actor_flow=is_actor_flow,
+            )
+            return HTMLResponse(
+                content=(
+                    "<h1>Error verifying the connected account</h1>"
+                    f"<p>{html.escape(provider)} did not return an account "
+                    "identity.</p>"
+                ),
+                status_code=400,
+            )
 
         if is_actor_flow:
             assert user_id is not None
@@ -4805,6 +4894,9 @@ def generic_oauth_callback(
                 # myob_business_id is the already-guarded value from above
                 # (MYOB can't reach this branch without it).
                 resolved_instance_url = myob_business_id
+            elif bound_account is not None:
+                # The account bound at login, never a token-response value.
+                resolved_instance_url = bound_account
             setattr(oauth_account, "instance_url", resolved_instance_url)
             setattr(oauth_account, "expires_at", None)
             if "expires_in" in token_data:
@@ -4965,6 +5057,7 @@ def oauth_login(
     token: Optional[str] = None,
     app_id: Optional[str] = None,
     redirect: Optional[str] = None,
+    account: Optional[str] = None,
     db: Session = Depends(get_db),
 ) -> Any:
     """Unified entry point for OAuth login"""
@@ -4979,7 +5072,9 @@ def oauth_login(
         )
 
     # But now everything can be routed through generic
-    return generic_oauth_login(provider, token, app_id, redirect, db, db_provider)
+    return generic_oauth_login(
+        provider, token, app_id, redirect, db, db_provider, account=account
+    )
 
 
 @auth_router.get("/{provider}/callback")

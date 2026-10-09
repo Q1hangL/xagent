@@ -910,9 +910,11 @@ def _resolve_upload_file_path(file_path: str) -> Path:
             ", ".join(str(path) for path in allowed_dirs),
         )
         raise PermissionError(
-            "file path is outside the allowed directories; ask the user "
-            "for a file inside the task workspace or another allowed "
-            "location"
+            "file path is outside the allowed directories; pass an absolute "
+            "path inside the task workspace, or, if this tool's description "
+            "says a registered file_id may be supplied, pass the xagent "
+            "file_id as file:<file_id> (from list_all_user_files or a file "
+            "reference; not a Google Drive file id)"
         )
 
     if not local_path.is_file():
@@ -1046,15 +1048,31 @@ _PER_FILE_ACCESS_NOTE = (
     "created through this app or explicitly granted to it, so a file the "
     "user can open in Google Drive may still not be visible here."
 )
+# The Google Docs, Sheets and Slides connectors open their own files by link
+# without this connection, but cannot open an Office file stored in Drive.
+# This process does not know which of them are connected, so the hint for
+# native files is worded as a condition. The user is asked to paste a link,
+# not to share it: those connectors use the user's own Google account, so no
+# sharing is needed.
 _OPEN_BY_LINK_HINT = (
     "To work with an existing Google Docs, Sheets or Slides file, ask the "
-    "user for its link and open it with the Google Docs, Sheets or Slides "
-    "tools when they are available; otherwise offer to create a new file."
+    "user for its link and open it with the matching Google Docs, Sheets or "
+    "Slides tools; if those tools are not available, ask the user to connect "
+    "the matching Google Docs, Google Sheets or Google Slides connector and "
+    "then paste the link."
+)
+_OFFICE_FILE_HINT = (
+    "An uploaded file, such as an Excel (.xlsx), Word (.docx), PowerPoint "
+    "(.pptx) or PDF file, cannot be opened with the Google Docs, Sheets or "
+    "Slides tools: ask the user to attach it to their message instead, or, "
+    "for an Office file, to open it in Google Docs, Sheets or Slides, save it "
+    "as a Google file (for example File > Save as Google Sheets) and paste "
+    "the new file's link."
 )
 _EMPTY_SEARCH_NOTE = (
     "No files matched. This connection only sees files it can access. "
     f"{_PER_FILE_ACCESS_NOTE} An empty result does not mean the file does "
-    f"not exist. {_OPEN_BY_LINK_HINT}"
+    f"not exist. {_OPEN_BY_LINK_HINT} {_OFFICE_FILE_HINT}"
 )
 # files.list can return an empty page together with a nextPageToken, so an
 # empty page only means "nothing matched" when no token comes with it.
@@ -1069,7 +1087,7 @@ def _unavailable_file_message(exc: Exception) -> str:
     return (
         "Google Drive could not open this file: it does not exist, or this "
         f"Drive connection cannot access it. {_PER_FILE_ACCESS_NOTE} "
-        f"{_OPEN_BY_LINK_HINT} Google API response: "
+        f"{_OPEN_BY_LINK_HINT} {_OFFICE_FILE_HINT} Google API response: "
         f"{google_api_error_summary(exc)}"
     )
 
@@ -1152,6 +1170,10 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
     PDF, an Office format, an image, or any other binary content, use
     google_drive_download_file instead, which writes the real bytes to a
     file instead of decoding them as text.
+    A Google Sheets spreadsheet is exported as CSV by default, which holds
+    only its first sheet (tab); to read the other sheets, use the Google
+    Sheets tools if they are available, or export it to an Excel file with
+    google_drive_download_file.
     The result's "encoding" field is "utf-8" for ordinary text, or "base64"
     for the rare case where content typed as text still wasn't valid UTF-8
     (e.g. a legacy-encoded file) -- check this before treating "content" as
@@ -1302,7 +1324,14 @@ def google_drive_download_file(
     image, Office format, etc.) that google_drive_get_file_content would
     otherwise corrupt by decoding as text. The returned path can be passed
     directly to another tool that reads local files, e.g. gmail_send_messages's
-    'attachments'.
+    'attachments'. A downloaded Excel (.xlsx), Word (.docx) or PDF file can
+    be read with read_file, and a PowerPoint (.pptx) file with read_pptx,
+    when those tools are available. read_file chooses how to read a file by
+    its extension, so the saved name must keep the file's own extension
+    (for example .xlsx, .docx or .pdf). If the returned path has no
+    extension at all (an uploaded file whose Drive name has none), download
+    the file again with a filename that adds the extension of its returned
+    mimeType (see filename).
 
     mime_type: required when file_id is a Google Workspace document (Docs,
     Sheets, Slides) — the format to export to (e.g. "application/pdf").
@@ -1312,7 +1341,11 @@ def google_drive_download_file(
     file's own name. Either way, if exporting a Workspace document the
     mime_type's extension is appended when not already present (so a bare
     filename="report" for an "application/pdf" export still ends up
-    "report.pdf").
+    "report.pdf"). For any other file nothing is appended: the file is
+    saved under the filename, or its Drive name, as it is. So a filename
+    given here must keep the file's own extension (e.g. "report.xlsx", not
+    "report"), and a file whose Drive name has no extension needs a
+    filename that adds one.
 
     The result's "file" also carries modifiedTime, version, shared, driveId
     and, for a stored (non-Google) file, headRevisionId. When saving an

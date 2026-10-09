@@ -59,6 +59,15 @@ class ClientErrorCode(StrEnum):
     TASK_ACCESS_DENIED = "task_access_denied"
     INVALID_MESSAGE = "invalid_message"
     MESSAGE_OUTCOME_UNKNOWN = "message_outcome_unknown"
+    # The turn ended interrupted after an external stop was requested (that
+    # stop, or a shutdown that settled the turn first). Only the external
+    # cancel core puts it on a frame, by passing it to the shared terminal
+    # builder as ``asserted_code``; passed as ``code`` it is dropped.
+    # TerminalTaskEventMessageCode has a member with the same value and a
+    # different meaning: on a cancel command's audit record it means the
+    # command ended in failure while its task was already COMPLETED or
+    # FAILED. That record never reaches a client.
+    EXTERNAL_TURN_INTERRUPTED = "external_turn_interrupted"
 
 
 def client_error_message(code: ClientErrorCode) -> str:
@@ -119,6 +128,7 @@ def client_error_message(code: ClientErrorCode) -> str:
             "The message may or may not have been applied. Check the "
             "conversation before sending it again."
         ),
+        ClientErrorCode.EXTERNAL_TURN_INTERRUPTED: "This response was interrupted.",
     }[code]
 
 

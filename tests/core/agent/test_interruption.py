@@ -15,6 +15,7 @@ from xagent.core.agent.interruption import (
     classify_run_failure,
     classify_run_result,
     interruption_reason_value,
+    is_database_unavailable,
 )
 from xagent.core.model.chat.exceptions import (
     LLMContextLengthError,
@@ -271,3 +272,20 @@ def test_reason_values_are_stable_strings() -> None:
         "llm_unavailable"
     )
     assert interruption_reason_value(None) is None
+
+
+def test_is_database_unavailable_follows_the_cause_chain():
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
+    reset = OperationalError("SELECT", {}, Exception("connection reset"))
+    wrapped = RuntimeError("read failed")
+    wrapped.__cause__ = reset
+
+    assert is_database_unavailable(reset)
+    assert is_database_unavailable(wrapped)
+    assert is_database_unavailable(PoolTimeoutError("pool exhausted"))
+    assert not is_database_unavailable(TypeError("resolver bug"))
+    context_only = RuntimeError("cleanup")
+    context_only.__context__ = reset
+    assert not is_database_unavailable(context_only)

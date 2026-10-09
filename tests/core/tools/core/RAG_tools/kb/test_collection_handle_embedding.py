@@ -666,3 +666,14 @@ def test_commit_embeddings_does_nothing_on_lancedb():
         raise AssertionError("the commit gate must not run on LanceDB")
 
     assert handle.commit_embeddings("d", "p", "m", commit_gate=gate, user_id=1) is None
+
+
+def test_discarding_uncommitted_embeddings_does_nothing_on_lancedb():
+    handle = make_handle()
+    handle.write_embeddings(
+        [_embedding("d1", "c0", "h1", "m1", vector=[0.1, 0.2])], create_index=False
+    )
+
+    assert handle.discard_uncommitted_embeddings("d1", user_id=1) == 0
+    assert handle.discard_uncommitted_embeddings("d1") == 0
+    assert len(_embedding_rows("m1", "coll", "d1")) == 1

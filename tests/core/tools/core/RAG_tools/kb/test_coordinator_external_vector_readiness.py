@@ -413,9 +413,12 @@ def test_document_row_snapshot_routes_through_the_handle() -> None:
     captured = coordinator.capture_document_rows_sync(
         "c1", ["d"], user_id=7, is_admin=False
     )
-    coordinator.restore_document_rows_sync(snapshot, user_id=7, is_admin=False)
+    restored = coordinator.restore_document_rows_sync(
+        snapshot, user_id=7, is_admin=False
+    )
 
     assert captured == "capture_document_rows-result"
+    assert restored == "restore_document_rows-result"
     assert [handle.calls for handle in provider.handles] == [
         [("capture_document_rows", (["d"],), {"user_id": 7, "is_admin": False})],
         [("restore_document_rows", (snapshot,), {"user_id": 7, "is_admin": False})],
@@ -428,3 +431,17 @@ def test_document_row_snapshot_routes_through_the_handle() -> None:
         ("c2", KBAccessMode.WRITE, KBUserScope(user_id=7, is_admin=False)),
     ]
     assert metadata_store.calls == ["c1", "c2"]
+
+
+def test_discarding_uncommitted_embeddings_routes_through_a_write_handle() -> None:
+    coordinator, provider, _ = _coordinator()
+
+    discarded = coordinator.discard_uncommitted_embeddings_sync("c1", "d", user_id=7)
+
+    assert discarded == "discard_uncommitted_embeddings-result"
+    assert [handle.calls for handle in provider.handles] == [
+        [("discard_uncommitted_embeddings", ("d",), {"user_id": 7})]
+    ]
+    context = provider.contexts[0]
+    assert context.collection == "c1" and context.access_mode is KBAccessMode.WRITE
+    assert context.user_scope == KBUserScope(user_id=7, is_admin=False)

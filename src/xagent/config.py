@@ -517,12 +517,16 @@ def _get_strict_bool_env(env_var: str, default: bool) -> bool:
 def get_task_infra_failure_pause_enabled() -> bool:
     """Whether eligible tasks pause (instead of failing) on infrastructure failures.
 
+    Off by default until automatic resume ships: a paused run that nothing
+    resumes is worse than a terminal failure for unattended (e.g. scheduled)
+    tasks. Lease-expiry recovery pauses regardless, as it always has.
+
     Priority:
         1. XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED environment variable
-        2. True
+        2. False
     """
 
-    return _get_strict_bool_env(TASK_INFRA_FAILURE_PAUSE_ENABLED, True)
+    return _get_strict_bool_env(TASK_INFRA_FAILURE_PAUSE_ENABLED, False)
 
 
 def get_task_auto_resume_enabled() -> bool:

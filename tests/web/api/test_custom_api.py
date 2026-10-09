@@ -389,8 +389,9 @@ async def test_update_custom_api():
     )
 
     # Return user api on first query
-    # Return None for existing name check
-    db.query().filter().first.side_effect = [mock_user_api, None]
+    # Return None for the exact-name check, then for the folded-name check's
+    # MCP server and Custom API queries
+    db.query().filter().first.side_effect = [mock_user_api, None, None, None]
     # The row lock's own fresh query is a separate mock chain
     # (.populate_existing().with_for_update() sits between .filter() and
     # .first()), so it needs its own return value rather than sharing the

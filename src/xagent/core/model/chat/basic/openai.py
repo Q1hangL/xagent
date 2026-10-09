@@ -4,14 +4,30 @@ import json
 import logging
 import os
 import time
-from typing import Any, AsyncIterator, Dict, List, Optional, Union
+from typing import (
+    Any,
+    AsyncIterator,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    TypeVar,
+    Union,
+)
 
 import openai
 from openai import AsyncOpenAI
 
 from ....runtime_performance import run_in_thread_with_telemetry
 from ....utils.security import redact_sensitive_text
-from ..exceptions import LLMEmptyContentError, LLMRetryableError, LLMTimeoutError
+from ..exceptions import (
+    LLMEmptyContentError,
+    LLMRetryableError,
+    LLMTimeoutError,
+    ModelProviderError,
+    ModelProviderRetryableError,
+    format_model_provider_error,
+)
 from ..stream_progress import (
     NO_PROGRESS_FINISH_REASON,
     STREAM_ABORTED_KEY,
@@ -213,17 +229,108 @@ def _degrade_rejected_params(
 
 
 def _format_openai_error(prefix: str, error: BaseException) -> str:
-    message = str(getattr(error, "message", None) or error)
-    status_code = getattr(error, "status_code", None)
-    if status_code is not None:
-        formatted = f"{prefix} ({status_code}): {message}"
-    else:
-        formatted = f"{prefix}: {message}"
+    return format_model_provider_error(
+        prefix,
+        getattr(error, "status_code", None),
+        str(getattr(error, "message", None) or error),
+        _openai_error_details(error),
+    )
 
-    details = _openai_error_details(error)
-    if details:
-        formatted = f"{formatted} | " + " | ".join(details)
-    return formatted
+
+def _provider_failure_kind(error: BaseException, status_code: int | None) -> str:
+    """The failure kind, from the SDK exception class and then the status.
+
+    The class is checked first: ``APITimeoutError`` is an
+    ``APIConnectionError``, and neither carries a status. No message text is
+    read.
+
+    The kind is derived from the exception class and the HTTP status alone,
+    and the vocabulary is deliberately distinct from ``classify_provider_failure``
+    in ``call_boundary.py``. That classifier folds 401 and 403 into one
+    credential code, so a decommissioned-model 403 would read as a rejected
+    credential; it also reads message text markers, and its vocabulary
+    (``PROVIDER_CALL_FAILURE_CODES``) carries codes no provider returns, such
+    as ``call_scope_unavailable``. Here 401 and 403 stay separate kinds and
+    the message never influences the result.
+    """
+    if isinstance(error, openai.APITimeoutError):
+        return "timeout"
+    if isinstance(error, openai.APIConnectionError):
+        return "connection_failed"
+    if status_code is None:
+        return "unknown"
+    if status_code == 408:
+        return "timeout"
+    named = {
+        400: "bad_request",
+        401: "authentication_failed",
+        403: "access_denied",
+        404: "not_found",
+        429: "rate_limited",
+    }
+    if status_code in named:
+        return named[status_code]
+    if 500 <= status_code <= 599:
+        return "server_error"
+    if 400 <= status_code <= 499:
+        return "rejected"
+    return "unknown"
+
+
+_T = TypeVar("_T")
+
+
+def _guarded(extract: Callable[[], _T], default: _T) -> _T:
+    """``extract()``, or ``default`` when it raises."""
+    try:
+        return extract()
+    except Exception:
+        return default
+
+
+def _model_provider_error(
+    prefix: str, error: BaseException, *, retryable: bool = False
+) -> ModelProviderError:
+    """The typed exception for a provider failure; never raises.
+
+    Each field is extracted under its own guard, so one failing accessor
+    leaves the others intact. The text has the same shape as
+    ``_format_openai_error``'s and is built by the same formatter, with the SDK
+    message capped and a non-integer or out-of-range status omitted.
+    """
+
+    def status_code_of() -> int | None:
+        value = getattr(error, "status_code", None)
+        return value if type(value) is int and 100 <= value <= 599 else None
+
+    def provider_message_of() -> str | None:
+        payload = _openai_error_payload(error)
+        value = payload.get("message") if payload is not None else None
+        if type(value) is str and value.strip():
+            return _truncate_error_detail(value)
+        return None
+
+    def sdk_message_of() -> str:
+        return _truncate_error_detail(str(getattr(error, "message", None) or error))
+
+    def sdk_message_fallback() -> str:
+        return _guarded(
+            lambda: _truncate_error_detail(str(error)),
+            _guarded(lambda: _truncate_error_detail(repr(error)), type(error).__name__),
+        )
+
+    status_code = _guarded(status_code_of, None)
+    kind = _guarded(lambda: _provider_failure_kind(error, status_code), "unknown")
+    cls = ModelProviderRetryableError if retryable else ModelProviderError
+    return cls(
+        prefix=prefix,
+        kind=kind,
+        status_code=status_code,
+        provider_code=_guarded(lambda: _openai_error_code(error), None),
+        provider_message=_guarded(provider_message_of, None),
+        sdk_message=_guarded(sdk_message_of, None) or sdk_message_fallback(),
+        details=_guarded(lambda: _openai_error_details(error), []),
+    )
 
 
 def field_content(message: Any, field_name: str) -> tuple[bool, Any]:
@@ -915,23 +1022,23 @@ class OpenAICompatibleLLM(BaseLLM):
         except openai.BadRequestError as e:
             # Handle bad request errors, including a response_format resend
             # that failed again (see the degrade loop above).
-            raise RuntimeError(_format_openai_error("OpenAI bad request", e)) from e
+            raise _model_provider_error("OpenAI bad request", e) from e
 
         except openai.APITimeoutError as e:
             # Handle timeout errors
-            raise RuntimeError(f"OpenAI API timeout: {str(e)}") from e
+            raise _model_provider_error("OpenAI API timeout", e) from e
 
         except openai.RateLimitError as e:
             # Handle rate limit errors
-            raise RuntimeError(f"OpenAI rate limit exceeded: {e.message}") from e
+            raise _model_provider_error("OpenAI rate limit exceeded", e) from e
 
         except openai.AuthenticationError as e:
             # Handle authentication errors
-            raise RuntimeError(f"OpenAI authentication failed: {e.message}") from e
+            raise _model_provider_error("OpenAI authentication failed", e) from e
 
         except openai.APIError as e:
             # Handle OpenAI API errors
-            raise RuntimeError(_format_openai_error("OpenAI API error", e)) from e
+            raise _model_provider_error("OpenAI API error", e) from e
 
         except Exception as e:
             # Handle any other unexpected errors
@@ -1202,24 +1309,24 @@ class OpenAICompatibleLLM(BaseLLM):
 
         except openai.APITimeoutError as e:
             # Handle timeout errors
-            raise RuntimeError(f"OpenAI API timeout: {str(e)}") from e
+            raise _model_provider_error("OpenAI API timeout", e) from e
 
         except openai.RateLimitError as e:
             # Handle rate limit errors
-            raise RuntimeError(f"OpenAI rate limit exceeded: {e.message}") from e
+            raise _model_provider_error("OpenAI rate limit exceeded", e) from e
 
         except openai.AuthenticationError as e:
             # Handle authentication errors
-            raise RuntimeError(f"OpenAI authentication failed: {e.message}") from e
+            raise _model_provider_error("OpenAI authentication failed", e) from e
 
         except openai.BadRequestError as e:
             # Handle bad request errors, including a response_format resend
             # that failed again (see the degrade loop above).
-            raise RuntimeError(_format_openai_error("OpenAI bad request", e)) from e
+            raise _model_provider_error("OpenAI bad request", e) from e
 
         except openai.APIError as e:
             # Handle OpenAI API errors
-            raise RuntimeError(_format_openai_error("OpenAI API error", e)) from e
+            raise _model_provider_error("OpenAI API error", e) from e
 
         except Exception as e:
             # Handle any other unexpected errors
@@ -1551,33 +1658,37 @@ class OpenAICompatibleLLM(BaseLLM):
 
         except openai.APITimeoutError as e:
             logger.error(f"OpenAI API timeout: {e}")
-            raise LLMRetryableError(f"OpenAI API timeout: {str(e)}") from e
+            raise _model_provider_error("OpenAI API timeout", e, retryable=True) from e
 
         except openai.RateLimitError as e:
             logger.error(
                 "OpenAI rate limit exceeded: %s", redact_sensitive_text(str(e))
             )
-            raise LLMRetryableError(f"OpenAI rate limit exceeded: {e.message}") from e
+            raise _model_provider_error(
+                "OpenAI rate limit exceeded", e, retryable=True
+            ) from e
 
         except openai.APIConnectionError as e:
             logger.error(
                 "OpenAI stream connection failed: %s", redact_sensitive_text(str(e))
             )
-            raise LLMRetryableError(f"OpenAI stream connection failed: {str(e)}") from e
+            raise _model_provider_error(
+                "OpenAI stream connection failed", e, retryable=True
+            ) from e
 
         except openai.AuthenticationError as e:
             logger.error(
                 "OpenAI authentication failed: %s", redact_sensitive_text(str(e))
             )
-            raise RuntimeError(f"OpenAI authentication failed: {e.message}") from e
+            raise _model_provider_error("OpenAI authentication failed", e) from e
 
         except openai.BadRequestError as e:
             logger.debug("OpenAI bad request: %s", redact_sensitive_text(str(e)))
-            raise RuntimeError(_format_openai_error("OpenAI bad request", e)) from e
+            raise _model_provider_error("OpenAI bad request", e) from e
 
         except openai.APIError as e:
             logger.error("OpenAI API error: %s", redact_sensitive_text(str(e)))
-            raise RuntimeError(_format_openai_error("OpenAI API error", e)) from e
+            raise _model_provider_error("OpenAI API error", e) from e
 
         except TimeoutError:
             raise

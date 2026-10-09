@@ -138,9 +138,11 @@ function ToolsPageContent() {
   const [tools, setTools] = useState<Tool[]>([])
   const [mcpServers, setMcpServers] = useState<MCPServer[]>([])
   const [connectorStatus, setConnectorStatus] = useState<Record<string, { shared: boolean; is_owner: boolean; needs_config: boolean }>>({})
+  const [isConnectorStatusLoaded, setIsConnectorStatusLoaded] = useState(false)
   const [configurableTools, setConfigurableTools] = useState<ConfigurableTool[]>([])
   const [sqlConnections, setSqlConnections] = useState<SqlConnectionItem[]>([])
   const [isLoading, setIsLoading] = useState(false)
+  const [isDeletingServer, setIsDeletingServer] = useState(false)
   const [isConnectMcpOpen, setIsConnectMcpOpen] = useState(false)
   const [isOfficialAppDialogOpen, setIsOfficialAppDialogOpen] = useState(false)
   const [editingOfficialApp, setEditingOfficialApp] = useState<AppIntegration | null>(null)
@@ -293,8 +295,10 @@ function ToolsPageContent() {
     // /api/connectors/status route, so skip the call entirely when not in a team.
     if (!inTeam) {
       setConnectorStatus({})
+      setIsConnectorStatusLoaded(true)
       return
     }
+    setIsConnectorStatusLoaded(false)
     try {
       const refs = servers.map((s) => ({
         type: s.transport === "custom_api" ? "custom_api" : "mcp",
@@ -302,6 +306,7 @@ function ToolsPageContent() {
       }))
       if (refs.length === 0) {
         setConnectorStatus({})
+        setIsConnectorStatusLoaded(true)
         return
       }
       const response = await apiRequest(`${getApiUrl()}/api/connectors/status`, {
@@ -311,6 +316,7 @@ function ToolsPageContent() {
       })
       if (response.ok) {
         setConnectorStatus(await response.json())
+        setIsConnectorStatusLoaded(true)
       }
     } catch (error) {
       console.error("Failed to load connector status:", error)
@@ -704,6 +710,55 @@ function ToolsPageContent() {
     }
   }
 
+  // Delete is offered to owners and admins only (can_edit_global). The
+  // DELETE routes also accept non-owner rows that carry can_delete, such as
+  // catalog connections, but the list does not expose that flag, so those
+  // keep their existing disconnect paths. In a team, an admin's list also
+  // holds team connectors without a personal row; DELETE answers 404 for
+  // those, so the button waits for the ownership status and hides it for
+  // team tools the viewer does not own. Other refusals (team admin rules,
+  // live OAuth connections) come back as the toast below.
+  const canDeleteServer = (server: MCPServer) => {
+    if (server.can_edit_global !== true) return false
+    if (!inTeam) return true
+    if (!isConnectorStatusLoaded) return false
+    const connType = server.transport === 'custom_api' ? 'custom_api' : 'mcp'
+    const status = connectorStatus[`${connType}:${server.id}`]
+    return !(status?.shared && status.is_owner !== true)
+  }
+
+  const handleDeleteMcpServer = async () => {
+    const server = editingServer
+    if (!server || isDeletingServer) return
+    if (!confirm(t('tools.mcp.dialog.deleteConfirm', { name: server.name }))) return
+
+    setIsDeletingServer(true)
+    try {
+      const url = server.transport === 'custom_api'
+        ? `${getApiUrl()}/api/custom-apis/${server.id}`
+        : `${getApiUrl()}/api/mcp/servers/${server.id}`
+      const response = await apiRequest(url, { method: 'DELETE' })
+      if (!response.ok) {
+        const err = await response.json().catch(() => null)
+        toast.error(
+          typeof err?.detail === 'string' && err.detail
+            ? err.detail
+            : t('tools.mcp.dialog.deleteFailed', { name: server.name })
+        )
+        return
+      }
+
+      setIsMcpDialogOpen(false)
+      await loadMCPServers()
+      toast.success(t('tools.mcp.dialog.deleteSuccess', { name: server.name }))
+    } catch (error) {
+      console.error("Failed to delete connector:", error)
+      toast.error(t('tools.mcp.dialog.deleteFailed', { name: server.name }))
+    } finally {
+      setIsDeletingServer(false)
+    }
+  }
+
   const handleToggleToolEnabled = async (tool: Tool) => {
     if (pendingToolToggles[tool.name]) return
 
@@ -1090,6 +1145,9 @@ function ToolsPageContent() {
       <Dialog
         open={isMcpDialogOpen}
         onOpenChange={(nextOpen) => {
+          // Keep the dialog open until a pending delete settles, so its
+          // completion cannot close an editor opened for another connector.
+          if (!nextOpen && isDeletingServer) return
           setIsMcpDialogOpen(nextOpen)
           if (!nextOpen) {
             connectorEditRequestRef.current += 1
@@ -1130,13 +1188,25 @@ function ToolsPageContent() {
             )}
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setIsMcpDialogOpen(false)}>
+            {editingServer && canDeleteServer(editingServer) && (
+              <Button
+                variant="destructive"
+                className="sm:mr-auto"
+                onClick={handleDeleteMcpServer}
+                disabled={isDeletingServer || isLoading}
+              >
+                {isDeletingServer ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Trash2 className="h-4 w-4 mr-2" />}
+                {t('tools.mcp.buttons.delete')}
+              </Button>
+            )}
+            <Button variant="outline" onClick={() => setIsMcpDialogOpen(false)} disabled={isDeletingServer}>
               {t('tools.mcp.buttons.cancel')}
             </Button>
             <Button
               onClick={handleSaveMcpServer}
               disabled={
                 isLoading ||
+                isDeletingServer ||
                 !mcpFormData.name.trim() ||
                 (mcpFormData.transport === 'custom_api' && customApiEnv.length > 0 && customApiEnv.some(env => !env.key.trim() || !env.value.trim()))
               }

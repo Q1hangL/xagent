@@ -994,6 +994,35 @@ async def refresh_oauth_token_if_needed(
             data["client_secret"] = client_secret
 
         refresh_token_url = provider_config.token_url
+        from ..oauth_account_hosts import (
+            OAuthAccountError,
+            get_oauth_account_host,
+            normalize_oauth_account,
+            resolve_oauth_account_endpoints,
+        )
+
+        account_host = get_oauth_account_host(normalized_provider)
+        if account_host is not None:
+            # Refresh on the account the grant was issued for (stored in
+            # instance_url at connect, see oauth_account_hosts). A missing or
+            # malformed stored label never heals on retry, so it is
+            # permanent; a resolution failure below stays transient.
+            try:
+                stored_account = normalize_oauth_account(oauth_account.instance_url)
+            except OAuthAccountError:
+                logger.warning(
+                    "Cannot refresh %s token for user %s: no valid account "
+                    "stored on this connection.",
+                    provider_name,
+                    oauth_account.user_id,
+                )
+                raise _OAuthRefreshPermanentlyInvalid() from None
+            account_endpoints = await asyncio.to_thread(
+                resolve_oauth_account_endpoints, account_host, stored_account
+            )
+            refresh_token_url = account_endpoints.token_url
+            # A redirect would skip the account host's private-network check.
+            post_kwargs["follow_redirects"] = False
         if normalized_provider == "deputy":
             # Deputy's docs (both the code-exchange and refresh legs) list
             # `redirect_uri` and `scope` as required body params here too,
@@ -1107,7 +1136,8 @@ async def refresh_oauth_token_if_needed(
                 oauth_account.access_token = data["access_token"]
                 if "refresh_token" in data:
                     oauth_account.refresh_token = data["refresh_token"]
-                if "instance_url" in data:
+                # An account-hosted grant stays bound to its account.
+                if "instance_url" in data and account_host is None:
                     # Matches the code-exchange branch in api/auth.py:
                     # Salesforce can return a different instance_url on
                     # refresh (e.g. after an org migration), so this is

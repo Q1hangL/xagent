@@ -10,6 +10,9 @@ one function in this repository that projects an exception onto a
 client-visible code. Anything else (a literal, ``str(exc)``, a field read off
 the exception directly) is an unauthorized source, even if the value it
 produces happens to be a real closed-set member today.
+
+The second test pins the other way a code reaches the frame: a caller
+asserting it through ``asserted_code=``.
 """
 
 from __future__ import annotations
@@ -134,3 +137,56 @@ def test_every_code_argument_traces_to_the_projector() -> None:
     # projector call, a renamed binding, or a moved raise site should fail
     # loudly here rather than let the assertion above pass on an empty set.
     assert recognized_bindings == 1
+
+
+PACKAGE_ROOT = Path(xagent.__path__[0])
+ASSERTED_KEYWORD = "asserted_code"
+
+
+def _asserted_code_sites() -> list[tuple[str, str, str]]:
+    """Every ``asserted_code=`` keyword in the package, one entry per call.
+
+    Matched on the keyword, not on the callee's name, so an aliased import of
+    the builder is still seen. The value must be spelled
+    ``ClientErrorCode.<MEMBER>``; anything else is a hard failure.
+    """
+
+    sites: list[tuple[str, str, str]] = []
+
+    def visit(node: ast.AST, rel_path: str, scope: str) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            scope = node.name
+        if isinstance(node, ast.Call):
+            for keyword in node.keywords:
+                if keyword.arg != ASSERTED_KEYWORD:
+                    continue
+                value = keyword.value
+                if not (
+                    isinstance(value, ast.Attribute)
+                    and isinstance(value.value, ast.Name)
+                    and value.value.id == "ClientErrorCode"
+                ):
+                    raise AssertionError(
+                        f"asserted_code= at {rel_path}:{node.lineno} in {scope} "
+                        f"is not a literal ClientErrorCode member: {ast.dump(value)}"
+                    )
+                sites.append((rel_path, scope, value.attr))
+        for child in ast.iter_child_nodes(node):
+            visit(child, rel_path, scope)
+
+    for path in sorted(PACKAGE_ROOT.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        visit(tree, path.relative_to(PACKAGE_ROOT).as_posix(), "<module>")
+    return sites
+
+
+def test_every_asserted_code_has_a_pinned_caller() -> None:
+    """Each caller-asserted code is asserted once, by the caller that proved it."""
+
+    assert _asserted_code_sites() == [
+        (
+            "web/services/external_task_cancel.py",
+            "_broadcast_external_cancel_terminal_event",
+            "EXTERNAL_TURN_INTERRUPTED",
+        )
+    ]

@@ -51,6 +51,7 @@ from typing import (
     Optional,
     Union,
     cast,
+    get_args,
     overload,
 )
 from urllib.parse import unquote
@@ -65,6 +66,7 @@ from ...core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointUnavailableError,
 )
+from ...core.agent.interruption import InterruptionReason
 from ...core.agent.runner import (
     InjectionDisposition,
     UserMessageInjectionOutcome,
@@ -86,6 +88,15 @@ from ..models.database import (
 from ..models.task import Task, TaskStatus, task_status_predicate
 from ..models.uploaded_file import UploadedFile
 from .llm_utils import AutoModelUnavailableError
+from .task_auto_recovery import (
+    InterruptionDecision,
+    InterruptionSettlementDeferred,
+    apply_interruption_outcome_no_commit,
+    decide_interruption,
+    interruption_pause_result,
+    settlement_interruption_for_failure,
+    settlement_interruption_for_result,
+)
 from .task_events import DeliveryNotifier, publish_task_event
 from .task_execution_event_writer import (
     FactWitness,
@@ -250,26 +261,62 @@ def _task_error_payload(
     return payload
 
 
+# Codes a caller states from an outcome it proved itself, as opposed to
+# ``code``, which is projected from an exception. Add a member in the change
+# that adds the call site asserting it; the runtime set is derived from this.
+CallerAssertedTerminalCode = Literal[ClientErrorCode.EXTERNAL_TURN_INTERRUPTED]
+_CALLER_ASSERTED_TERMINAL_CODES: frozenset[ClientErrorCode] = frozenset(
+    get_args(CallerAssertedTerminalCode)
+)
+
+
 def create_terminal_task_error_event(
     task_id: int,
     message: str,
     *,
     code: str | None = None,
+    asserted_code: CallerAssertedTerminalCode | None = None,
 ) -> dict[str, Any]:
     """Shape an error event after the exact lease owner commits FAILED.
 
     ``code`` is written only when it survives validation, so a caller that
-    passes none still gets the same six-key frame, and a caller that passes
-    something unusable gets that same frame rather than an exception. This
-    runs on the reporting path of an already-failed task, and the one call
-    site that passes this argument evaluates it inside the ``except
-    Exception`` that only logs a failed broadcast -- so raising here would
-    cost the terminal frame outright and leave the user on the silent
+    passes neither argument still gets the same six-key frame, and a caller
+    that passes something unusable gets that same frame rather than an
+    exception. This runs on the reporting path of an already-failed task,
+    and the one call site that passes ``code`` evaluates it inside the
+    ``except Exception`` that only logs a failed broadcast -- so raising here
+    would cost the terminal frame outright and leave the user on the silent
     failure this path exists to remove. A bad optional argument costs that
     argument and nothing else. The rejection is logged with its stack.
 
     ``code`` must be a connector-runtime code or ``AUTO_MODEL_UNAVAILABLE``.
+
+    ``asserted_code`` is the other way a code reaches this frame: the caller
+    states an outcome it proved itself, for example the external cancel core
+    once its target turn ended interrupted. It must be a
+    ``ClientErrorCode`` member listed in ``CallerAssertedTerminalCode``; an
+    equal plain string or a same-valued member of another enum is dropped.
+    The two arguments are exclusive: when both are passed, ``asserted_code``
+    is dropped and ``code`` is validated as usual, so a projected failure is
+    never relabelled by an assertion.
     """
+
+    # The exclusivity check reads ``code`` as passed, before its own gate
+    # below can clear it: an assertion never rides along with a projected
+    # failure, valid or not.
+    if asserted_code is not None and (
+        not isinstance(asserted_code, ClientErrorCode)
+        or asserted_code not in _CALLER_ASSERTED_TERMINAL_CODES
+        or code is not None
+    ):
+        logger.error(
+            "task_id=%s component=terminal-error-frame dropped=asserted_code "
+            "value=%r; the frame is still sent without it",
+            task_id,
+            asserted_code,
+            stack_info=True,
+        )
+        asserted_code = None
 
     # Python annotations are not enforced at run time, so the mypy gate on the
     # signature above is not the whole door: a caller that routes through Any
@@ -312,6 +359,8 @@ def create_terminal_task_error_event(
     }
     if code is not None:
         event["code"] = code
+    elif asserted_code is not None:
+        event["code"] = asserted_code.value
     return event
 
 
@@ -1707,6 +1756,8 @@ class _TaskExecutionFinalization:
     final_task_status: str
     broadcast_meta: dict[str, Any]
     late_result: bool = False
+    # Set when an interruption paused the run: the reason it records.
+    interruption_pause_reason: InterruptionReason | None = None
 
 
 @dataclass(frozen=True)
@@ -1835,6 +1886,37 @@ def _finalization_broadcast_meta(task: Task) -> dict[str, Any]:
     }
 
 
+def _decide_result_interruption(
+    db: Session, task: Task, result: dict[str, Any]
+) -> InterruptionDecision | None:
+    """Decide the interruption an unsuccessful result reports, if any.
+
+    Only a RUNNING row is decided; anything else keeps its own settlement.
+    An unresolvable checkpoint raises ``InterruptionSettlementDeferred``.
+    """
+
+    if task.status != TaskStatus.RUNNING:
+        return None
+    reason = settlement_interruption_for_result(result)
+    if reason is None:
+        return None
+    return decide_interruption(db, task=task, reason=reason)
+
+
+def _apply_result_interruption(
+    db: Session,
+    task: Task,
+    decision: InterruptionDecision,
+    result: dict[str, Any],
+) -> None:
+    apply_interruption_outcome_no_commit(
+        db,
+        task=task,
+        decision=decision,
+        error=safe_str(result.get("error")).strip() or None,
+    )
+
+
 def _finalize_task_execution_result_isolated(
     *,
     task_id: int,
@@ -1953,6 +2035,7 @@ def _finalize_task_execution_result_isolated(
         # failed and already-paused tasks ignore the late result and roll back
         # its files.
         control_commit_pending = False
+        interruption_pause_reason: InterruptionReason | None = None
         final_control_snapshot: TaskControlSnapshot | None = None
         final_task_status = pre_run_status.value
 
@@ -2045,38 +2128,66 @@ def _finalize_task_execution_result_isolated(
                 TaskStatus.PAUSED,
                 TaskStatus.WAITING_FOR_USER,
             }:
-                final_status = (
-                    TaskStatus.COMPLETED
-                    if result.get("success", False)
-                    else TaskStatus.FAILED
+                # Only an owned run is paused: its lease settlement releases it.
+                interruption = (
+                    _decide_result_interruption(finalize_db, task_updated, result)
+                    if task_lease is not None
+                    else None
                 )
-                final_control_snapshot = apply_task_control_transition(
-                    task_updated,
-                    TaskControlState.COMPLETED
-                    if final_status == TaskStatus.COMPLETED
-                    else TaskControlState.FAILED,
-                    status=final_status,
-                    expected_run_id=expected_run_id,
-                )
-                setattr(
-                    task_updated,
-                    "completion_outcome",
-                    completion_outcome_for_status(result, final_status),
-                )
-                if final_status == TaskStatus.FAILED:
-                    diagnostic_error = safe_str(result.get("error")).strip()
+                if interruption is not None and interruption.pause:
+                    # A recoverable run interrupted by infrastructure rests
+                    # PAUSED for its user to resume, as lease recovery
+                    # leaves it; the scheduler's settlement releases it.
+                    final_control_snapshot = apply_task_control_transition(
+                        task_updated,
+                        TaskControlState.PAUSED,
+                        status=TaskStatus.PAUSED,
+                        expected_run_id=expected_run_id,
+                    )
+                    _apply_result_interruption(
+                        finalize_db, task_updated, interruption, result
+                    )
+                    interruption_pause_reason = interruption.reason
+                    terminal_state_committed = True
+                    waiting_for_control = True
+                    control_commit_pending = True
+                else:
+                    final_status = (
+                        TaskStatus.COMPLETED
+                        if result.get("success", False)
+                        else TaskStatus.FAILED
+                    )
+                    final_control_snapshot = apply_task_control_transition(
+                        task_updated,
+                        TaskControlState.COMPLETED
+                        if final_status == TaskStatus.COMPLETED
+                        else TaskControlState.FAILED,
+                        status=final_status,
+                        expected_run_id=expected_run_id,
+                    )
                     setattr(
                         task_updated,
-                        "error_message",
-                        diagnostic_error
-                        or safe_str(ai_response).strip()
-                        or CLIENT_SAFE_TASK_FAILURE,
+                        "completion_outcome",
+                        completion_outcome_for_status(result, final_status),
                     )
-                sync_workforce_run_status(
-                    finalize_db,
-                    task_updated,
-                    task_updated.status,
-                )
+                    if final_status == TaskStatus.FAILED:
+                        diagnostic_error = safe_str(result.get("error")).strip()
+                        setattr(
+                            task_updated,
+                            "error_message",
+                            diagnostic_error
+                            or safe_str(ai_response).strip()
+                            or CLIENT_SAFE_TASK_FAILURE,
+                        )
+                    sync_workforce_run_status(
+                        finalize_db,
+                        task_updated,
+                        task_updated.status,
+                    )
+                    if interruption is not None:
+                        _apply_result_interruption(
+                            finalize_db, task_updated, interruption, result
+                        )
             else:
                 waiting_for_control = True
                 terminal_state_committed = True
@@ -2147,7 +2258,11 @@ def _finalize_task_execution_result_isolated(
 
             if result_commit_pending:
                 fact_witness = stage_result_fact_no_commit(
-                    finalize_db, task_updated, result
+                    finalize_db,
+                    task_updated,
+                    interruption_pause_result()
+                    if interruption_pause_reason is not None
+                    else result,
                 )
                 finalize_db.flush()
                 broadcast_meta = _finalization_broadcast_meta(task_updated)
@@ -2184,6 +2299,7 @@ def _finalize_task_execution_result_isolated(
             final_control_snapshot=final_control_snapshot,
             final_task_status=final_task_status,
             broadcast_meta=broadcast_meta,
+            interruption_pause_reason=interruption_pause_reason,
         )
     finally:
         try:
@@ -2454,6 +2570,14 @@ async def execute_task_background(
                     ),
                     task_id,
                 )
+                if finalized.interruption_pause_reason is not None:
+                    from .task_orchestrator import publish_interruption_pause
+
+                    await publish_interruption_pause(
+                        task_id,
+                        control_event_state,
+                        finalized.interruption_pause_reason,
+                    )
                 logger.info(
                     "Background task %s left %s for v2 control",
                     task_id,
@@ -2805,6 +2929,7 @@ def _finalize_resumed_task(
         "normalized_outputs": [],
         "output": output,
         "late_result": False,
+        "interruption_pause_reason": None,
     }
     if task_lease.run_id is None:
         _settle_prepared_task_file_outputs(
@@ -2879,6 +3004,7 @@ def _finalize_resumed_task(
                 finalized["agent_name"] = cast(Any, agent.name)
                 finalized["agent_logo_url"] = cast(Any, agent.logo_url)
 
+        interruption: InterruptionDecision | None = None
         if result.get("injection_outcome_unknown") and (
             success or status in {"waiting_for_user", "interrupted"}
         ):
@@ -2890,7 +3016,12 @@ def _finalize_resumed_task(
         elif success:
             final_task_status = TaskStatus.COMPLETED
         else:
-            final_task_status = TaskStatus.FAILED
+            interruption = _decide_result_interruption(db, task, result)
+            final_task_status = (
+                TaskStatus.PAUSED
+                if interruption is not None and interruption.pause
+                else TaskStatus.FAILED
+            )
 
         control_snapshot = apply_task_control_transition(
             task,
@@ -2943,7 +3074,15 @@ def _finalize_resumed_task(
                 or CLIENT_SAFE_TASK_FAILURE
             )
 
-        sync_workforce_run_status(db, task, final_task_status)
+        if interruption is not None:
+            # Projects the workforce run itself for a pause.
+            if not interruption.pause:
+                sync_workforce_run_status(db, task, final_task_status)
+            _apply_result_interruption(db, task, interruption, result)
+            if interruption.pause:
+                finalized["interruption_pause_reason"] = interruption.reason
+        else:
+            sync_workforce_run_status(db, task, final_task_status)
         lease_released = release_task_lease_no_commit(
             db,
             task_lease,
@@ -2953,7 +3092,13 @@ def _finalize_resumed_task(
             db.rollback()
             finalized["late_result"] = True
             return finalized
-        stage_result_fact_no_commit(db, task, result)
+        stage_result_fact_no_commit(
+            db,
+            task,
+            interruption_pause_result()
+            if finalized["interruption_pause_reason"] is not None
+            else result,
+        )
         # A lost acknowledgement here is not reconciled yet: the lease is
         # released in this transaction, so only the result fact's witness
         # (returned above) can prove the commit. That belongs with the
@@ -2980,6 +3125,8 @@ def _settle_resumed_task_lease(
     *,
     error_message: str | None,
     terminal_event_state: dict[str, Any] | None = None,
+    interruption: InterruptionReason | None = None,
+    paused_for: list[InterruptionReason] | None = None,
 ) -> bool:
     """Delegate resume cleanup to the shared run/runner-fenced lifecycle."""
     from .assistant_history_safety import CLIENT_SAFE_FAILURE_MESSAGE_TYPE
@@ -2999,6 +3146,8 @@ def _settle_resumed_task_lease(
         lease,
         error_message=error_message,
         terminal_event_state=terminal_event_state,
+        interruption=interruption,
+        paused_for=paused_for,
     )
 
 
@@ -3096,6 +3245,7 @@ async def execute_resume_background(
     lease: TaskLease | None = preacquired_lease
     lease_released = False
     settlement_error: str | None = None
+    settlement_interruption: InterruptionReason | None = None
     broadcast_error_message: str | None = None
     defer_db_cleanup_to_ttl_recovery = False
     # A fenced rejection keeps the uncertain run paused instead of failing it.
@@ -3876,6 +4026,13 @@ async def execute_resume_background(
                 ),
                 task_id,
             )
+            pause_reason = finalized.get("interruption_pause_reason")
+            if pause_reason is not None:
+                from .task_orchestrator import publish_interruption_pause
+
+                await publish_interruption_pause(
+                    task_id, control_event_state, pause_reason
+                )
             return
 
         from .task_event_display import publish_task_result
@@ -3958,6 +4115,20 @@ async def execute_resume_background(
             # otherwise left reclaimable when no lease was acquired). Do not
             # emit the generic FAILED/task_error payload below.
             return
+        elif isinstance(e, InterruptionSettlementDeferred):
+            # The result's settlement could not resolve the run's checkpoint.
+            # Failing it here could fail a resumable run; keep the exact
+            # lease and let TTL recovery decide once the read works.
+            defer_db_cleanup_to_ttl_recovery = lease is not None and not lease_released
+            logger.error(
+                "task_id=%s component=resume interrupted run's checkpoint "
+                "unresolvable; retaining lease for TTL recovery: %s",
+                task_id,
+                e,
+                # The chained cause is the actual read failure.
+                exc_info=e,
+            )
+            return
         elif delivery_outcome_unknown:
             if await mark_deferred_delivery_failed():
                 await notify_deferred_delivery(False)
@@ -4035,6 +4206,9 @@ async def execute_resume_background(
                 exc_info=True,
             )
             settlement_error = error_message
+            # A checkpoint/event write or the database itself failed: a
+            # recoverable run is paused, not failed.
+            settlement_interruption = settlement_interruption_for_failure(e)
             broadcast_error_message = client_safe_error_message(
                 e,
                 fallback=CLIENT_SAFE_TASK_FAILURE,
@@ -4254,6 +4428,7 @@ async def execute_resume_background(
                                 or _resume_cancel_settlement_error(trusted_task_source)
                             )
                         terminal_event_state: dict[str, Any] = {}
+                        paused_for: list[InterruptionReason] = []
                         if pause_for_input and not explicit_cancel:
                             from .task_orchestrator import pause_unknown_task_lease
 
@@ -4271,11 +4446,27 @@ async def execute_resume_background(
                                     lease,
                                     error_message=settlement_error,
                                     terminal_event_state=terminal_event_state,
+                                    # An explicit cancel is not an
+                                    # interruption to resume from.
+                                    interruption=(
+                                        None
+                                        if explicit_cancel
+                                        else settlement_interruption
+                                    ),
+                                    paused_for=paused_for,
                                 )
                             )
                         if settled:
                             lease_released = True
-                            if broadcast_error_message is not None:
+                            if paused_for:
+                                from .task_orchestrator import (
+                                    publish_interruption_pause,
+                                )
+
+                                await publish_interruption_pause(
+                                    task_id, terminal_event_state, paused_for[0]
+                                )
+                            elif broadcast_error_message is not None:
                                 try:
                                     from .task_event_display import publish_task_result
 

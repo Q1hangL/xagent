@@ -24,6 +24,7 @@ from .builtin_mcp_registry import (
     get_builtin_execution_fields_and_optional_scopes,
 )
 from .models.public_mcp import PublicMCPApp
+from .oauth_account_hosts import get_oauth_account_host
 
 # Apps that must not be satisfied by a bare provider-level OAuth grant (one
 # created via the app_id-less connect flow, e.g. UserOAuth.provider == "meta").
@@ -353,7 +354,7 @@ def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
     if app.app_id == "gmail" and not get_google_restricted_scopes():
         visible = False
 
-    return {
+    app_dict: Dict[str, Any] = {
         "id": app.app_id,
         "name": execution_fields["name"],
         "description": app.description,
@@ -370,6 +371,12 @@ def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
         "launch_config": launch_config,
         "auth_type": classify_app_auth(transport, launch_config),
     }
+    # Only for apps whose provider authorizes on the customer's own account
+    # host, so every other app's payload is unchanged.
+    account_host = get_oauth_account_host(execution_fields["provider_name"])
+    if account_host is not None and app_dict["auth_type"] == "builtin_oauth":
+        app_dict["oauth_account_input"] = account_host.input_metadata()
+    return app_dict
 
 
 @dataclass(frozen=True)

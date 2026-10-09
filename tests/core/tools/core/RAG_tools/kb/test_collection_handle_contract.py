@@ -4,11 +4,12 @@ Tests drive the handle only through the abstract interface; an engine joins by
 adding an ``ENGINES`` entry. On Milvus the cases in ``MILVUS_SKELETON`` (the ledger
 and the query-vector check) run, the cases in ``MILVUS_ROWS`` run against the server
 at ``MILVUS_URI``, the cascade cases in ``MILVUS_UNSUPPORTED`` are skipped because
-Milvus does not support cascade cleanup by design, and every other case needs Milvus
-delete, snapshot or restore: those are not implemented yet, so the cases are strict
-xfails on ``NotImplementedError`` until they are. The rename case is a strict xfail on
-``AssertionError``: it reads the renamed collection through search and finds no rows.
-Not covered here:
+Milvus does not support cascade cleanup by design, and every other case needs the
+Milvus embedding snapshot, restore or cleanup: those are not implemented yet, so the
+cases are strict xfails on ``NotImplementedError`` until they are. Deletes, rename
+and the document-row restore are also checked through per-document vector counts,
+which both engines serve without search. Milvus counts and searches are Bounded, so
+a change shows after a moment (``_eventually``). Not covered here:
 
 - async search: LanceDB async search returns no rows today;
 - untagged main pointers and ``list_main_pointers``: on LanceDB the untagged
@@ -35,6 +36,7 @@ import ast
 import importlib
 import inspect
 import os
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -133,12 +135,18 @@ MILVUS_ROWS = {
     "test_chunk_rows_round_trip_in_index_order",
     "test_chunks_needing_embedding_resume_after_partial_write",
     "test_stats_and_listings_follow_owner_scope",
+    "test_delete_documents_data_removes_document_chunks_and_vectors",
+    "test_tenant_delete_leaves_other_owners_rows",
+    "test_delete_collection_data_empties_only_this_collection",
+    "test_rename_collection_data_moves_rows_to_new_name",
+    "test_document_rows_restore_drops_rows_written_after_capture",
+    "test_a_deleted_document_is_not_found_by_any_search",
+    "test_restored_and_deleted_rows_are_not_found_by_any_search",
 }
 MILVUS_UNSUPPORTED = {
     "test_cascade_deletes_its_scope_only_when_confirmed",
     "test_cascade_leaves_other_owners_rows",
 }
-MILVUS_RENAME = "test_rename_collection_data_moves_rows_to_new_name"
 
 
 def _engine_marks(engine: str, case: str) -> tuple[pytest.MarkDecorator, ...]:
@@ -148,21 +156,12 @@ def _engine_marks(engine: str, case: str) -> tuple[pytest.MarkDecorator, ...]:
         return (pytest.mark.skip(reason="Milvus does not support cascade cleanup"),)
     if case in MILVUS_ROWS:
         return (pytest.mark.milvus,)
-    if case == MILVUS_RENAME:
-        return (
-            pytest.mark.milvus,
-            pytest.mark.xfail(
-                strict=True,
-                raises=AssertionError,
-                reason="the rename does not move the Milvus rows yet",
-            ),
-        )
     return (
         pytest.mark.milvus,
         pytest.mark.xfail(
             strict=True,
             raises=NotImplementedError,
-            reason="needs Milvus delete, snapshot or restore, which are not implemented yet",
+            reason="needs the Milvus embedding snapshot, restore or cleanup, not implemented yet",
         ),
     )
 
@@ -320,6 +319,31 @@ def _search(
         response = handle.search_hybrid(MODEL, query, vector, **scope)
     assert response.status == "success", response.warnings
     return {result.chunk_id: result.doc_id for result in response.results}
+
+
+def _vector_docs(handle: KBCollectionHandle) -> dict[str, int]:
+    """Visible vectors per document, counted without search."""
+    counts = handle.count_rows_by_document(user_id=None, is_admin=True)
+    vectors = {
+        doc_id: sum(n for table, n in tables.items() if table.startswith("embeddings_"))
+        for doc_id, tables in counts.items()
+    }
+    return {doc_id: n for doc_id, n in vectors.items() if n}
+
+
+def _assert_vector_docs(handle: KBCollectionHandle, expected: dict[str, int]) -> None:
+    assert _vector_docs(handle) == expected
+
+
+def _eventually(check: Callable[[], None], timeout: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return check()
+        except AssertionError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.2)
 
 
 HANDLE_CALLER_MODULES = (
@@ -546,10 +570,12 @@ def test_delete_documents_data_removes_document_chunks_and_vectors(
 ) -> None:
     seeded.delete_documents_data(["doc-1"], user_id=None, is_admin=True)
 
-    for mode in SEARCH_MODES:
-        assert set(_search(seeded, mode).values()) == {"doc-2"}
-    stats = seeded.collection_stats(None, True)
-    assert (stats["documents"], stats["chunks"], stats["embeddings"]) == (1, 1, 1)
+    def removed() -> None:
+        assert _vector_docs(seeded) == {"doc-2": 1}
+        stats = seeded.collection_stats(None, True)
+        assert (stats["documents"], stats["chunks"], stats["embeddings"]) == (1, 1, 1)
+
+    _eventually(removed)
     assert seeded.list_collection_documents(None, True) == ["doc-2"]
     gone = seeded.read_chunks_needing_embedding("doc-1", PARSE, MODEL, is_admin=True)
     assert gone.total_count == 0
@@ -559,8 +585,7 @@ def test_tenant_delete_leaves_other_owners_rows(seeded: KBCollectionHandle) -> N
     seeded.delete_documents_data(["doc-1", "doc-2"], user_id=2, is_admin=False)
 
     assert seeded.list_collection_documents(None, True) == ["doc-1"]
-    for mode in SEARCH_MODES:
-        assert set(_search(seeded, mode).values()) == {"doc-1"}
+    _eventually(lambda: _assert_vector_docs(seeded, {"doc-1": 2}))
 
 
 def test_delete_collection_data_empties_only_this_collection(
@@ -571,10 +596,12 @@ def test_delete_collection_data_empties_only_this_collection(
 
     seeded.delete_collection_data(user_id=None, is_admin=True)
 
-    stats = seeded.collection_stats(None, True)
-    assert (stats["documents"], stats["chunks"], stats["embeddings"]) == (0, 0, 0)
-    for mode in SEARCH_MODES:
-        assert _search(seeded, mode) == {}
+    def emptied() -> None:
+        stats = seeded.collection_stats(None, True)
+        assert (stats["documents"], stats["chunks"], stats["embeddings"]) == (0, 0, 0)
+        assert _vector_docs(seeded) == {}
+
+    _eventually(emptied)
     other_stats = other.collection_stats(None, True)
     assert (other_stats["documents"], other_stats["embeddings"]) == (1, 1)
 
@@ -585,9 +612,8 @@ def test_rename_collection_data_moves_rows_to_new_name(
     assert seeded.rename_collection_data("renamed", None, True) == []
 
     renamed = open_handle("renamed")
-    for mode in SEARCH_MODES:
-        assert set(_search(renamed, mode).values()) == {"doc-1", "doc-2"}
-        assert _search(seeded, mode) == {}
+    _assert_vector_docs(renamed, {"doc-1": 2, "doc-2": 1})
+    _assert_vector_docs(seeded, {})
     assert renamed.list_collection_documents(None, True) == ["doc-1", "doc-2"]
     assert seeded.count_documents(None, True) == 0
 
@@ -611,13 +637,53 @@ def test_document_rows_restore_drops_rows_written_after_capture(
     snapshot = seeded.capture_document_rows(["doc-1"], user_id=1, is_admin=False)
     _write_chunks(seeded, "doc-1", ["kiwi grape"], user_id=1, start=2)
     _embed(seeded, "doc-1", user_id=1)
-    assert "doc-1-c2" in _search(seeded, "sparse", query="grape")
+    _eventually(lambda: _assert_vector_docs(seeded, {"doc-1": 3, "doc-2": 1}))
+
+    assert seeded.restore_document_rows(snapshot, user_id=1, is_admin=False) == []
+
+    _eventually(lambda: _assert_vector_docs(seeded, {"doc-1": 2, "doc-2": 1}))
+    assert seeded.collection_stats(None, True)["chunks"] == 3
+
+
+def _assert_every_search_finds(handle: KBCollectionHandle, expected: set[str]) -> None:
+    def found() -> None:
+        for mode in SEARCH_MODES:
+            assert set(_search(handle, mode).values()) == expected, mode
+
+    _eventually(found)
+
+
+def test_a_deleted_document_is_not_found_by_any_search(
+    seeded: KBCollectionHandle,
+) -> None:
+    seeded.delete_documents_data(["doc-1"], user_id=None, is_admin=True)
+
+    _assert_every_search_finds(seeded, {"doc-2"})
+
+
+def test_restored_and_deleted_rows_are_not_found_by_any_search(
+    seeded: KBCollectionHandle,
+) -> None:
+    def sparse_grape() -> set[str]:
+        return set(_search(seeded, "sparse", query="grape"))
+
+    def grape_is(expected: set[str]) -> None:
+        assert sparse_grape() == expected
+
+    snapshot = seeded.capture_document_rows(["doc-1"], user_id=1, is_admin=False)
+    _write_chunks(seeded, "doc-1", ["kiwi grape"], user_id=1, start=2)
+    _embed(seeded, "doc-1", user_id=1)
+    _eventually(lambda: grape_is({"doc-1-c2"}))
 
     seeded.restore_document_rows(snapshot, user_id=1, is_admin=False)
+    _eventually(lambda: grape_is(set()))
+    _assert_every_search_finds(seeded, {"doc-1", "doc-2"})
 
-    assert _search(seeded, "sparse", query="grape") == {}
-    assert set(_search(seeded, "dense")) == {"doc-1-c0", "doc-1-c1", "doc-2-c0"}
-    assert seeded.collection_stats(None, True)["chunks"] == 3
+    seeded.delete_documents_data(["doc-1", "doc-2"], user_id=2, is_admin=False)
+    _assert_every_search_finds(seeded, {"doc-1"})
+
+    seeded.delete_collection_data(user_id=None, is_admin=True)
+    _assert_every_search_finds(seeded, set())
 
 
 def test_embedding_snapshot_restores_deleted_rows(seeded: KBCollectionHandle) -> None:

@@ -229,6 +229,16 @@ async def test_external_cancel_broadcasts_terminal_frame(
     payloads = _broadcast_payloads(manager)
     assert [payload["type"] for payload in payloads] == ["task_error"]
     assert payloads[0]["message"] == EXTERNAL_TURN_INTERRUPTED_MESSAGE
+    assert payloads[0]["code"] == "external_turn_interrupted"
+    assert set(payloads[0]) == {
+        "type",
+        "message",
+        "task_id",
+        "task",
+        "error",
+        "timestamp",
+        "code",
+    }
     assert payloads[0]["task"]["status"] == TaskStatus.FAILED.value
     cancelled = _load_task(task_id)
     assert cancelled.status == TaskStatus.FAILED
@@ -466,6 +476,7 @@ async def test_interrupted_transcript_settlement_wins(
     assert _interruption_transcript_count(task_id) == 1
     assert _load_task(task_id).error_message == EXTERNAL_TURN_INTERRUPTED_MESSAGE
     assert manager.broadcast_to_task.await_count == 1
+    assert _broadcast_payloads(manager)[0]["code"] == "external_turn_interrupted"
     db = _direct_db_session()
     try:
         row = (
@@ -565,7 +576,9 @@ async def test_external_cancel_finalize_replay_idempotent(
     # A settled target is not cancelled a second time, but the terminal
     # event still goes out: the attempt that settled it may have died
     # before broadcasting.
-    assert len(_broadcast_payloads(manager)) == 1
+    assert [payload["code"] for payload in _broadcast_payloads(manager)] == [
+        "external_turn_interrupted"
+    ]
 
 
 @pytest.mark.asyncio

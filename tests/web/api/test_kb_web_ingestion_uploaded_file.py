@@ -1891,7 +1891,7 @@ class TestIngestWebHandleWebFile:
             ),
             patch(
                 "xagent.web.api.kb._snapshot_rag_documents_for_uploaded_file",
-                return_value=object(),
+                return_value=_RagDocumentSnapshot(doc_refs=[], collections=[]),
             ),
             patch(
                 "xagent.web.api.kb._restore_ingestion_runs_snapshot"
@@ -2205,7 +2205,7 @@ class TestWebFileRefreshHelpers:
             file_size=existing_path.stat().st_size,
         )
         run_snapshot = object()
-        rag_snapshot = object()
+        rag_snapshot = _RagDocumentSnapshot(doc_refs=[], collections=[])
 
         with (
             patch(
@@ -2246,7 +2246,7 @@ class TestWebFileRefreshHelpers:
             rag_snapshot=rag_snapshot,
             file_id=str(existing_record.file_id),
         )
-        mock_restore_runs.assert_called_once_with(run_snapshot)
+        mock_restore_runs.assert_called_once_with(run_snapshot, keep=[])
 
 
 def test_web_rollback_skips_status_clear_after_deleting_registered_doc() -> None:

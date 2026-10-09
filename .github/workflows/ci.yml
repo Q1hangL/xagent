@@ -738,7 +738,7 @@ jobs:
   pytest-milvus:
     name: Pytest Milvus
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     needs: [changes, pre-commit]
     env:
@@ -797,7 +797,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          python3 -m uv run python -m pytest tests/core/tools/core/RAG_tools -m milvus -v
+          python3 -m uv run python -m pytest tests/core/tools/core/RAG_tools tests/web/api/test_kb_milvus_rollback.py -m milvus -v
 
       - name: Show Milvus logs
         if: needs.changes.outputs.code == 'true' && failure()

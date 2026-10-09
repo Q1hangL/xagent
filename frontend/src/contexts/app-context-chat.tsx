@@ -1047,7 +1047,8 @@ export const projectErrorFrameForDisplay = (
   // The frame's own code decides the wording, and one code has one sentence
   // for every audience. This is the same table the root error channel already
   // uses for its error_code field, extended with the connector-runtime codes
-  // that reach this frame -- not a second vocabulary beside it. It also fixes
+  // and the external-cancel interruption code that reach this frame -- not a
+  // second vocabulary beside it. It also fixes
   // what the relayed sentence could not: on a transport that marks legacy
   // prose untrusted, getWebSocketErrorMessage returns a constant by design
   // (#1938: never render server free text there), so before this the curated
@@ -1056,7 +1057,7 @@ export const projectErrorFrameForDisplay = (
   // selected by code. A code the table does not list keeps the generic
   // prefixed wording.
   const projectedCode = projection ? readClientErrorCode(projection.code) : null
-  const connectorRuntimeBubble = projectedCode
+  const codedBubble = projectedCode
     ? translate(clientErrorTranslationKey(projectedCode))
     : null
   // The dedup identity has to name WHICH occurrence this frame reports, not
@@ -1089,7 +1090,7 @@ export const projectErrorFrameForDisplay = (
     dedupText,
     occurrenceIdentity,
     bubbleContent:
-      connectorRuntimeBubble
+      codedBubble
       ?? `${translate('agent.logs.event.messages.errorPrefix')} ${dedupText}`,
     // A terminal failure IS this turn's result: without the flag the
     // conversation panel (which renders only user / isResult / system-notice

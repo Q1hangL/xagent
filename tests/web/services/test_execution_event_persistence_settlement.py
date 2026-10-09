@@ -199,12 +199,16 @@ def _assert_client_safe_failure_transcript(factory, tid: int) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pause_switch", ["true", "false"], ids=["pause", "legacy"])
 @pytest.mark.parametrize("channel", [False, True], ids=["web", "channel"])
 async def test_lost_tool_result_settles_as_unknown_effect(
-    canonical, monkeypatch, caplog, channel
+    canonical, monkeypatch, caplog, channel, pause_switch
 ):
+    """The same FAILED unknown-effect settlement whether the interruption
+    is decided (switch on) or classified the legacy way (switch off)."""
     from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
 
+    monkeypatch.setenv("XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED", pause_switch)
     caplog.set_level("WARNING", logger="xagent.web.services.task_lease_service")
     factory, tid = canonical
     with factory() as db:
@@ -239,9 +243,20 @@ async def test_lost_tool_result_settles_as_unknown_effect(
 
 
 @pytest.mark.asyncio
-async def test_unstarted_tool_keeps_generic_persistence_failure(canonical, monkeypatch):
-    """No started attempt means no unknown effect: the tool never ran."""
+@pytest.mark.parametrize("pause_switch", ["false", None])
+async def test_unstarted_tool_keeps_generic_persistence_failure(
+    canonical, monkeypatch, pause_switch
+):
+    """No started attempt means no unknown effect: the tool never ran.
 
+    With interruption pauses switched off -- explicitly, or by the default
+    until automatic resume ships -- the run fails as it always has.
+    """
+
+    if pause_switch is None:
+        monkeypatch.delenv("XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED", pause_switch)
     factory, tid = canonical
     with factory() as db:
         lease = acquire_task_lease(db, tid, new_run=True)
@@ -261,11 +276,43 @@ async def test_unstarted_tool_keeps_generic_persistence_failure(canonical, monke
 
 
 @pytest.mark.asyncio
-async def test_unreadable_classification_defers_to_lease_recovery(
+async def test_unstarted_tool_persistence_failure_pauses_the_run(
     canonical, monkeypatch
 ):
-    """Settlement that cannot classify keeps the lease; recovery classifies."""
+    """With the pause switch on the same failure pauses the run: it has a
+    checkpoint."""
 
+    monkeypatch.setenv("XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED", "true")
+    factory, tid = canonical
+    with factory() as db:
+        lease = acquire_task_lease(db, tid, new_run=True)
+    failed = _fail_once(monkeypatch, "tool_execution_start")
+    tool = FakeTool()
+
+    await _run_scheduled_turn(tid, lease, _react_execution(tid, tool))
+
+    assert failed == ["tool_execution_start"]
+    assert tool.calls == []
+    with factory() as db:
+        task = db.get(Task, tid)
+        assert task.status == TaskStatus.PAUSED
+        assert task.control_state == "paused"
+        assert task.runner_id is None
+        assert task.error_message is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pause_switch", ["true", "false"], ids=["pause", "legacy"])
+async def test_unreadable_classification_defers_to_lease_recovery(
+    canonical, monkeypatch, pause_switch
+):
+    """Settlement that cannot classify keeps the lease; recovery classifies.
+
+    Switch on, the interruption decision cannot read the checkpoint; switch
+    off, the legacy unknown-effect classification cannot.
+    """
+
+    monkeypatch.setenv("XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED", pause_switch)
     factory, tid = canonical
     with factory() as db:
         lease = acquire_task_lease(db, tid, new_run=True)

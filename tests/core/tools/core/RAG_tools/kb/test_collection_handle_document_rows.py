@@ -229,7 +229,7 @@ def test_restore_puts_back_changed_rows_and_drops_rows_added_since() -> None:
     )
     assert len(_embedding_tables()) == 2
 
-    handle.restore_document_rows(snapshot, user_id=1, is_admin=True)
+    assert handle.restore_document_rows(snapshot, user_id=1, is_admin=True) == []
 
     assert _rows("documents", "doc_id", "source_path") == [("d1", "old")]
     assert _rows("parses", "doc_id", "parse_hash") == [("d1", "p1")]
