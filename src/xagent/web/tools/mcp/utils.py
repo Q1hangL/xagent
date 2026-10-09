@@ -1975,13 +1975,17 @@ _LINK_PREFIX_RE = re.compile(
 )
 
 # Drive links a file that is not a native Google file, most often an
-# uploaded Office or PDF file, as "drive.google.com/file/d/<id>/view". Its
-# download links (".../uc?id=<id>") and older share links (".../open?id=<id>",
-# which Google Forms file uploads use, among others) are matched too. An older
-# share link can also name a native file, which the message allows for.
-_DRIVE_FILE_LINK_RE = re.compile(
-    r"drive\.google\.com/"
-    r"(?:file/(?:u/\d+/)?d/|(?:u/\d+/)?(?:open|uc)\?(?:[^#]*&)?id=)"
+# uploaded Office or PDF file, as "drive.google.com/file/d/<id>/view".
+_DRIVE_FILE_LINK_RE = re.compile(r"drive\.google\.com/file/(?:u/\d+/)?d/")
+
+# Drive's older share links (".../open?id=<id>", which Google Forms file
+# uploads use, among others) and its download links (".../uc?id=<id>") can
+# name a native Google file as well as an uploaded one. Their id is passed to
+# the API, which opens a native file and answers an Office file with the 400
+# that google_file_error_message explains.
+_DRIVE_ID_QUERY_LINK_RE = re.compile(
+    r"drive\.google\.com/(?:u/\d+/)?(?:open|uc)\?(?:[^#]*&)?id=([a-zA-Z0-9_-]+)",
+    re.IGNORECASE,
 )
 
 # The Sheets API answers a request for an Excel file stored in Drive (which
@@ -2096,8 +2100,10 @@ def resolve_google_file_id(
     which reads as if the file did not exist. Rejecting it here explains how
     to get a usable link instead, without spending an API call. A
     percent-encoded link (for example one wrapped by a redirect URL) is
-    decoded once before giving up, and a link to another kind of Google file,
-    or to a file uploaded to Drive, is named as such.
+    decoded once before giving up. A Drive ".../open?id=<id>" or
+    ".../uc?id=<id>" link resolves to its id, because it can name a native
+    file too. A link to another kind of Google file, or to a file uploaded to
+    Drive, is named as such.
 
     Pass ``editing=True`` from a tool that changes the file, as for
     ``google_file_error_message``: the next steps for a file uploaded to
@@ -2112,6 +2118,9 @@ def resolve_google_file_id(
         match = pattern.search(decoded)
         if match:
             return match.group(1)
+    drive_id_link = _DRIVE_ID_QUERY_LINK_RE.search(decoded)
+    if drive_id_link:
+        return drive_id_link.group(1)
     shown = _shown_input(resolved)
     lowered = decoded.lower()
     if "docs.google.com" in lowered and _PUBLISHED_LINK_RE.search(lowered):

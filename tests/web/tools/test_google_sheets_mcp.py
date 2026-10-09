@@ -793,6 +793,72 @@ def test_read_range_keeps_raw_error_for_other_400(monkeypatch):
     assert result["message"] == str(error)
 
 
+# An older Drive share link or a Drive download link can name a native
+# spreadsheet as well as an Excel file, so its id goes to the API, which
+# decides.
+def test_get_spreadsheet_opens_a_native_spreadsheet_from_a_drive_open_link(
+    monkeypatch,
+):
+    spreadsheets = Mock()
+    spreadsheets.get.return_value.execute.return_value = {
+        "spreadsheetId": "abc123",
+        "properties": {"title": "Budget"},
+        "sheets": [{"properties": {"sheetId": 0, "title": "Sheet1"}}],
+    }
+    _mock_sheets_service(monkeypatch, spreadsheets)
+
+    result = json.loads(
+        google_sheets.google_sheets_get_spreadsheet(
+            "https://drive.google.com/open?id=abc123"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert spreadsheets.get.call_args.kwargs["spreadsheetId"] == "abc123"
+
+
+@pytest.mark.parametrize(
+    ("invoke", "request_of", "editing"),
+    [
+        pytest.param(
+            lambda: google_sheets.google_sheets_read_range(
+                "https://drive.google.com/open?id=abc123", "Sheet1"
+            ),
+            lambda spreadsheets: spreadsheets.values.return_value.get,
+            False,
+            id="read_range-open-link",
+        ),
+        pytest.param(
+            lambda: google_sheets.google_sheets_update_range(
+                "https://drive.google.com/uc?export=download&id=abc123",
+                "Sheet1!A1",
+                [["x"]],
+            ),
+            lambda spreadsheets: spreadsheets.values.return_value.update,
+            True,
+            id="update_range-uc-link",
+        ),
+    ],
+)
+def test_tools_explain_an_excel_file_named_by_a_drive_open_or_uc_link(
+    monkeypatch, invoke, request_of, editing
+):
+    spreadsheets = Mock()
+    request_of(spreadsheets).return_value.execute.side_effect = _http_error(
+        400, _OFFICE_FILE_400
+    )
+    _mock_sheets_service(monkeypatch, spreadsheets)
+
+    result = json.loads(invoke())
+
+    assert result["status"] == "error"
+    assert request_of(spreadsheets).call_args.kwargs["spreadsheetId"] == "abc123"
+    message = result["message"]
+    _assert_explains_an_excel_file(message)
+    assert ("read the downloaded copy with read_file" in message) is not editing
+    assert ("To make this change with these tools" in message) is editing
+
+
 def test_get_spreadsheet_explains_a_drive_file_link_without_calling_the_api(
     monkeypatch,
 ):

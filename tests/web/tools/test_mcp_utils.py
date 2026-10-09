@@ -2451,12 +2451,6 @@ _DRIVE_FILE_LINKS = [
     "drive.google.com/file/u/1/d/abc123/view",
     "https://www.google.com/url?q=https%3A%2F%2Fdrive.google.com%2Ffile%2Fd"
     "%2Fabc123%2Fview&sa=D",
-    # Older share links and download links, such as those of Google Forms
-    # file uploads.
-    "https://drive.google.com/open?id=abc123",
-    "https://drive.google.com/open?usp=sharing&id=abc123",
-    "https://drive.google.com/uc?export=download&id=abc123",
-    "https://drive.google.com/u/0/uc?id=abc123&export=download",
 ]
 
 
@@ -2506,6 +2500,56 @@ def test_resolve_google_file_id_explains_a_drive_file_link_to_an_editing_tool(
         "If the file is a Google Docs document, ask the user for the document's "
         "own link (https://docs.google.com/document/d/...)."
     )
+
+
+# Older share links and download links, such as those of Google Forms file
+# uploads, can name a native file too, so their id goes to the API.
+@pytest.mark.parametrize(
+    ("value", "file_id"),
+    [
+        ("https://drive.google.com/open?id=1AbC_d-9", "1AbC_d-9"),
+        ("https://drive.google.com/open?usp=sharing&id=1AbC_d-9", "1AbC_d-9"),
+        ("https://drive.google.com/uc?export=download&id=1AbC_d-9", "1AbC_d-9"),
+        ("https://drive.google.com/u/0/uc?id=1AbC_d-9&export=download", "1AbC_d-9"),
+        ("Drive.Google.com/Open?id=1AbC_d-9", "1AbC_d-9"),
+        (
+            "https://www.google.com/url?q=https://drive.google.com/open%3Fid%3D"
+            "1AbC_d-9&sa=D",
+            "1AbC_d-9",
+        ),
+        (
+            "https://www.google.com/url?q=https%3A%2F%2Fdrive.google.com%2Fuc"
+            "%3Fexport%3Ddownload%26id%3D1AbC_d-9&sa=D",
+            "1AbC_d-9",
+        ),
+    ],
+)
+@pytest.mark.parametrize("editing", [False, True])
+def test_resolve_google_file_id_takes_the_id_of_a_drive_open_or_uc_link(
+    value, file_id, editing
+):
+    assert (
+        utils.resolve_google_file_id(
+            value, _TEST_DOC_PATTERN, "document_id", _TEST_FILE_KIND, editing=editing
+        )
+        == file_id
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://drive.google.com/open?usp=sharing",
+        "https://drive.google.com/uc?id=&export=download",
+    ],
+)
+def test_resolve_google_file_id_rejects_a_drive_open_or_uc_link_without_an_id(
+    value,
+):
+    with pytest.raises(ValueError, match="is not a Google Docs link or document id"):
+        utils.resolve_google_file_id(
+            value, _TEST_DOC_PATTERN, "document_id", _TEST_FILE_KIND
+        )
 
 
 # The response the Sheets API gives for an Excel file stored in Drive. The
