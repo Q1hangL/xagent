@@ -637,21 +637,29 @@ def test_refresh_failures_without_an_answer_are_unavailable(
 
 
 @pytest.mark.parametrize("owner", [None, OWNER])
-def test_failed_commit_after_refresh_rolls_back(store, owner) -> None:
+def test_failed_commit_after_refresh_rolls_back(store, owner, caplog) -> None:
     row_id = store.add_drive(owner=owner, token="old", expires_at=_future(-5))
     before = store.stored(row_id)
     rollbacks: list[bool] = []
     original_rollback = store.db.rollback
 
     def _failing_commit() -> None:
-        raise OperationalError("UPDATE user_oauth", {}, Exception("locked"))
+        # A database error's text includes the statement's parameters, which
+        # here are the refreshed tokens.
+        raise OperationalError(
+            "UPDATE user_oauth SET access_token=?, refresh_token=? "
+            "WHERE user_oauth.id = ?",
+            ("refreshed-token", "rotated-refresh-token", row_id),
+            Exception("database is locked"),
+        )
 
     def _recording_rollback() -> None:
         rollbacks.append(True)
         original_rollback()
 
-    patcher, _calls = _refreshing()
+    patcher, _calls = _refreshing(refresh_token="rotated-refresh-token")
     with (
+        caplog.at_level(logging.ERROR, logger="xagent.web.api.cloud_storage"),
         patcher,
         patch.object(store.db, "commit", _failing_commit),
         patch.object(store.db, "rollback", _recording_rollback),
@@ -667,6 +675,12 @@ def test_failed_commit_after_refresh_rolls_back(store, owner) -> None:
     assert exc_info.value.reason == "refresh_unavailable"
     assert exc_info.value.oauth_account_id == row_id
     assert store.stored(row_id) == before
+    # The error itself carries both new tokens; the log carries neither.
+    assert "rotated-refresh-token" in str(exc_info.value.__cause__)
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages == ["Failed to store refreshed Google token: OperationalError"]
+    for secret in ("refreshed-token", "rotated-refresh-token"):
+        assert all(secret not in message for message in messages)
 
 
 def _replacement_row(
@@ -675,6 +689,7 @@ def _replacement_row(
     replaced_id: int,
     owner: str | None,
     expires_at: datetime,
+    scope: str = f"{USERINFO} {DRIVE_FILE}",
 ) -> int:
     """Replace a stored row the way a reconnect does, from another session.
 
@@ -691,7 +706,7 @@ def _replacement_row(
             provider_user_id="google-user",
             access_token="replacement-token",
             refresh_token="replacement-refresh-token",
-            scope=f"{USERINFO} {DRIVE_FILE}",
+            scope=scope,
             expires_at=expires_at,
         )
         other.add(replacement)
@@ -802,6 +817,48 @@ def test_owner_refresh_uses_a_row_replaced_while_it_waited(
             "replacement-token",
             "replacement-refresh-token",
         )
+    # The lock was released.
+    assert not store.db.in_transaction()
+
+
+def _delete_row(store: "_Store", row_id: int) -> None:
+    """Delete a stored row the way a disconnect does, from another session."""
+    other = store.sessions()
+    try:
+        other.query(UserOAuth).filter(UserOAuth.id == row_id).delete()
+        other.commit()
+    finally:
+        other.close()
+
+
+@pytest.mark.parametrize(
+    ("select_row", "status", "detail", "reason"),
+    [
+        (False, 401, "Google Drive account not connected", "account_not_connected"),
+        (True, 404, "Selected Google Drive account not found", "account_not_found"),
+    ],
+    ids=["newest-row", "selected-row"],
+)
+def test_owner_refresh_stops_when_the_row_was_deleted_while_it_waited(
+    store, monkeypatch, select_row, status, detail, reason
+) -> None:
+    row_id = store.add_drive(owner=OWNER, token="old", expires_at=_future(-5))
+    _locking_with(monkeypatch, lambda: _delete_row(store, row_id))
+    patcher, calls = _refreshing()
+
+    with patcher, pytest.raises(GoogleDriveCredentialError) as exc_info:
+        get_google_credentials(
+            store.user_id,
+            store.db,
+            row_id if select_row else None,
+            resource_owner_key=OWNER,
+        )
+
+    assert calls == []
+    assert (exc_info.value.status_code, exc_info.value.detail) == (status, detail)
+    assert exc_info.value.reason == reason
+    # The row it was about to refresh is gone, so the error names none.
+    assert exc_info.value.oauth_account_id is None
     # The lock was released.
     assert not store.db.in_transaction()
 
@@ -1601,6 +1658,42 @@ def test_issue_picker_config_names_the_refreshed_row_on_a_scope_error(
     assert calls == ["old"]
     assert exc_info.value.reason == "scope_full_drive"
     assert exc_info.value.oauth_account_id == row_id
+
+
+def test_issue_picker_config_names_the_row_read_under_the_lock_on_a_scope_error(
+    store, picker_key, monkeypatch
+) -> None:
+    full_drive = f"{USERINFO} {DRIVE}"
+    old_id = store.add_drive(
+        owner=OWNER, token="old", scope=full_drive, expires_at=_future(-5)
+    )
+    store.add_drive(owner=OTHER_OWNER, token="other")
+    replacement_ids: list[int] = []
+    _locking_with(
+        monkeypatch,
+        lambda: replacement_ids.append(
+            _replacement_row(
+                store,
+                replaced_id=old_id,
+                owner=OWNER,
+                expires_at=_future(60),
+                scope=full_drive,
+            )
+        ),
+    )
+    patcher, calls = _refreshing()
+
+    with patcher, pytest.raises(GoogleDriveCredentialError) as exc_info:
+        issue_google_drive_picker_config(
+            store.db, user_id=store.user_id, resource_owner_key=OWNER
+        )
+
+    [replacement_id] = replacement_ids
+    assert replacement_id != old_id
+    # The replacement is fresh, so nothing was refreshed.
+    assert calls == []
+    assert exc_info.value.reason == "scope_full_drive"
+    assert exc_info.value.oauth_account_id == replacement_id
 
 
 def test_issue_picker_config_allows_extra_scopes_unless_minimal(
