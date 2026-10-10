@@ -757,6 +757,14 @@ def _locking_with(monkeypatch, before_lock) -> None:
 def test_owner_refresh_uses_a_row_replaced_while_it_waited(
     store, monkeypatch, replacement_minutes, refreshed
 ) -> None:
+    """The replacement commits just before the lock is taken.
+
+    On SQLite a replacement that commits while the lock statement waits ends
+    up the same way: the row is read only once the lock is held, and from
+    then on no writer can commit. On PostgreSQL the locking statement reads
+    the row itself; a replacement it cannot see is covered by
+    ``test_owner_lock_selects_for_update_outside_sqlite``.
+    """
     old_id = store.add_drive(owner=OWNER, token="old", expires_at=_future(-5))
     store.add_drive(owner=OTHER_OWNER, token="other")
     replacement_ids: list[int] = []
@@ -979,11 +987,23 @@ def test_owner_lock_failure_is_unavailable_and_skips_the_refresh(
     assert not store.db.in_transaction()
 
 
-def test_owner_lock_selects_for_update_outside_sqlite() -> None:
+@pytest.mark.parametrize(
+    ("reads", "locked_row"),
+    [
+        (["row"], "row"),
+        # In READ COMMITTED, PostgreSQL skips a row deleted while FOR UPDATE
+        # waits for it, and the replacement is not in that statement's
+        # snapshot: only a second statement finds it.
+        ([None, "replacement"], "replacement"),
+        ([None, None], None),
+    ],
+    ids=["found", "replaced-while-it-waited", "deleted"],
+)
+def test_owner_lock_selects_for_update_outside_sqlite(reads, locked_row) -> None:
     query = MagicMock()
     for method in ("filter", "order_by", "with_for_update", "populate_existing"):
         getattr(query, method).return_value = query
-    query.first.return_value = "row"
+    query.first.side_effect = reads
     db = MagicMock()
     db.get_bind.return_value.dialect.name = "postgresql"
 
@@ -994,7 +1014,8 @@ def test_owner_lock_selects_for_update_outside_sqlite() -> None:
             db, user_id=1, account_id=None, resource_owner_key=OWNER
         )
 
-    assert row == "row"
+    assert row == locked_row
+    assert query.first.call_count == len(reads)
     query.with_for_update.assert_called_once_with()
     query.populate_existing.assert_called_once_with()
     db.execute.assert_not_called()

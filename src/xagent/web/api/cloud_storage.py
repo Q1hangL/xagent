@@ -104,9 +104,10 @@ class GoogleDriveCredentialError(HTTPException):
     ``status_code`` and ``detail`` are exactly what the ``/api/cloud`` routes
     return. ``reason`` is a stable, machine-readable classification for
     in-process callers. ``oauth_account_id`` names the stored credential row
-    the failure concerns: it is set on every failure raised after a row was
-    read, except a scope error for the user's own connection (see
-    ``issue_google_drive_picker_config``), and ``None`` when no row was read.
+    the failure concerns: it is set on every failure about a row that was
+    found, except a scope error for the user's own connection (see
+    ``issue_google_drive_picker_config``), and ``None`` when no row was found,
+    including a row that was gone by the time it was locked for a refresh.
     Neither is sent to clients.
     """
 
@@ -441,8 +442,9 @@ def _resource_owner_google_credentials(
             oauth_account_id=oauth_account_id,
         ) from exc
     try:
-        # Read under the lock: another refresher may have stored a new token,
-        # or a reconnect may have replaced the row, while this one waited.
+        # Read under the lock. While this one waited, another refresher may
+        # have stored a new token, a reconnect may have replaced the row, or a
+        # disconnect may have deleted it.
         oauth_account_id = _require_usable_google_drive_row(
             oauth_account, account_id=account_id
         )
@@ -483,6 +485,8 @@ def _lock_resource_owner_google_drive_row(
     ``tools/config.py``): ``SELECT ... FOR UPDATE`` on the newest row, or on
     SQLite a no-op ``UPDATE`` of the owner's rows, which takes the database
     write lock. It is held until ``db``'s transaction ends.
+
+    Returns ``None`` when no row is left, for example after a disconnect.
     """
     query = _google_drive_query(
         db,
@@ -504,9 +508,19 @@ def _lock_resource_owner_google_drive_row(
                 "provider": _GOOGLE_DRIVE_PROVIDER,
             },
         )
-    else:
-        query = query.with_for_update()
-    return query.populate_existing().first()
+        # No writer can commit after the lock is taken, so this read sees
+        # every row a reconnect committed before it.
+        return query.populate_existing().first()
+    locked = query.with_for_update().populate_existing()
+    oauth_account = locked.first()
+    if oauth_account is None:
+        # A reconnect deletes the row and inserts a new one. When it commits
+        # while this statement waits for the row lock, PostgreSQL (READ
+        # COMMITTED) skips the deleted row, and the new row is not in the
+        # snapshot this statement started with. A second statement takes a
+        # new snapshot, so it finds the new row and locks it.
+        oauth_account = locked.first()
+    return oauth_account
 
 
 def _rollback_quietly(db: Session) -> None:
