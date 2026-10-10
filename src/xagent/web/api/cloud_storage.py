@@ -536,21 +536,14 @@ class _GoogleTokenRequest(Request):
         self.last_status: int | None = None
         self.last_body: bytes | None = None
 
-    def __call__(
-        self,
-        url: Any,
-        method: Any = "GET",
-        body: Any = None,
-        headers: Any = None,
-        **kwargs: Any,
-    ) -> Any:
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        # google-auth passes the timeout, like every other argument, by
+        # keyword; without one of our own, its default stays in place.
         if self._timeout is not None:
             kwargs["timeout"] = self._timeout
         self.last_status = None
         self.last_body = None
-        response = super().__call__(
-            url, method=method, body=body, headers=headers, **kwargs
-        )
+        response = super().__call__(*args, **kwargs)
         self.last_status = response.status
         self.last_body = response.data
         return response
@@ -680,9 +673,9 @@ def _refresh_google_credentials(
     except Exception as exc:
         # For example the row was replaced by a concurrent reconnect. Clear
         # the failed transaction so the caller's session stays usable; a
-        # later attempt reads the current row again.
-        # Only the exception type is logged: a database error's text can
-        # carry the statement's parameters, which include the new token.
+        # later attempt reads the current row again. Only the exception type
+        # is logged: a database error's text can carry the statement's
+        # parameters, which include the new token.
         logger.error(
             "Failed to store refreshed Google token: %s", _exception_label(exc)
         )
