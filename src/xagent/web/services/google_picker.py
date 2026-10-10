@@ -2,6 +2,7 @@
 
 import logging
 import os
+import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal, Optional, cast
@@ -36,6 +37,11 @@ GOOGLE_PICKER_COMPANION_SCOPES = frozenset(
 GoogleDrivePickerScopeState = Literal[
     "drive_file", "full_drive", "drive_missing", "other"
 ]
+
+# (app id, OAuth client id) pairs already reported as mismatched, so that one
+# misconfiguration is logged once per process rather than on every check.
+_REPORTED_APP_ID_MISMATCHES: set[tuple[str, str]] = set()
+_REPORTED_APP_ID_MISMATCHES_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -112,9 +118,10 @@ def google_picker_app_id_matches_client(
     selection, but the app cannot see the chosen files afterwards.
 
     This returns ``False`` only when ``app_id`` is set and differs from the
-    numeric project prefix of ``oauth_client_id``, and logs a warning in that
-    case. A missing app id, or a client id without a numeric prefix, cannot be
-    compared and is treated as a match.
+    numeric project prefix of ``oauth_client_id``. The first time a process
+    sees a given mismatched pair it logs a warning. A missing app id, or a
+    client id without a numeric prefix, cannot be compared and is treated as
+    a match.
     """
     explicit_app_id = app_id.strip() if isinstance(app_id, str) else ""
     if not explicit_app_id:
@@ -123,6 +130,11 @@ def google_picker_app_id_matches_client(
     client_project = client_id.split("-", 1)[0]
     if not client_project.isdigit() or explicit_app_id == client_project:
         return True
+    with _REPORTED_APP_ID_MISMATCHES_LOCK:
+        reported = (explicit_app_id, client_id) in _REPORTED_APP_ID_MISMATCHES
+        _REPORTED_APP_ID_MISMATCHES.add((explicit_app_id, client_id))
+    if reported:
+        return False
     logger.warning(
         "Google Picker app id %s does not match the Google OAuth client's "
         "project number %s; files chosen in the Picker would be granted to "

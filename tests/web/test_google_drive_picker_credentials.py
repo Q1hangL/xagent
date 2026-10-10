@@ -40,6 +40,7 @@ from xagent.web.models.database import Base
 from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
+from xagent.web.services import google_picker
 
 OWNER = "delegated:7:member-3"
 OTHER_OWNER = "delegated:7:member-4"
@@ -1576,17 +1577,60 @@ def test_issue_picker_config_reports_reasons_from_credentials(
     assert exc_info.value.reason == "account_not_connected"
 
 
-def test_issue_picker_config_warns_about_an_app_id_from_another_project(
-    store, picker_key, monkeypatch, caplog
+_PICKER_LOGGER = "xagent.web.services.google_picker"
+
+
+@pytest.fixture
+def app_id_reports(monkeypatch, caplog):
+    """Return the app id mismatch warnings logged so far, none reported yet."""
+    monkeypatch.setattr(google_picker, "_REPORTED_APP_ID_MISMATCHES", set())
+    caplog.set_level(logging.WARNING, logger=_PICKER_LOGGER)
+    return lambda: [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == _PICKER_LOGGER
+    ]
+
+
+def test_issue_picker_config_warns_once_about_an_app_id_from_another_project(
+    store, picker_key, monkeypatch, app_id_reports
 ) -> None:
     monkeypatch.setenv("GOOGLE_PICKER_APP_ID", "555555555555")
     store.add_drive(owner=None, token="ordinary")
 
-    with caplog.at_level(logging.WARNING, logger="xagent.web.services.google_picker"):
-        result = issue_google_drive_picker_config(store.db, user_id=store.user_id)
+    first = issue_google_drive_picker_config(store.db, user_id=store.user_id)
+    second = issue_google_drive_picker_config(store.db, user_id=store.user_id)
 
-    assert result["app_id"] == "555555555555"
-    assert any("555555555555" in record.getMessage() for record in caplog.records)
+    assert first["app_id"] == second["app_id"] == "555555555555"
+    [report] = app_id_reports()
+    assert "555555555555" in report
+    assert "123456789012" in report
+
+
+@pytest.mark.parametrize(
+    ("app_id", "warned"),
+    [("999999999999", False), ("123456789012", True)],
+    ids=["matches-the-env-client", "matches-only-the-row"],
+)
+def test_issue_picker_config_checks_the_app_id_against_the_tokens_client(
+    store, picker_key, monkeypatch, app_id_reports, app_id, warned
+) -> None:
+    # The provider row has a client id but no secret, so the user's own
+    # connection uses the environment's client pair.
+    store.db.query(OAuthProvider).update({"client_secret": ""})
+    store.db.commit()
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", ENV_CLIENT_ID)
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "env-secret")
+    monkeypatch.setenv("GOOGLE_PICKER_APP_ID", app_id)
+    store.add_drive(owner=None, token="ordinary")
+
+    result = issue_google_drive_picker_config(store.db, user_id=store.user_id)
+
+    assert result["app_id"] == app_id
+    reports = app_id_reports()
+    assert len(reports) == (1 if warned else 0)
+    if warned:
+        assert "999999999999" in reports[0]
 
 
 @pytest.mark.asyncio

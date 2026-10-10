@@ -746,9 +746,6 @@ def issue_google_drive_picker_config(
             detail=_PICKER_NOT_CONFIGURED_DETAIL,
             reason="picker_not_configured",
         )
-    # Logs a warning when an explicit app id points at another project.
-    google_picker_app_id_matches_client(picker_config.app_id, oauth_client_id)
-
     if owner_key is None:
         # The website route: the same call it has always made.
         creds = get_google_credentials(user_id, db, account_id, min_ttl=min_ttl)
@@ -761,6 +758,13 @@ def issue_google_drive_picker_config(
             min_ttl=min_ttl,
             oauth_client=owner_client,
         )
+    # Warns (once per pair) when the app id points at another project than
+    # the OAuth client the token was issued with. ``creds.client_id`` is that
+    # client after any environment fallback, which can differ from the
+    # provider row's client id read above.
+    google_picker_app_id_matches_client(
+        picker_config.app_id, getattr(creds, "client_id", None)
+    )
     scope_state = classify_google_drive_picker_scopes(
         creds.scopes, minimal=minimal_scopes
     )

@@ -4,6 +4,7 @@ import logging
 
 import pytest
 
+from xagent.web.services import google_picker
 from xagent.web.services.google_picker import (
     GOOGLE_PICKER_COMPANION_SCOPES,
     classify_google_drive_picker_scopes,
@@ -69,6 +70,11 @@ def test_companion_scopes_are_identity_only() -> None:
     }
 
 
+@pytest.fixture(autouse=True)
+def no_reported_app_id_mismatches(monkeypatch) -> None:
+    monkeypatch.setattr(google_picker, "_REPORTED_APP_ID_MISMATCHES", set())
+
+
 @pytest.mark.parametrize(
     ("app_id", "client_id"),
     [
@@ -101,3 +107,25 @@ def test_picker_app_id_for_another_project_is_reported(caplog) -> None:
     assert record.levelno == logging.WARNING
     assert "555555555555" in record.getMessage()
     assert "123456789012" in record.getMessage()
+
+
+def test_picker_app_id_mismatch_is_reported_once_per_pair(caplog) -> None:
+    client = "123456789012-abc.apps.googleusercontent.com"
+    other_client = "123456789012-other.apps.googleusercontent.com"
+
+    with caplog.at_level(logging.WARNING, logger="xagent.web.services.google_picker"):
+        results = [
+            google_picker_app_id_matches_client("555555555555", client),
+            google_picker_app_id_matches_client(" 555555555555 ", client),
+            google_picker_app_id_matches_client("555555555555", other_client),
+            google_picker_app_id_matches_client("666666666666", client),
+            google_picker_app_id_matches_client("555555555555", client),
+        ]
+
+    # Every mismatch is still reported to the caller.
+    assert results == [False] * 5
+    assert [record.getMessage().split()[4] for record in caplog.records] == [
+        "555555555555",
+        "555555555555",
+        "666666666666",
+    ]
