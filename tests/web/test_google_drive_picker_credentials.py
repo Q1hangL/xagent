@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, get_args
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
@@ -26,6 +26,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from xagent.web.api import auth as auth_api
+from xagent.web.api import cloud_storage
 from xagent.web.api.cloud_storage import (
     GOOGLE_TOKEN_URI,
     GoogleDriveCredentialError,
@@ -575,30 +576,335 @@ def test_failed_commit_after_refresh_rolls_back(store, owner) -> None:
     assert store.stored(row_id) == before
 
 
-def test_row_replaced_during_refresh_is_retryable(store) -> None:
-    row_id = store.add_drive(owner=OWNER, token="old", expires_at=_future(-5))
+def _replacement_row(
+    store: "_Store",
+    *,
+    replaced_id: int,
+    owner: str | None,
+    expires_at: datetime,
+) -> int:
+    """Replace a stored row the way a reconnect does, from another session.
+
+    Callers keep a later row in the table, so that SQLite does not hand the
+    replacement the deleted row's id again.
+    """
+    other = store.sessions()
+    try:
+        other.query(UserOAuth).filter(UserOAuth.id == replaced_id).delete()
+        replacement = UserOAuth(
+            user_id=store.user_id,
+            provider="google-drive",
+            resource_owner_key=owner,
+            provider_user_id="google-user",
+            access_token="replacement-token",
+            refresh_token="replacement-refresh-token",
+            scope=f"{USERINFO} {DRIVE_FILE}",
+            expires_at=expires_at,
+        )
+        other.add(replacement)
+        other.commit()
+        return int(replacement.id)
+    finally:
+        other.close()
+
+
+def test_row_replaced_during_a_website_refresh_is_read_on_retry(store) -> None:
+    row_id = store.add_drive(owner=None, token="old", expires_at=_future(-5))
+    store.add_drive(owner=OTHER_OWNER, token="other")
+    replacement_ids: list[int] = []
 
     def _replace_row_then_refresh(self: Credentials, request: Any) -> None:
         del request
-        other = store.sessions()
-        try:
-            other.query(UserOAuth).filter(UserOAuth.id == row_id).delete()
-            other.commit()
-        finally:
-            other.close()
+        replacement_ids.append(
+            _replacement_row(
+                store, replaced_id=row_id, owner=None, expires_at=_future(60)
+            )
+        )
         self.token = "refreshed-token"
 
     with (
         patch.object(Credentials, "refresh", _replace_row_then_refresh),
         pytest.raises(GoogleDriveCredentialError) as exc_info,
     ):
-        get_google_credentials(store.user_id, store.db, resource_owner_key=OWNER)
+        get_google_credentials(store.user_id, store.db)
 
     assert exc_info.value.status_code == 401
     assert exc_info.value.reason == "refresh_unavailable"
     assert exc_info.value.oauth_account_id == row_id
-    # The session was rolled back and is usable again.
-    assert store.db.query(UserOAuth).count() == 0
+    # The session was rolled back, so a retry reads the replacement.
+    [replacement_id] = replacement_ids
+    assert replacement_id != row_id
+    retried = get_google_credentials(store.user_id, store.db)
+    assert retried.token == "replacement-token"
+    assert store.stored(replacement_id)[0] == "replacement-token"
+
+
+# --- refresh lock for a resource owner's connection -------------------------
+#
+# The resource-owner branch locks the stored row before it refreshes and reads
+# it again under the lock. On SQLite the lock is the database write lock.
+
+
+def _locking_with(monkeypatch, before_lock) -> None:
+    """Run ``before_lock`` each time a refresher is about to take the lock."""
+    original = cloud_storage._lock_resource_owner_google_drive_row
+
+    def _lock(db, **kwargs):
+        before_lock()
+        return original(db, **kwargs)
+
+    monkeypatch.setattr(cloud_storage, "_lock_resource_owner_google_drive_row", _lock)
+
+
+@pytest.mark.parametrize(
+    ("replacement_minutes", "refreshed"),
+    [(60, False), (-5, True)],
+    ids=["fresh-replacement", "expired-replacement"],
+)
+def test_owner_refresh_uses_a_row_replaced_while_it_waited(
+    store, monkeypatch, replacement_minutes, refreshed
+) -> None:
+    old_id = store.add_drive(owner=OWNER, token="old", expires_at=_future(-5))
+    store.add_drive(owner=OTHER_OWNER, token="other")
+    replacement_ids: list[int] = []
+    _locking_with(
+        monkeypatch,
+        lambda: replacement_ids.append(
+            _replacement_row(
+                store,
+                replaced_id=old_id,
+                owner=OWNER,
+                expires_at=_future(replacement_minutes),
+            )
+        ),
+    )
+    patcher, calls = _refreshing(refresh_token="rotated-refresh-token")
+
+    with patcher:
+        creds = get_google_credentials(
+            store.user_id, store.db, resource_owner_key=OWNER
+        )
+
+    [replacement_id] = replacement_ids
+    assert replacement_id != old_id
+    if refreshed:
+        assert calls == ["replacement-token"]
+        assert creds.token == "refreshed-token"
+        assert store.stored(replacement_id)[:2] == (
+            "refreshed-token",
+            "rotated-refresh-token",
+        )
+    else:
+        assert calls == []
+        assert creds.token == "replacement-token"
+        assert store.stored(replacement_id)[:2] == (
+            "replacement-token",
+            "replacement-refresh-token",
+        )
+    # The lock was released.
+    assert not store.db.in_transaction()
+
+
+def _read_owner_credentials(
+    store: "_Store", min_ttl: timedelta = timedelta(minutes=5)
+) -> tuple[str, str | None, bool]:
+    session = store.sessions()
+    try:
+        creds = get_google_credentials(
+            store.user_id, session, resource_owner_key=OWNER, min_ttl=min_ttl
+        )
+        return str(creds.token), creds.refresh_token, session.in_transaction()
+    finally:
+        session.close()
+
+
+def _start(name: str, target) -> tuple[threading.Thread, dict[str, Any]]:
+    outcome: dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            outcome["result"] = target()
+        except BaseException as exc:  # pragma: no cover - reported below
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=_run, name=name, daemon=True)
+    thread.start()
+    return thread, outcome
+
+
+@pytest.mark.parametrize(
+    ("waiter_min_ttl", "waiter_refreshes"),
+    [(timedelta(minutes=5), False), (timedelta(hours=2), True)],
+    ids=["reuses-the-winners-token", "refreshes-with-the-rotated-token"],
+)
+def test_a_refresher_waiting_on_the_lock_never_uses_a_stale_refresh_token(
+    store, monkeypatch, waiter_min_ttl, waiter_refreshes
+) -> None:
+    row_id = store.add_drive(owner=OWNER, token="old", expires_at=_future(-5))
+    winner_refreshing = threading.Event()
+    waiter_locking = threading.Event()
+    refreshes: list[tuple[str, str, str | None]] = []
+
+    def _before_lock() -> None:
+        if threading.current_thread().name == "waiter":
+            waiter_locking.set()
+
+    def _refresh(self: Credentials, request: Any) -> None:
+        del request
+        name = threading.current_thread().name
+        refreshes.append((name, str(self.token), self.refresh_token))
+        if name == "winner":
+            winner_refreshing.set()
+            # Keep the lock until the other refresher waits for it.
+            assert waiter_locking.wait(timeout=5)
+            time.sleep(0.2)
+        self.token = f"{name}-token"
+        self.expiry = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
+            hours=1
+        )
+        self._refresh_token = f"{name}-refresh-token"
+
+    _locking_with(monkeypatch, _before_lock)
+    monkeypatch.setattr(Credentials, "refresh", _refresh)
+
+    winner, winner_outcome = _start("winner", lambda: _read_owner_credentials(store))
+    assert winner_refreshing.wait(timeout=5)
+    # The waiter's first read still sees the expired token.
+    waiter, waiter_outcome = _start(
+        "waiter", lambda: _read_owner_credentials(store, waiter_min_ttl)
+    )
+    winner.join(timeout=10)
+    waiter.join(timeout=10)
+
+    assert not winner.is_alive() and not waiter.is_alive()
+    assert "error" not in winner_outcome, winner_outcome
+    assert "error" not in waiter_outcome, waiter_outcome
+    assert winner_outcome["result"] == ("winner-token", "winner-refresh-token", False)
+    if waiter_refreshes:
+        # The waiter refreshed with the token the winner stored.
+        assert refreshes == [
+            ("winner", "old", "refresh-token"),
+            ("waiter", "winner-token", "winner-refresh-token"),
+        ]
+        assert waiter_outcome["result"] == (
+            "waiter-token",
+            "waiter-refresh-token",
+            False,
+        )
+        assert store.stored(row_id)[:2] == ("waiter-token", "waiter-refresh-token")
+    else:
+        assert refreshes == [("winner", "old", "refresh-token")]
+        assert waiter_outcome["result"] == (
+            "winner-token",
+            "winner-refresh-token",
+            False,
+        )
+        assert store.stored(row_id)[:2] == ("winner-token", "winner-refresh-token")
+
+
+def _quick_writer(store: "_Store", row_id: int) -> None:
+    """Touch the row from another connection, giving up after 0.1 seconds."""
+    engine = create_engine(store.engine.url, connect_args={"timeout": 0.1})
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text("UPDATE user_oauth SET scope = scope WHERE id = :id"),
+                {"id": row_id},
+            )
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("fails", [False, True], ids=["refreshed", "refresh-failed"])
+def test_owner_refresh_holds_the_lock_until_it_is_done(store, fails) -> None:
+    row_id = store.add_drive(owner=OWNER, token="old", expires_at=_future(-5))
+    writes_during_refresh: list[str] = []
+
+    def _refresh(self: Credentials, request: Any) -> None:
+        del request
+        try:
+            _quick_writer(store, row_id)
+            writes_during_refresh.append("written")
+        except OperationalError:
+            writes_during_refresh.append("locked")
+        if fails:
+            raise TransportError("connection reset")
+        self.token = "refreshed-token"
+
+    with patch.object(Credentials, "refresh", _refresh):
+        if fails:
+            with pytest.raises(GoogleDriveCredentialError):
+                get_google_credentials(
+                    store.user_id, store.db, resource_owner_key=OWNER
+                )
+        else:
+            get_google_credentials(store.user_id, store.db, resource_owner_key=OWNER)
+
+    assert writes_during_refresh == ["locked"]
+    # Released afterwards, also after a failed refresh.
+    assert not store.db.in_transaction()
+    _quick_writer(store, row_id)
+
+
+def test_website_refresh_takes_no_lock(store) -> None:
+    row_id = store.add_drive(owner=None, token="old", expires_at=_future(-5))
+    writes_during_refresh: list[str] = []
+
+    def _refresh(self: Credentials, request: Any) -> None:
+        del request
+        _quick_writer(store, row_id)
+        writes_during_refresh.append("written")
+        self.token = "refreshed-token"
+
+    with patch.object(Credentials, "refresh", _refresh):
+        get_google_credentials(store.user_id, store.db)
+
+    assert writes_during_refresh == ["written"]
+
+
+def test_owner_lock_failure_is_unavailable_and_skips_the_refresh(
+    store, monkeypatch
+) -> None:
+    row_id = store.add_drive(owner=OWNER, token="old", expires_at=_future(-5))
+
+    def _locked(db, **kwargs):
+        raise OperationalError("UPDATE user_oauth", {}, Exception("locked"))
+
+    monkeypatch.setattr(cloud_storage, "_lock_resource_owner_google_drive_row", _locked)
+    patcher, calls = _refreshing()
+
+    with patcher, pytest.raises(GoogleDriveCredentialError) as exc_info:
+        get_google_credentials(store.user_id, store.db, resource_owner_key=OWNER)
+
+    assert calls == []
+    assert (exc_info.value.status_code, exc_info.value.detail) == (
+        401,
+        RECONNECT_DETAIL,
+    )
+    assert exc_info.value.reason == "refresh_unavailable"
+    assert exc_info.value.oauth_account_id == row_id
+    assert not store.db.in_transaction()
+
+
+def test_owner_lock_selects_for_update_outside_sqlite() -> None:
+    query = MagicMock()
+    for method in ("filter", "order_by", "with_for_update", "populate_existing"):
+        getattr(query, method).return_value = query
+    query.first.return_value = "row"
+    db = MagicMock()
+    db.get_bind.return_value.dialect.name = "postgresql"
+
+    with patch(
+        "xagent.web.api.cloud_storage.scoped_user_oauth_query", return_value=query
+    ):
+        row = cloud_storage._lock_resource_owner_google_drive_row(
+            db, user_id=1, account_id=None, resource_owner_key=OWNER
+        )
+
+    assert row == "row"
+    query.with_for_update.assert_called_once_with()
+    query.populate_existing.assert_called_once_with()
+    db.execute.assert_not_called()
 
 
 # --- refresh through google-auth ------------------------------------------

@@ -11,6 +11,8 @@ from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ...core.utils.encryption import decrypt_value
@@ -79,7 +81,8 @@ GoogleDriveCredentialReason = Literal[
     "reauth_required",
     # Any other refresh failure: transport error or timeout, retryable or
     # 5xx answer, a body that is not an OAuth error, another OAuth error
-    # code (for example ``invalid_client``), an unexpected exception, or a
+    # code (for example ``invalid_client``), an unexpected exception, a
+    # stored credential that could not be locked for the refresh, or a
     # failed commit of the refreshed token.
     "refresh_unavailable",
     # No Google OAuth client id/secret is configured.
@@ -360,16 +363,114 @@ def _resource_owner_google_credentials(
     creds = _google_credentials_from_row(
         oauth_account, *oauth_client, oauth_account_id=oauth_account_id
     )
+    if not _google_token_needs_refresh(creds, min_ttl):
+        return creds
 
-    if _google_token_needs_refresh(creds, min_ttl):
-        _refresh_google_credentials(
-            creds,
-            oauth_account,
+    # A refresh is due. Serialize it with every other refresher of this
+    # credential, the connector runtime's included: Google may rotate the
+    # refresh token, and an overlapping refresh would store a token the other
+    # one has already replaced. The runtime also orders its own refreshers
+    # with an asyncio.Lock (``_actor_oauth_refresh_lock`` in
+    # ``tools/config.py``); that lock belongs to one event loop and cannot be
+    # taken from this synchronous code, so this relies on the row lock alone.
+    # The runtime takes the same row lock, and it holds across threads,
+    # event loops and processes.
+    try:
+        oauth_account = _lock_resource_owner_google_drive_row(
             db,
-            oauth_account_id=oauth_account_id,
-            timeout=_RESOURCE_OWNER_REFRESH_TIMEOUT,
+            user_id=user_id,
+            account_id=account_id,
+            resource_owner_key=resource_owner_key,
         )
+    except SQLAlchemyError as exc:
+        logger.error(
+            "Failed to lock the stored Google Drive credential: %s",
+            _exception_label(exc),
+        )
+        _rollback_quietly(db)
+        raise GoogleDriveCredentialError(
+            status_code=401,
+            detail=_DRIVE_RECONNECT_DETAIL,
+            reason="refresh_unavailable",
+            oauth_account_id=oauth_account_id,
+        ) from exc
+    try:
+        # Read under the lock: another refresher may have stored a new token,
+        # or a reconnect may have replaced the row, while this one waited.
+        oauth_account_id = _require_usable_google_drive_row(
+            oauth_account, account_id=account_id
+        )
+        creds = _google_credentials_from_row(
+            oauth_account, *oauth_client, oauth_account_id=oauth_account_id
+        )
+        if _google_token_needs_refresh(creds, min_ttl):
+            # Commits ``db``, which releases the lock.
+            _refresh_google_credentials(
+                creds,
+                oauth_account,
+                db,
+                oauth_account_id=oauth_account_id,
+                timeout=_RESOURCE_OWNER_REFRESH_TIMEOUT,
+            )
+            return creds
+    except Exception:
+        if db.in_transaction():
+            _rollback_quietly(db)
+        raise
+    # Another refresher already stored a token that is fresh enough. Nothing
+    # was changed here; end the transaction to release the lock.
+    _rollback_quietly(db)
     return creds
+
+
+def _lock_resource_owner_google_drive_row(
+    db: Session,
+    *,
+    user_id: int,
+    account_id: Optional[int],
+    resource_owner_key: str,
+) -> Any:
+    """Lock a resource owner's Google Drive credential and read it again.
+
+    This is the lock the connector runtime takes before it refreshes the same
+    credential (``_resolve_actor_oauth_access_token_in_worker`` in
+    ``tools/config.py``): ``SELECT ... FOR UPDATE`` on the newest row, or on
+    SQLite a no-op ``UPDATE`` of the owner's rows, which takes the database
+    write lock. It is held until ``db``'s transaction ends.
+    """
+    query = _google_drive_query(
+        db,
+        user_id=user_id,
+        account_id=account_id,
+        resource_owner_key=resource_owner_key,
+    ).order_by(UserOAuth.id.desc())
+    if db.get_bind().dialect.name == "sqlite":
+        db.execute(
+            text(
+                "UPDATE user_oauth SET id = id "
+                "WHERE user_id = :user_id "
+                "AND resource_owner_key = :resource_owner_key "
+                "AND provider = :provider"
+            ),
+            {
+                "user_id": user_id,
+                "resource_owner_key": resource_owner_key,
+                "provider": _GOOGLE_DRIVE_PROVIDER,
+            },
+        )
+    else:
+        query = query.with_for_update()
+    return query.populate_existing().first()
+
+
+def _rollback_quietly(db: Session) -> None:
+    try:
+        db.rollback()
+    except Exception as exc:
+        logger.error(
+            "Failed to roll back a Google Drive credential transaction: %s",
+            _exception_label(exc),
+        )
 
 
 class _GoogleTokenRequest(Request):
@@ -534,14 +635,12 @@ def _refresh_google_credentials(
         # For example the row was replaced by a concurrent reconnect. Clear
         # the failed transaction so the caller's session stays usable; a
         # later attempt reads the current row again.
-        logger.error("Failed to store refreshed Google token: %s", exc)
-        try:
-            db.rollback()
-        except Exception as rollback_exc:
-            logger.error(
-                "Failed to roll back after storing a refreshed Google token: %s",
-                rollback_exc,
-            )
+        # Only the exception type is logged: a database error's text can
+        # carry the statement's parameters, which include the new token.
+        logger.error(
+            "Failed to store refreshed Google token: %s", _exception_label(exc)
+        )
+        _rollback_quietly(db)
         raise GoogleDriveCredentialError(
             status_code=401,
             detail=_DRIVE_RECONNECT_DETAIL,
