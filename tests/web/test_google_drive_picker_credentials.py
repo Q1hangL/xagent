@@ -390,6 +390,98 @@ def test_due_refresh_without_refresh_token_requires_reauth(store, owner) -> None
     assert (access_token, refresh_token) == ("old", None)
 
 
+_INVALID_OWNER_KEYS = pytest.mark.parametrize(
+    "key", ["", "   ", "k" * 513, 7], ids=["empty", "blank", "oversized", "not-a-str"]
+)
+_INVALID_MIN_TTLS = pytest.mark.parametrize(
+    "min_ttl", [timedelta(seconds=-1), 300, None], ids=["negative", "int", "none"]
+)
+
+
+def _nothing_may_be_read():
+    return (
+        patch(
+            "xagent.web.api.cloud_storage.scoped_user_oauth_query",
+            side_effect=AssertionError("no credential may be read"),
+        ),
+        patch(
+            "xagent.web.api.cloud_storage.get_google_picker_config",
+            side_effect=AssertionError("the configuration may not be checked"),
+        ),
+    )
+
+
+@_INVALID_OWNER_KEYS
+def test_an_invalid_owner_key_is_rejected_before_anything_is_read(store, key) -> None:
+    store.add_drive(owner=OWNER, token="owned")
+    no_query, no_config = _nothing_may_be_read()
+
+    with no_query, no_config:
+        with pytest.raises(ValueError, match="resource_owner_key"):
+            get_google_credentials(store.user_id, store.db, resource_owner_key=key)
+        # Not 503 even though the Picker is not configured here.
+        with pytest.raises(ValueError, match="resource_owner_key"):
+            issue_google_drive_picker_config(
+                store.db, user_id=store.user_id, resource_owner_key=key
+            )
+
+
+@_INVALID_MIN_TTLS
+def test_an_invalid_min_ttl_is_rejected_before_anything_is_read(store, min_ttl) -> None:
+    store.add_drive(owner=OWNER, token="owned")
+    no_query, no_config = _nothing_may_be_read()
+
+    with no_query, no_config:
+        for owner in (None, OWNER):
+            with pytest.raises(ValueError, match="min_ttl"):
+                get_google_credentials(
+                    store.user_id, store.db, resource_owner_key=owner, min_ttl=min_ttl
+                )
+            with pytest.raises(ValueError, match="min_ttl"):
+                issue_google_drive_picker_config(
+                    store.db,
+                    user_id=store.user_id,
+                    resource_owner_key=owner,
+                    min_ttl=min_ttl,
+                )
+
+
+def test_an_owner_key_is_stripped(store) -> None:
+    store.add_drive(owner=OWNER, token="old", expires_at=_future(-5))
+    patcher, calls = _refreshing()
+
+    with patcher:
+        creds = get_google_credentials(
+            store.user_id, store.db, resource_owner_key=f"  {OWNER}\t"
+        )
+
+    assert calls == ["old"]
+    assert creds.token == "refreshed-token"
+
+
+def test_a_zero_min_ttl_leaves_the_refresh_to_google_auth(store) -> None:
+    # Inside the default five minutes, but outside the few minutes before
+    # expiry in which google-auth itself considers a token expired.
+    store.add_drive(
+        owner=OWNER,
+        token="four-and-a-half-minutes",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=4, seconds=30),
+    )
+    patcher, calls = _refreshing()
+
+    with patcher:
+        kept = get_google_credentials(
+            store.user_id, store.db, resource_owner_key=OWNER, min_ttl=timedelta(0)
+        )
+        refreshed = get_google_credentials(
+            store.user_id, store.db, resource_owner_key=OWNER
+        )
+
+    assert kept.token == "four-and-a-half-minutes"
+    assert calls == ["four-and-a-half-minutes"]
+    assert refreshed.token == "refreshed-token"
+
+
 # --- OAuth client resolution -------------------------------------------
 
 

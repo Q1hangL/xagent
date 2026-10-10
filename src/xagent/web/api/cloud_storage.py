@@ -28,6 +28,7 @@ from ..services.google_picker import (
 )
 from ..services.user_oauth import (
     get_scoped_user_oauth_account,
+    normalize_user_oauth_resource_owner_key,
     scoped_user_oauth_query,
 )
 
@@ -284,18 +285,31 @@ def get_google_credentials(
     of a token refresh is bounded to ten seconds, all like the connector
     runtime does.
 
-    The token is refreshed when it expires within ``min_ttl``. Failures raise
+    ``min_ttl`` is a refresh threshold: a token that expires within it is
+    refreshed first (google-auth also treats a token as expired a few minutes
+    before its expiry). Nothing checks how long the refreshed token lives,
+    and a token stored without an expiry is never refreshed. Failures raise
     ``GoogleDriveCredentialError``; stored credentials are never cleared here.
+    ``resource_owner_key`` is stripped; a blank or oversized key, or a
+    ``min_ttl`` that is not a non-negative ``timedelta``, raises
+    ``ValueError`` before anything is read.
     """
-    if resource_owner_key is not None:
+    owner_key = normalize_user_oauth_resource_owner_key(resource_owner_key)
+    _require_min_ttl(min_ttl)
+    if owner_key is not None:
         return _resource_owner_google_credentials(
             user_id,
             db,
             account_id,
-            resource_owner_key=resource_owner_key,
+            resource_owner_key=owner_key,
             min_ttl=min_ttl,
         )
     return _own_google_credentials(user_id, db, account_id, min_ttl=min_ttl)
+
+
+def _require_min_ttl(min_ttl: timedelta) -> None:
+    if not isinstance(min_ttl, timedelta) or min_ttl < timedelta(0):
+        raise ValueError("min_ttl must be a non-negative timedelta")
 
 
 def _own_google_credentials(
@@ -705,17 +719,21 @@ def issue_google_drive_picker_config(
     key (a delegated connection) instead of the user's own connection.
     ``minimal_scopes`` additionally requires that the grant carries nothing
     besides ``drive.file`` and basic identity scopes. ``min_ttl`` is the
-    shortest remaining lifetime the returned access token may have.
+    refresh threshold described in ``get_google_credentials``, not a
+    guaranteed remaining lifetime of the returned token.
 
     Raises ``GoogleDriveCredentialError``. The Picker configuration is checked
-    before any credential is read, and the scopes are checked last.
+    before any credential is read, and the scopes are checked last. Invalid
+    arguments raise ``ValueError`` before the configuration is checked.
     """
+    owner_key = normalize_user_oauth_resource_owner_key(resource_owner_key)
+    _require_min_ttl(min_ttl)
     # Fail closed before touching account credentials. An unconfigured
     # deployment should consistently report 503 rather than leaking account
     # state through a 401/409 response.
     oauth_client_id: Optional[str]
     owner_client: tuple[str, str] | None = None
-    if resource_owner_key is None:
+    if owner_key is None:
         oauth_client_id, _ = get_google_oauth_config(db)
     else:
         # Resolved once: the credential below is built with the same client.
@@ -731,7 +749,7 @@ def issue_google_drive_picker_config(
     # Logs a warning when an explicit app id points at another project.
     google_picker_app_id_matches_client(picker_config.app_id, oauth_client_id)
 
-    if resource_owner_key is None:
+    if owner_key is None:
         # The website route: the same call it has always made.
         creds = get_google_credentials(user_id, db, account_id, min_ttl=min_ttl)
     else:
@@ -739,7 +757,7 @@ def issue_google_drive_picker_config(
             user_id,
             db,
             account_id,
-            resource_owner_key=resource_owner_key,
+            resource_owner_key=owner_key,
             min_ttl=min_ttl,
             oauth_client=owner_client,
         )
