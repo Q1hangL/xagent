@@ -5,12 +5,11 @@ callers can read the credential stored for a resource owner key instead; the
 routes' status codes and details must stay exactly as they are.
 """
 
-import inspect
 import json
 import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import patch
 
 import pytest
@@ -26,9 +25,9 @@ from sqlalchemy.orm import sessionmaker
 
 from xagent.web.api import auth as auth_api
 from xagent.web.api.cloud_storage import (
-    GOOGLE_DRIVE_CREDENTIAL_REASONS,
     GOOGLE_TOKEN_URI,
     GoogleDriveCredentialError,
+    GoogleDriveCredentialReason,
     _GoogleTokenRequest,
     get_google_credentials,
     get_google_drive_picker_config,
@@ -198,8 +197,8 @@ def _refreshing(
 # --- contract ------------------------------------------------------------
 
 
-def test_credential_error_reasons_and_signatures_are_stable() -> None:
-    assert GOOGLE_DRIVE_CREDENTIAL_REASONS == {
+def test_credential_reasons_are_stable() -> None:
+    assert set(get_args(GoogleDriveCredentialReason)) == {
         "picker_not_configured",
         "account_not_connected",
         "account_not_found",
@@ -210,42 +209,73 @@ def test_credential_error_reasons_and_signatures_are_stable() -> None:
         "scope_mismatch",
         "scope_drive_missing",
     }
+
+
+def test_credential_error_is_the_routes_http_error_plus_a_reason() -> None:
     error = GoogleDriveCredentialError(
         401, RECONNECT_DETAIL, reason="reauth_required", oauth_account_id=5
     )
     assert isinstance(error, HTTPException)
     assert (error.status_code, error.detail) == (401, RECONNECT_DETAIL)
     assert (error.reason, error.oauth_account_id) == ("reauth_required", 5)
-
-    credentials_params = inspect.signature(get_google_credentials).parameters
-    assert (
-        credentials_params["resource_owner_key"].kind is inspect.Parameter.KEYWORD_ONLY
+    rowless = GoogleDriveCredentialError(
+        503, PICKER_NOT_CONFIGURED_DETAIL, reason="picker_not_configured"
     )
-    assert credentials_params["resource_owner_key"].default is None
-    assert credentials_params["min_ttl"].default == timedelta(minutes=5)
-
-    issue_params = inspect.signature(issue_google_drive_picker_config).parameters
-    assert list(issue_params) == [
-        "db",
-        "user_id",
-        "resource_owner_key",
-        "account_id",
-        "minimal_scopes",
-        "min_ttl",
-    ]
-    assert issue_params["minimal_scopes"].default is False
-    assert issue_params["min_ttl"].default == timedelta(minutes=5)
+    assert rowless.oauth_account_id is None
 
 
-def test_cloud_storage_keeps_its_drive_scope_constants() -> None:
-    from xagent.web.api import cloud_storage
-    from xagent.web.services import google_picker
+def test_contract_functions_take_their_options_by_keyword(store, picker_key) -> None:
+    row_id = store.add_drive(owner=OWNER, token="owned")
 
-    assert cloud_storage.GOOGLE_DRIVE_FILE_SCOPE == DRIVE_FILE
-    assert cloud_storage.GOOGLE_DRIVE_SCOPE_PREFIX == DRIVE
-    # Same values as the scope rules the Picker uses.
-    assert google_picker.GOOGLE_DRIVE_FILE_SCOPE == DRIVE_FILE
-    assert google_picker.GOOGLE_DRIVE_SCOPE_PREFIX == DRIVE
+    creds = get_google_credentials(
+        user_id=store.user_id,
+        db=store.db,
+        account_id=row_id,
+        resource_owner_key=OWNER,
+        min_ttl=timedelta(minutes=5),
+    )
+    issued = issue_google_drive_picker_config(
+        db=store.db,
+        user_id=store.user_id,
+        resource_owner_key=OWNER,
+        account_id=row_id,
+        minimal_scopes=True,
+        min_ttl=timedelta(minutes=5),
+    )
+
+    assert creds.token == issued["access_token"] == "owned"
+    with pytest.raises(TypeError):
+        get_google_credentials(store.user_id, store.db, row_id, OWNER)
+    with pytest.raises(TypeError):
+        issue_google_drive_picker_config(store.db, store.user_id)
+
+
+def _credentials_token(store: "_Store") -> str:
+    return get_google_credentials(
+        store.user_id, store.db, resource_owner_key=OWNER
+    ).token
+
+
+def _issued_token(store: "_Store") -> str:
+    return issue_google_drive_picker_config(
+        store.db, user_id=store.user_id, resource_owner_key=OWNER
+    )["access_token"]
+
+
+@pytest.mark.parametrize(
+    "read_token", [_credentials_token, _issued_token], ids=["credentials", "issue"]
+)
+@pytest.mark.parametrize(
+    ("minutes_left", "expected"), [(4, "refreshed-token"), (6, "stored")]
+)
+def test_default_refresh_threshold_is_five_minutes(
+    store, picker_key, read_token, minutes_left, expected
+) -> None:
+    store.add_drive(owner=OWNER, token="stored", expires_at=_future(minutes_left))
+    patcher, _calls = _refreshing()
+
+    with patcher:
+        assert read_token(store) == expected
 
 
 # --- owner namespace -----------------------------------------------------

@@ -5,7 +5,7 @@ import logging
 import os
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Literal, Optional, cast, get_args
+from typing import Any, Dict, List, Literal, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from google.auth.exceptions import RefreshError
@@ -36,8 +36,6 @@ cloud_router = APIRouter(prefix="/api/cloud", tags=["Cloud Storage"])
 
 # Google OAuth Constants
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
-GOOGLE_DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
-GOOGLE_DRIVE_SCOPE_PREFIX = "https://www.googleapis.com/auth/drive"
 GOOGLE_TOKEN_REFRESH_SKEW = timedelta(minutes=5)
 # Upper bound, in seconds, for each HTTP call (connect and read) of a token
 # refresh for a resource owner's connection. The connector runtime refreshes
@@ -93,9 +91,6 @@ GoogleDriveCredentialReason = Literal[
     # The grant carries no Drive scope at all.
     "scope_drive_missing",
 ]
-GOOGLE_DRIVE_CREDENTIAL_REASONS: frozenset[str] = frozenset(
-    get_args(GoogleDriveCredentialReason)
-)
 
 
 class GoogleDriveCredentialError(HTTPException):
@@ -319,11 +314,6 @@ def get_google_credentials(
     return creds
 
 
-# Lets ``_GoogleTokenRequest`` tell "no timeout given" (google-auth's own
-# default applies) apart from an explicit ``timeout=None``.
-_TRANSPORT_DEFAULT: Any = object()
-
-
 class _GoogleTokenRequest(Request):
     """google-auth HTTP transport for one token refresh.
 
@@ -344,13 +334,10 @@ class _GoogleTokenRequest(Request):
         method: Any = "GET",
         body: Any = None,
         headers: Any = None,
-        timeout: Any = _TRANSPORT_DEFAULT,
         **kwargs: Any,
     ) -> Any:
         if self._timeout is not None:
             kwargs["timeout"] = self._timeout
-        elif timeout is not _TRANSPORT_DEFAULT:
-            kwargs["timeout"] = timeout
         response = super().__call__(
             url, method=method, body=body, headers=headers, **kwargs
         )
