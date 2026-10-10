@@ -77,8 +77,9 @@ GoogleDriveCredentialReason = Literal[
     # ``account_id`` does not name a credential in the requested namespace.
     "account_not_found",
     # The credential cannot be used again without a new authorization: no
-    # access token, no refresh token when a refresh is due, or Google
-    # answered the refresh with ``invalid_grant`` (revoked or expired).
+    # access token, no refresh token when a refresh is due, or the token
+    # endpoint's last answer to the refresh was ``invalid_grant`` (revoked or
+    # expired, or reauthentication needed). Nothing is cleared.
     "reauth_required",
     # Any other refresh failure: transport error or timeout, retryable or
     # 5xx answer, a body that is not an OAuth error, another OAuth error
@@ -281,21 +282,47 @@ def get_google_credentials(
 ) -> Any:
     """Get Google Credentials for user, refreshing if necessary.
 
-    By default this reads the user's own Google Drive connection. With
-    ``resource_owner_key`` it instead reads the credential stored for that
-    resource owner key under ``user_id`` (a delegated connection); the newest
-    such row wins, the OAuth client is resolved per field, and each HTTP call
-    of a token refresh is bounded to ten seconds, all like the connector
-    runtime does.
+    By default this reads the user's own Google Drive connection, as the
+    ``/api/cloud`` routes always have. With ``resource_owner_key`` it reads
+    the credential stored for that key under ``user_id`` (a delegated
+    connection) instead. That credential is handled the way the connector
+    runtime refreshes it:
+
+    * the newest row wins;
+    * each field of the OAuth client falls back to its environment variable
+      on its own;
+    * a refresh sets a 10-second connect and per-read timeout on each request
+      (retries can make the whole refresh longer);
+    * a due refresh first takes the runtime's lock on the stored row.
+
+    A failed refresh is classified here, not as the runtime does: an
+    ``invalid_grant`` answer is ``reauth_required`` (see
+    ``GoogleDriveCredentialReason``), which is safe because nothing is
+    cleared here.
+
+    This function belongs to the cross-repository contract documented on
+    ``issue_google_drive_picker_config``. That covers its signature (``user_id``,
+    ``db`` and ``account_id`` positional or keyword, the rest keyword-only), its
+    reasons, the ``status_code`` and ``detail`` of every error (unchanged from
+    the website routes), and the caller's precondition. Nothing is authorized
+    here, and the result carries a raw access token.
 
     ``min_ttl`` is a refresh threshold: a token that expires within it is
     refreshed first (google-auth also treats a token as expired a few minutes
     before its expiry). Nothing checks how long the refreshed token lives,
-    and a token stored without an expiry is never refreshed. Failures raise
-    ``GoogleDriveCredentialError``; stored credentials are never cleared here.
-    ``resource_owner_key`` is stripped; a blank or oversized key, or a
-    ``min_ttl`` that is not a non-negative ``timedelta``, raises
-    ``ValueError`` before anything is read.
+    and a token stored without an expiry is never refreshed.
+
+    The session is committed after a refresh stores the new token, and it is
+    rolled back when storing the token fails. For a resource owner's
+    connection a due refresh also locks the stored row, and the transaction
+    always ends before this returns or raises: it is committed after a stored
+    refresh and rolled back in every other case. In-process callers should
+    therefore pass a dedicated session.
+
+    Failures raise ``GoogleDriveCredentialError``; stored credentials are never
+    cleared here. ``resource_owner_key`` is stripped. A blank or oversized key,
+    or a ``min_ttl`` that is not a non-negative ``timedelta``, raises
+    ``ValueError`` (a programming error) before anything is read.
     """
     owner_key = normalize_user_oauth_resource_owner_key(resource_owner_key)
     _require_min_ttl(min_ttl)
@@ -720,16 +747,33 @@ def issue_google_drive_picker_config(
     The result is exactly ``{"access_token", "developer_key", "app_id"}``. The
     refresh token and client secret never leave the server.
 
+    The website route calls this with ``user_id`` and ``account_id`` only. An
+    application that embeds xagent and serves delegated connections calls it
+    in process with ``resource_owner_key``, so what follows is a contract
+    across repositories:
+
+    * Signature: ``db`` positional or keyword, every other argument
+      keyword-only, with the defaults shown.
+    * Errors: ``GoogleDriveCredentialError``. Its ``reason`` is one of
+      ``GoogleDriveCredentialReason``, and its ``status_code`` and ``detail``
+      are the ones the website route has always returned. Invalid arguments
+      raise ``ValueError`` (a programming error) before anything else.
+    * Check order: the Picker configuration first, before any credential is
+      read; then the credential; then the scopes.
+    * Precondition: the caller must already have authenticated the browser
+      principal as the owner of the connection, meaning ``user_id`` and, when
+      given, ``resource_owner_key``. This function does no authorization of
+      its own and returns a raw access token.
+    * Session: when a refresh is due, ``db`` is committed or rolled back as
+      ``get_google_credentials`` describes. Pass a dedicated session.
+
     ``resource_owner_key`` reads the credential stored for that resource owner
-    key (a delegated connection) instead of the user's own connection.
+    key (a delegated connection) instead of the user's own connection. The
+    key is stripped, and a blank or oversized key raises ``ValueError``.
     ``minimal_scopes`` additionally requires that the grant carries nothing
     besides ``drive.file`` and basic identity scopes. ``min_ttl`` is the
-    refresh threshold described in ``get_google_credentials``, not a
+    refresh threshold that ``get_google_credentials`` describes, not a
     guaranteed remaining lifetime of the returned token.
-
-    Raises ``GoogleDriveCredentialError``. The Picker configuration is checked
-    before any credential is read, and the scopes are checked last. Invalid
-    arguments raise ``ValueError`` before the configuration is checked.
     """
     owner_key = normalize_user_oauth_resource_owner_key(resource_owner_key)
     _require_min_ttl(min_ttl)
