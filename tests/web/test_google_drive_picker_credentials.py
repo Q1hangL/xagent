@@ -1289,6 +1289,79 @@ def test_token_endpoint_answers_are_classified(
     assert store.snapshot(row_id) == before
 
 
+@pytest.mark.parametrize("owner", [None, OWNER])
+@pytest.mark.parametrize(
+    "body",
+    ["[]", '"invalid_grant"', "null", "[" * 100_000],
+    ids=["array", "string", "null", "nested-too-deep"],
+)
+def test_a_token_endpoint_body_that_is_not_a_json_object_is_unavailable(
+    store, backoff_sleeps, caplog, owner, body
+) -> None:
+    """google-auth itself may fail on such a body; it is still classified."""
+    endpoint = _TokenEndpoint(_Answer(400, body))
+    row_id = store.add_drive(owner=owner, token="old", expires_at=_future(-5))
+    before = store.snapshot(row_id)
+
+    with (
+        caplog.at_level(logging.ERROR, logger="xagent.web.api.cloud_storage"),
+        patch.object(requests.Session, "request", endpoint.request),
+        pytest.raises(GoogleDriveCredentialError) as exc_info,
+    ):
+        get_google_credentials(store.user_id, store.db, resource_owner_key=owner)
+
+    assert (exc_info.value.status_code, exc_info.value.detail) == (
+        401,
+        RECONNECT_DETAIL,
+    )
+    assert exc_info.value.reason == "refresh_unavailable"
+    assert exc_info.value.oauth_account_id == row_id
+    assert exc_info.value.__cause__ is not None
+    assert len(endpoint.calls) == 1
+    assert backoff_sleeps == []
+    [message] = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "xagent.web.api.cloud_storage"
+    ]
+    assert "token endpoint status 400, error None," in message
+    assert store.snapshot(row_id) == before
+
+
+@pytest.mark.parametrize(
+    ("body", "error_code"),
+    [
+        (None, None),
+        (b"", None),
+        (
+            b'{"error": "invalid_grant", "error_subtype": "invalid_rapt"}',
+            "invalid_grant",
+        ),
+        (b'{"error": {"code": 400, "message": "Bad Request"}}', None),
+        (b'{"error_description": "no code"}', None),
+        (b"<html>Bad Request</html>", None),
+        (b"[]", None),
+        (b'"invalid_grant"', None),
+        (b"null", None),
+        (b"[" * 100_000, None),
+    ],
+    ids=[
+        "none",
+        "empty",
+        "object",
+        "structured-error",
+        "no-error",
+        "html",
+        "array",
+        "string",
+        "null",
+        "nested-too-deep",
+    ],
+)
+def test_oauth_error_code_reads_only_a_json_object(body, error_code) -> None:
+    assert cloud_storage._oauth_error_code(body) == error_code
+
+
 # (answers, reason, last status, last error code, token endpoint calls)
 _REFRESH_SEQUENCES = [
     pytest.param(
