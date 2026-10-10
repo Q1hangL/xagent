@@ -102,8 +102,11 @@ class GoogleDriveCredentialError(HTTPException):
 
     ``status_code`` and ``detail`` are exactly what the ``/api/cloud`` routes
     return. ``reason`` is a stable, machine-readable classification for
-    in-process callers, and ``oauth_account_id`` names the stored credential
-    row the failure concerns, when there is one. Neither is sent to clients.
+    in-process callers. ``oauth_account_id`` names the stored credential row
+    the failure concerns: it is set on every failure raised after a row was
+    read, except a scope error for the user's own connection (see
+    ``issue_google_drive_picker_config``), and ``None`` when no row was read.
+    Neither is sent to clients.
     """
 
     def __init__(
@@ -297,13 +300,14 @@ def get_google_credentials(
     owner_key = normalize_user_oauth_resource_owner_key(resource_owner_key)
     _require_min_ttl(min_ttl)
     if owner_key is not None:
-        return _resource_owner_google_credentials(
+        creds, _oauth_account_id = _resource_owner_google_credentials(
             user_id,
             db,
             account_id,
             resource_owner_key=owner_key,
             min_ttl=min_ttl,
         )
+        return creds
     return _own_google_credentials(user_id, db, account_id, min_ttl=min_ttl)
 
 
@@ -349,9 +353,10 @@ def _resource_owner_google_credentials(
     resource_owner_key: str,
     min_ttl: timedelta,
     oauth_client: tuple[str, str] | None = None,
-) -> Any:
+) -> tuple[Any, int | None]:
     """Read the credential stored for ``resource_owner_key`` (a delegated one).
 
+    Returns the credentials and the id of the row they were read from.
     ``oauth_client`` is the client from ``_resolve_google_oauth_client_per_field``
     when the caller has already resolved it.
     """
@@ -378,7 +383,7 @@ def _resource_owner_google_credentials(
         oauth_account, *oauth_client, oauth_account_id=oauth_account_id
     )
     if not _google_token_needs_refresh(creds, min_ttl):
-        return creds
+        return creds, oauth_account_id
 
     # A refresh is due. Serialize it with every other refresher of this
     # credential, the connector runtime's included: Google may rotate the
@@ -426,7 +431,7 @@ def _resource_owner_google_credentials(
                 oauth_account_id=oauth_account_id,
                 timeout=_RESOURCE_OWNER_REFRESH_TIMEOUT,
             )
-            return creds
+            return creds, oauth_account_id
     except Exception:
         if db.in_transaction():
             _rollback_quietly(db)
@@ -434,7 +439,7 @@ def _resource_owner_google_credentials(
     # Another refresher already stored a token that is fresh enough. Nothing
     # was changed here; end the transaction to release the lock.
     _rollback_quietly(db)
-    return creds
+    return creds, oauth_account_id
 
 
 def _lock_resource_owner_google_drive_row(
@@ -746,11 +751,15 @@ def issue_google_drive_picker_config(
             detail=_PICKER_NOT_CONFIGURED_DETAIL,
             reason="picker_not_configured",
         )
+    oauth_account_id: int | None
     if owner_key is None:
-        # The website route: the same call it has always made.
+        # The website route: the same call it has always made. That call
+        # returns only the credentials, so a scope error below cannot name
+        # the row; the route never reads it.
         creds = get_google_credentials(user_id, db, account_id, min_ttl=min_ttl)
+        oauth_account_id = None
     else:
-        creds = _resource_owner_google_credentials(
+        creds, oauth_account_id = _resource_owner_google_credentials(
             user_id,
             db,
             account_id,
@@ -773,6 +782,7 @@ def issue_google_drive_picker_config(
             status_code=409,
             detail=_PICKER_SCOPE_DETAIL,
             reason=_PICKER_SCOPE_REASONS[scope_state],
+            oauth_account_id=oauth_account_id,
         )
 
     return {

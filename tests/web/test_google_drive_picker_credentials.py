@@ -1539,7 +1539,7 @@ def test_issue_picker_config_unconfigured_is_503_before_credentials(
 def test_issue_picker_config_rejects_scopes(
     store, picker_key, scope, minimal, reason
 ) -> None:
-    store.add_drive(owner=OWNER, token="owned", scope=scope)
+    row_id = store.add_drive(owner=OWNER, token="owned", scope=scope)
 
     with pytest.raises(GoogleDriveCredentialError) as exc_info:
         issue_google_drive_picker_config(
@@ -1551,6 +1551,35 @@ def test_issue_picker_config_rejects_scopes(
 
     assert (exc_info.value.status_code, exc_info.value.detail) == (409, SCOPE_DETAIL)
     assert exc_info.value.reason == reason
+    assert exc_info.value.oauth_account_id == row_id
+
+
+def test_issue_picker_config_names_the_refreshed_row_on_a_scope_error(
+    store, picker_key
+) -> None:
+    store.add_drive(
+        owner=OWNER,
+        token="older",
+        provider_user_id="first",
+        scope=f"{USERINFO} {DRIVE}",
+    )
+    row_id = store.add_drive(
+        owner=OWNER,
+        token="old",
+        provider_user_id="second",
+        scope=f"{USERINFO} {DRIVE}",
+        expires_at=_future(-5),
+    )
+    patcher, calls = _refreshing()
+
+    with patcher, pytest.raises(GoogleDriveCredentialError) as exc_info:
+        issue_google_drive_picker_config(
+            store.db, user_id=store.user_id, resource_owner_key=OWNER
+        )
+
+    assert calls == ["old"]
+    assert exc_info.value.reason == "scope_full_drive"
+    assert exc_info.value.oauth_account_id == row_id
 
 
 def test_issue_picker_config_allows_extra_scopes_unless_minimal(
