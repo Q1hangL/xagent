@@ -7,6 +7,9 @@ routes' status codes and details must stay exactly as they are.
 
 import json
 import logging
+import threading
+import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, get_args
@@ -15,7 +18,6 @@ from unittest.mock import patch
 import pytest
 import requests
 from fastapi import HTTPException, Response
-from google.auth import _exponential_backoff
 from google.auth.exceptions import RefreshError, TransportError
 from google.auth.transport import requests as google_auth_requests
 from google.oauth2.credentials import Credentials
@@ -506,70 +508,21 @@ _INVALID_GRANT_PAYLOAD = {
 
 @pytest.mark.parametrize("owner", [None, OWNER])
 @pytest.mark.parametrize(
-    ("error", "reason"),
+    "error",
     [
-        (TransportError("connection reset"), "refresh_unavailable"),
-        (
-            RefreshError("temporarily_unavailable", retryable=True),
-            "refresh_unavailable",
+        TransportError("connection reset"),
+        RefreshError("temporarily_unavailable", retryable=True),
+        # The token endpoint never answered, so the payload is not trusted.
+        RefreshError(
+            "invalid_grant: Token has been expired or revoked.",
+            _INVALID_GRANT_PAYLOAD,
         ),
-        (
-            RefreshError(
-                "invalid_grant: Token has been expired or revoked.",
-                _INVALID_GRANT_PAYLOAD,
-            ),
-            "reauth_required",
-        ),
-        (
-            # Older google-auth releases pass the raw response body.
-            RefreshError(
-                "invalid_grant: Token has been expired or revoked.",
-                json.dumps(_INVALID_GRANT_PAYLOAD),
-            ),
-            "reauth_required",
-        ),
-        (
-            # Without a payload the response body was not JSON.
-            RefreshError("invalid_grant: Token has been expired or revoked."),
-            "refresh_unavailable",
-        ),
-        (
-            RefreshError(
-                "invalid_grant: Token has been expired or revoked.",
-                _INVALID_GRANT_PAYLOAD,
-                retryable=True,
-            ),
-            "refresh_unavailable",
-        ),
-        (
-            RefreshError(
-                "invalid_client: Unauthorized",
-                {"error": "invalid_client", "error_description": "Unauthorized"},
-            ),
-            "refresh_unavailable",
-        ),
-        (
-            RefreshError(
-                '{"error": {"code": 400}}', {"error": {"code": 400}}, retryable=False
-            ),
-            "refresh_unavailable",
-        ),
-        (RuntimeError("unexpected"), "refresh_unavailable"),
+        RuntimeError("unexpected"),
     ],
-    ids=[
-        "transport",
-        "retryable",
-        "invalid-grant",
-        "invalid-grant-raw-body",
-        "invalid-grant-text-only",
-        "invalid-grant-retryable",
-        "invalid-client",
-        "structured-error",
-        "unexpected",
-    ],
+    ids=["transport", "retryable", "invalid-grant-without-an-answer", "unexpected"],
 )
-def test_refresh_failures_are_classified_without_clearing_tokens(
-    store, owner, error, reason
+def test_refresh_failures_without_an_answer_are_unavailable(
+    store, owner, error
 ) -> None:
     expires_at = _future(-5)
     row_id = store.add_drive(owner=owner, token="old", expires_at=expires_at)
@@ -584,7 +537,7 @@ def test_refresh_failures_are_classified_without_clearing_tokens(
         401,
         RECONNECT_DETAIL,
     )
-    assert exc_info.value.reason == reason
+    assert exc_info.value.reason == "refresh_unavailable"
     assert exc_info.value.oauth_account_id == row_id
     assert store.stored(row_id) == before
 
@@ -654,158 +607,174 @@ def test_row_replaced_during_refresh_is_retryable(store) -> None:
 # under its ``requests`` transport is replaced.
 
 
-class _TokenEndpoint:
-    """Stands in for ``requests.Session.request`` during a token refresh."""
+@dataclass(frozen=True)
+class _Answer:
+    status: int = 200
+    body: str = ""
+    content_type: str = "application/json"
+    error: Exception | None = None
 
-    def __init__(
-        self,
-        status: int = 200,
-        body: str = "",
-        *,
-        content_type: str = "application/json",
-        error: Exception | None = None,
-    ) -> None:
-        self.status = status
-        self.body = body
-        self.content_type = content_type
-        self.error = error
+
+def _json_answer(status: int, payload: dict[str, Any]) -> _Answer:
+    return _Answer(status, json.dumps(payload))
+
+
+def _page(status: int, html: str) -> _Answer:
+    return _Answer(status, html, content_type="text/html")
+
+
+def _no_answer(error: Exception) -> _Answer:
+    return _Answer(error=error)
+
+
+class _TokenEndpoint:
+    """Stands in for ``requests.Session.request`` during a token refresh.
+
+    It gives its answers in order and then keeps repeating the last one.
+    """
+
+    def __init__(self, *answers: _Answer) -> None:
+        self.answers = answers or (_Answer(),)
         self.calls: list[dict[str, Any]] = []
 
     def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        answer = self.answers[min(len(self.calls), len(self.answers) - 1)]
         self.calls.append(
             {"method": method, "url": url, "timeout": kwargs.get("timeout")}
         )
-        if self.error is not None:
-            raise self.error
+        if answer.error is not None:
+            raise answer.error
         response = requests.Response()
-        response.status_code = self.status
-        response._content = self.body.encode()
-        response.headers["Content-Type"] = self.content_type
+        response.status_code = answer.status
+        response._content = answer.body.encode()
+        response.headers["Content-Type"] = answer.content_type
         response.url = url
         return response
 
 
 @pytest.fixture
 def backoff_sleeps(monkeypatch) -> list[float]:
+    """Record google-auth's backoff between attempts instead of sleeping.
+
+    google-auth waits with ``time.sleep``; only this thread's waits are
+    recorded and skipped.
+    """
     sleeps: list[float] = []
-    monkeypatch.setattr(
-        _exponential_backoff, "time", SimpleNamespace(sleep=sleeps.append)
-    )
+    real_sleep = time.sleep
+    test_thread = threading.get_ident()
+
+    def _sleep(seconds: float) -> None:
+        if threading.get_ident() == test_thread:
+            sleeps.append(seconds)
+        else:
+            real_sleep(seconds)
+
+    monkeypatch.setattr(time, "sleep", _sleep)
     return sleeps
 
 
 _GATEWAY_HTML = "<html><body><h1>502 Bad Gateway</h1></body></html>"
 _UNAVAILABLE_HTML = "<html><body><h1>503 Service Unavailable</h1></body></html>"
+_BACKEND_ERROR = {"error": "backend_error", "error_description": "Unavailable"}
+_FRESH_TOKEN = {"access_token": "fresh", "expires_in": 3600, "token_type": "Bearer"}
 
 
-def _json(payload: dict[str, Any]) -> str:
-    return json.dumps(payload)
-
-
-# (endpoint factory, reason, token endpoint calls). google-auth retries only
-# the answers it considers retryable, up to three attempts.
+# (answer, reason, token endpoint calls). google-auth retries only the
+# answers it considers retryable, up to three attempts.
 _REFRESH_RESPONSES = [
+    pytest.param(_page(502, _GATEWAY_HTML), "refresh_unavailable", 1, id="502-html"),
     pytest.param(
-        lambda: _TokenEndpoint(502, _GATEWAY_HTML, content_type="text/html"),
-        "refresh_unavailable",
-        1,
-        id="502-html",
-    ),
-    pytest.param(
-        lambda: _TokenEndpoint(
-            502, _json({"error": "bad_gateway", "error_description": "Bad Gateway"})
-        ),
+        _json_answer(502, {"error": "bad_gateway", "error_description": "Bad Gateway"}),
         "refresh_unavailable",
         1,
         id="502-json",
     ),
     pytest.param(
-        lambda: _TokenEndpoint(502, _json(_INVALID_GRANT_PAYLOAD)),
+        _json_answer(502, _INVALID_GRANT_PAYLOAD),
         "refresh_unavailable",
         1,
         id="502-json-invalid-grant",
     ),
     pytest.param(
-        lambda: _TokenEndpoint(503, _UNAVAILABLE_HTML, content_type="text/html"),
+        _page(503, _UNAVAILABLE_HTML),
         "refresh_unavailable",
         3,
         id="503-html-after-retries",
     ),
     pytest.param(
-        lambda: _TokenEndpoint(
-            503, _json({"error": "backend_error", "error_description": "Unavailable"})
-        ),
+        _json_answer(503, _BACKEND_ERROR),
         "refresh_unavailable",
         3,
         id="503-json-after-retries",
     ),
     pytest.param(
-        lambda: _TokenEndpoint(
-            400, "<html>Bad Request</html>", content_type="text/html"
-        ),
+        _json_answer(503, _INVALID_GRANT_PAYLOAD),
+        "refresh_unavailable",
+        3,
+        id="503-json-invalid-grant-after-retries",
+    ),
+    pytest.param(
+        _page(400, "<html>Bad Request</html>"),
         "refresh_unavailable",
         1,
         id="400-html",
     ),
     pytest.param(
-        lambda: _TokenEndpoint(400, _json(_INVALID_GRANT_PAYLOAD)),
+        _json_answer(400, _INVALID_GRANT_PAYLOAD),
         "reauth_required",
         1,
         id="400-invalid-grant",
     ),
     pytest.param(
-        lambda: _TokenEndpoint(
+        # google-auth turns this answer into a "Reauthentication is needed."
+        # error without the payload; the recorded answer still says
+        # invalid_grant.
+        _json_answer(
             400,
-            _json(
-                {
-                    "error": "invalid_grant",
-                    "error_subtype": "invalid_rapt",
-                    "error_description": "reauth related error (invalid_rapt)",
-                }
-            ),
+            {
+                "error": "invalid_grant",
+                "error_subtype": "invalid_rapt",
+                "error_description": "reauth related error (invalid_rapt)",
+            },
         ),
         "reauth_required",
         1,
         id="400-invalid-grant-reauth-subtype",
     ),
     pytest.param(
-        lambda: _TokenEndpoint(
+        _json_answer(
             401,
-            _json(
-                {
-                    "error": "invalid_client",
-                    "error_description": "The OAuth client was not found.",
-                }
-            ),
+            {
+                "error": "invalid_client",
+                "error_description": "The OAuth client was not found.",
+            },
         ),
         "refresh_unavailable",
         1,
         id="401-invalid-client",
     ),
     pytest.param(
-        lambda: _TokenEndpoint(
-            400,
-            _json(
-                {"error": "unauthorized_client", "error_description": "Unauthorized"}
-            ),
+        _json_answer(
+            400, {"error": "unauthorized_client", "error_description": "Unauthorized"}
         ),
         "refresh_unavailable",
         1,
         id="400-unauthorized-client",
     ),
     pytest.param(
-        lambda: _TokenEndpoint(
-            400,
-            _json({"error": "invalid_scope", "error_description": "Bad Request"}),
-        ),
+        _json_answer(400, {"error": "invalid_scope", "error_description": "Bad"}),
         "refresh_unavailable",
         1,
         id="400-invalid-scope",
     ),
     pytest.param(
-        lambda: _TokenEndpoint(
-            error=requests.exceptions.ReadTimeout("Read timed out.")
-        ),
+        _json_answer(400, {"error": {"code": 400, "message": "Bad Request"}}),
+        "refresh_unavailable",
+        1,
+        id="400-structured-error",
+    ),
+    pytest.param(
+        _no_answer(requests.exceptions.ReadTimeout("Read timed out.")),
         "refresh_unavailable",
         1,
         id="transport-timeout",
@@ -814,11 +783,11 @@ _REFRESH_RESPONSES = [
 
 
 @pytest.mark.parametrize("owner", [None, OWNER])
-@pytest.mark.parametrize(("make_endpoint", "reason", "attempts"), _REFRESH_RESPONSES)
+@pytest.mark.parametrize(("answer", "reason", "attempts"), _REFRESH_RESPONSES)
 def test_token_endpoint_answers_are_classified(
-    store, backoff_sleeps, owner, make_endpoint, reason, attempts
+    store, backoff_sleeps, owner, answer, reason, attempts
 ) -> None:
-    endpoint = make_endpoint()
+    endpoint = _TokenEndpoint(answer)
     row_id = store.add_drive(owner=owner, token="old", expires_at=_future(-5))
     before = store.snapshot(row_id)
 
@@ -843,11 +812,107 @@ def test_token_endpoint_answers_are_classified(
     assert store.snapshot(row_id) == before
 
 
+# (answers, reason, last status, last error code, token endpoint calls)
+_REFRESH_SEQUENCES = [
+    pytest.param(
+        (_page(503, _UNAVAILABLE_HTML), _json_answer(400, _INVALID_GRANT_PAYLOAD)),
+        "reauth_required",
+        400,
+        "invalid_grant",
+        2,
+        id="503-then-400-invalid-grant",
+    ),
+    pytest.param(
+        (
+            _json_answer(503, _BACKEND_ERROR),
+            _json_answer(503, _BACKEND_ERROR),
+            _json_answer(400, _INVALID_GRANT_PAYLOAD),
+        ),
+        "reauth_required",
+        400,
+        "invalid_grant",
+        3,
+        id="503-503-then-400-invalid-grant",
+    ),
+    pytest.param(
+        (_json_answer(503, _INVALID_GRANT_PAYLOAD), _page(502, _GATEWAY_HTML)),
+        "refresh_unavailable",
+        502,
+        None,
+        2,
+        id="503-invalid-grant-then-502-html",
+    ),
+    pytest.param(
+        (
+            _page(503, _UNAVAILABLE_HTML),
+            _no_answer(requests.exceptions.ReadTimeout("Read timed out.")),
+        ),
+        "refresh_unavailable",
+        None,
+        None,
+        2,
+        id="503-then-timeout",
+    ),
+    pytest.param(
+        # invalid_grant is final: google-auth never asks again.
+        (_json_answer(400, _INVALID_GRANT_PAYLOAD), _json_answer(200, _FRESH_TOKEN)),
+        "reauth_required",
+        400,
+        "invalid_grant",
+        1,
+        id="400-invalid-grant-is-not-retried",
+    ),
+]
+
+
+@pytest.mark.parametrize("owner", [None, OWNER])
+@pytest.mark.parametrize(
+    ("answers", "reason", "last_status", "error_code", "attempts"),
+    _REFRESH_SEQUENCES,
+)
+def test_the_last_token_endpoint_answer_decides(
+    store,
+    backoff_sleeps,
+    caplog,
+    owner,
+    answers,
+    reason,
+    last_status,
+    error_code,
+    attempts,
+) -> None:
+    endpoint = _TokenEndpoint(*answers)
+    row_id = store.add_drive(owner=owner, token="old", expires_at=_future(-5))
+    before = store.snapshot(row_id)
+
+    with (
+        caplog.at_level(logging.ERROR, logger="xagent.web.api.cloud_storage"),
+        patch.object(requests.Session, "request", endpoint.request),
+        pytest.raises(GoogleDriveCredentialError) as exc_info,
+    ):
+        get_google_credentials(store.user_id, store.db, resource_owner_key=owner)
+
+    assert (exc_info.value.status_code, exc_info.value.detail) == (
+        401,
+        RECONNECT_DETAIL,
+    )
+    assert exc_info.value.reason == reason
+    assert len(endpoint.calls) == attempts
+    assert len(backoff_sleeps) == attempts - 1
+    [message] = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "xagent.web.api.cloud_storage"
+    ]
+    assert f"token endpoint status {last_status}, error {error_code}," in message
+    assert store.snapshot(row_id) == before
+
+
 def test_refresh_failure_log_has_no_secrets_or_response_body(
     store, backoff_sleeps, caplog
 ) -> None:
     row_id = store.add_drive(owner=OWNER, token="old-access", expires_at=_future(-5))
-    endpoint = _TokenEndpoint(502, _GATEWAY_HTML, content_type="text/html")
+    endpoint = _TokenEndpoint(_page(502, _GATEWAY_HTML))
 
     with (
         caplog.at_level(logging.ERROR, logger="xagent.web.api.cloud_storage"),
@@ -866,17 +931,14 @@ def test_refresh_failure_log_has_no_secrets_or_response_body(
     assert store.snapshot(row_id)[0] == "old-access"
 
 
-def test_refresh_timeout_is_bounded_only_for_a_resource_owner(store) -> None:
+def test_refresh_timeout_is_set_only_for_a_resource_owner(store) -> None:
     owned_id = store.add_drive(
         owner=OWNER, token="old", provider_user_id="owned", expires_at=_future(-5)
     )
     ordinary_id = store.add_drive(
         owner=None, token="old", provider_user_id="ordinary", expires_at=_future(-5)
     )
-    endpoint = _TokenEndpoint(
-        200,
-        _json({"access_token": "fresh", "expires_in": 3600, "token_type": "Bearer"}),
-    )
+    endpoint = _TokenEndpoint(_json_answer(200, _FRESH_TOKEN))
 
     with patch.object(requests.Session, "request", endpoint.request):
         owned = get_google_credentials(
@@ -886,18 +948,23 @@ def test_refresh_timeout_is_bounded_only_for_a_resource_owner(store) -> None:
         endpoint.calls.clear()
         ordinary = get_google_credentials(store.user_id, store.db)
         website_timeouts = [call["timeout"] for call in endpoint.calls]
+        endpoint.calls.clear()
+        # What google-auth's own transport sends when nothing sets a timeout.
+        google_auth_requests.Request()(GOOGLE_TOKEN_URI, method="POST")
+        default_timeouts = [call["timeout"] for call in endpoint.calls]
 
-    # Same bound as the connector runtime's own refresh.
+    # The same timeout as the connector runtime's own refresh.
     assert owner_timeouts == [10.0]
-    # The website branch keeps google-auth's default transport timeout.
-    assert website_timeouts == [google_auth_requests._DEFAULT_TIMEOUT]
+    # The website branch keeps google-auth's default.
+    assert website_timeouts == default_timeouts
+    assert default_timeouts != [10.0]
     assert (owned.token, ordinary.token) == ("fresh", "fresh")
     assert store.stored(owned_id)[0] == "fresh"
     assert store.stored(ordinary_id)[0] == "fresh"
 
 
-def test_token_request_bound_replaces_any_requested_timeout() -> None:
-    endpoint = _TokenEndpoint(200, _json({"access_token": "fresh"}))
+def test_token_request_timeout_replaces_any_requested_timeout() -> None:
+    endpoint = _TokenEndpoint(_json_answer(200, {"access_token": "fresh"}))
 
     with patch.object(requests.Session, "request", endpoint.request):
         _GoogleTokenRequest()(GOOGLE_TOKEN_URI, method="POST", timeout=3)
@@ -907,11 +974,29 @@ def test_token_request_bound_replaces_any_requested_timeout() -> None:
     assert [call["timeout"] for call in endpoint.calls] == [3, 10.0, 10.0]
 
 
+def test_token_request_records_only_the_last_answer() -> None:
+    endpoint = _TokenEndpoint(
+        _json_answer(503, _BACKEND_ERROR),
+        _no_answer(requests.exceptions.ConnectionError("connection reset")),
+    )
+    request = _GoogleTokenRequest()
+
+    with patch.object(requests.Session, "request", endpoint.request):
+        request(GOOGLE_TOKEN_URI, method="POST")
+        assert request.last_status == 503
+        assert request.last_body is not None
+        assert json.loads(request.last_body) == _BACKEND_ERROR
+        with pytest.raises(TransportError):
+            request(GOOGLE_TOKEN_URI, method="POST")
+
+    assert (request.last_status, request.last_body) == (None, None)
+
+
 def test_owner_refresh_timeout_is_classified_as_unavailable(store) -> None:
     row_id = store.add_drive(owner=OWNER, token="old", expires_at=_future(-5))
     before = store.snapshot(row_id)
     endpoint = _TokenEndpoint(
-        error=requests.exceptions.ConnectTimeout("Connection timed out.")
+        _no_answer(requests.exceptions.ConnectTimeout("Connection timed out."))
     )
 
     with (

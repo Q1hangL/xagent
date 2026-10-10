@@ -3,7 +3,6 @@
 import json
 import logging
 import os
-from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, Optional, cast
 
@@ -37,19 +36,18 @@ cloud_router = APIRouter(prefix="/api/cloud", tags=["Cloud Storage"])
 # Google OAuth Constants
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
 GOOGLE_TOKEN_REFRESH_SKEW = timedelta(minutes=5)
-# Upper bound, in seconds, for each HTTP call (connect and read) of a token
-# refresh for a resource owner's connection. The connector runtime refreshes
-# the same credentials with this bound (``tools/config.py``); the default
-# google-auth transport would wait up to two minutes.
+# A token refresh for a resource owner's connection sets a 10-second connect
+# and per-read timeout on each request; google-auth's retries can make the
+# whole refresh longer. The connector runtime sets the same timeout when it
+# refreshes these credentials (``tools/config.py``); google-auth's own
+# default is two minutes.
 _RESOURCE_OWNER_REFRESH_TIMEOUT = 10.0
 # ``UserOAuth.provider`` of a Google Drive connection (its connector app id).
 _GOOGLE_DRIVE_PROVIDER = "google-drive"
 # The OAuth error code for a refresh token that was revoked or has expired.
+# Google also answers ``invalid_grant`` (with an ``error_subtype`` such as
+# ``invalid_rapt``) when the user must reauthenticate.
 _GOOGLE_INVALID_GRANT = "invalid_grant"
-# google-auth replaces an ``invalid_grant`` answer whose ``error_subtype``
-# asks for reauthentication (``invalid_rapt``, ``rapt_required``) with an
-# error that starts with this message and carries no response payload.
-_GOOGLE_AUTH_REAUTH_NEEDED_MESSAGE = "Reauthentication is needed."
 
 # Response details shared by several failure reasons. They are part of the
 # public API contract of the routes below and must not change.
@@ -377,16 +375,19 @@ def _resource_owner_google_credentials(
 class _GoogleTokenRequest(Request):
     """google-auth HTTP transport for one token refresh.
 
-    It remembers the status of the last token endpoint response, so a failed
-    refresh can be classified by it. With ``timeout`` every HTTP call is
-    bounded to that many seconds (connect and read); without it the
-    google-auth default applies.
+    It records the status and body of the token endpoint's last response, so
+    a failed refresh is classified by what Google answered rather than by how
+    google-auth words its exception. Both are ``None`` when the last request
+    got no response. With ``timeout``, each request gets that many seconds to
+    connect and for each read (retries can make the whole refresh longer);
+    without it google-auth's default applies.
     """
 
     def __init__(self, *, timeout: float | None = None) -> None:
         super().__init__()
         self._timeout = timeout
         self.last_status: int | None = None
+        self.last_body: bytes | None = None
 
     def __call__(
         self,
@@ -398,58 +399,61 @@ class _GoogleTokenRequest(Request):
     ) -> Any:
         if self._timeout is not None:
             kwargs["timeout"] = self._timeout
+        self.last_status = None
+        self.last_body = None
         response = super().__call__(
             url, method=method, body=body, headers=headers, **kwargs
         )
         self.last_status = response.status
+        self.last_body = response.data
         return response
 
 
-def _google_refresh_error_code(exc: Exception) -> str | None:
-    """Return the OAuth ``error`` code of the response behind ``exc``.
+def _oauth_error_code(body: bytes | None) -> str | None:
+    """Return the OAuth ``error`` code of a token endpoint response body.
 
-    google-auth passes the decoded JSON response as the second argument of
-    ``RefreshError`` (older releases pass the raw body, which is parsed
-    here). A body that is not a JSON object has no error code.
+    Only a body that is a JSON object has one; a gateway's HTML page or any
+    other body has none.
     """
-    if not isinstance(exc, RefreshError):
+    if not body:
         return None
-    payload: Any = exc.args[1] if len(exc.args) > 1 else None
-    if isinstance(payload, (str, bytes)):
-        try:
-            payload = json.loads(payload)
-        except ValueError:
-            payload = None
-    if isinstance(payload, Mapping):
-        error = payload.get("error")
-        return error if isinstance(error, str) else None
-    message = exc.args[0] if exc.args else None
-    if isinstance(message, str) and message.startswith(
-        _GOOGLE_AUTH_REAUTH_NEEDED_MESSAGE
-    ):
-        return _GOOGLE_INVALID_GRANT
-    return None
+    try:
+        payload = json.loads(body)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    return error if isinstance(error, str) else None
 
 
 def _google_refresh_failure_reason(
-    exc: Exception, *, status: int | None = None
+    exc: Exception, *, status: int | None, error_code: str | None
 ) -> GoogleDriveCredentialReason:
     """Classify a failed google-auth refresh.
 
-    ``status`` is the HTTP status of the last token endpoint response, when
-    there was one. Only an ``invalid_grant`` answer means the grant was
-    revoked or expired, so the user has to authorize again. Everything else
-    is ``refresh_unavailable``: transport errors (including timeouts), a
-    retryable or 5xx answer, a body that is not an OAuth error (for example
-    a gateway's HTML page), other OAuth error codes such as
-    ``invalid_client`` or ``unauthorized_client`` that a new authorization
-    by the user cannot fix, and unexpected exceptions.
+    ``status`` and ``error_code`` describe the token endpoint's last answer
+    (both ``None`` when the last request got none). Only an ``invalid_grant``
+    answer means the user has to authorize again. Everything else is
+    ``refresh_unavailable``: transport errors (including timeouts), a
+    retryable or 5xx answer, a body that is not an OAuth error (for example a
+    gateway's HTML page), other OAuth error codes such as ``invalid_client``
+    or ``unauthorized_client`` that a new authorization by the user cannot
+    fix, and unexpected exceptions.
     """
     if not isinstance(exc, RefreshError):
         return "refresh_unavailable"
-    if exc.retryable or (status is not None and status >= 500):
+    if exc.retryable or status is None or status >= 500:
         return "refresh_unavailable"
-    if _google_refresh_error_code(exc) == _GOOGLE_INVALID_GRANT:
+    if error_code == _GOOGLE_INVALID_GRANT:
+        # The connector runtime does not treat invalid_grant as a dead
+        # refresh token (``_PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES`` in
+        # ``tools/config.py``): it also covers a token issued to another
+        # client, for example after an admin rotates the OAuth client, and
+        # the runtime clears credentials it believes dead. Nothing is ever
+        # cleared on this path; the reason only selects the message a caller
+        # shows (reconnect), and the stored credential stays for the
+        # runtime's own refresh to judge.
         return "reauth_required"
     return "refresh_unavailable"
 
@@ -471,8 +475,9 @@ def _refresh_google_credentials(
 ) -> None:
     """Refresh ``creds`` and persist the new token on ``oauth_account``.
 
-    ``timeout`` bounds each HTTP call of the refresh, in seconds; ``None``
-    keeps the google-auth default. A failure raises
+    ``timeout`` is the connect and per-read timeout, in seconds, set on each
+    request of the refresh (retries can make the whole refresh longer);
+    ``None`` keeps google-auth's default. A failure raises
     ``GoogleDriveCredentialError`` and leaves the stored credential as it
     was; without a refresh token the user has to authorize again.
     """
@@ -487,16 +492,19 @@ def _refresh_google_credentials(
     try:
         creds.refresh(request)
     except Exception as exc:
-        reason = _google_refresh_failure_reason(exc, status=request.last_status)
-        # Only the classification inputs are logged: the exception text can
-        # carry a whole gateway page.
+        error_code = _oauth_error_code(request.last_body)
+        reason = _google_refresh_failure_reason(
+            exc, status=request.last_status, error_code=error_code
+        )
+        # Only the classification inputs are logged: the exception text and
+        # the response body can carry a whole gateway page.
         logger.error(
             "Failed to refresh Google token (%s): %s, token endpoint status %s, "
             "error %s, retryable %s",
             reason,
             _exception_label(exc),
             request.last_status,
-            _google_refresh_error_code(exc),
+            error_code,
             getattr(exc, "retryable", None),
         )
         raise GoogleDriveCredentialError(
