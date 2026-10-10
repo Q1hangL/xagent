@@ -399,16 +399,18 @@ def test_owner_branch_resolves_the_oauth_client_per_field(store, monkeypatch) ->
     store.add_drive(owner=OWNER, token="owned", provider_user_id="owned")
 
     with patch.object(
-        auth_api, "_resolve_oauth_secret", wraps=auth_api._resolve_oauth_secret
+        auth_api,
+        "_resolve_oauth_client_per_field",
+        wraps=auth_api._resolve_oauth_client_per_field,
     ) as resolver:
         owned = get_google_credentials(
             store.user_id, store.db, resource_owner_key=OWNER
         )
     ordinary = get_google_credentials(store.user_id, store.db)
 
-    # Per field, as the connector runtime refreshes the same credential.
+    # Per field, with the helper the connector runtime refreshes it with.
     assert (owned.client_id, owned.client_secret) == (DB_CLIENT_ID, "env-secret")
-    assert [call.args[0] for call in resolver.call_args_list] == ["google", "google"]
+    assert [call.args[0] for call in resolver.call_args_list] == ["google"]
     # The ordinary branch keeps replacing the incomplete pair as a whole.
     assert (ordinary.client_id, ordinary.client_secret) == (
         ENV_CLIENT_ID,
@@ -963,6 +965,27 @@ def test_issue_picker_config_derives_app_id_from_the_per_field_client(
     assert result["app_id"] == "999999999999"
 
 
+def test_issue_picker_config_resolves_the_owner_client_once(store, picker_key) -> None:
+    store.add_drive(owner=OWNER, token="old", expires_at=_future(-5))
+    patcher, calls = _refreshing()
+
+    with (
+        patcher,
+        patch.object(
+            auth_api,
+            "_resolve_oauth_client_per_field",
+            wraps=auth_api._resolve_oauth_client_per_field,
+        ) as resolver,
+    ):
+        result = issue_google_drive_picker_config(
+            store.db, user_id=store.user_id, resource_owner_key=OWNER
+        )
+
+    assert calls == ["old"]
+    assert result["access_token"] == "refreshed-token"
+    assert [call.args[0] for call in resolver.call_args_list] == ["google"]
+
+
 def test_issue_picker_config_passes_min_ttl(store, picker_key) -> None:
     store.add_drive(owner=OWNER, token="ten-minutes", expires_at=_future(10))
     patcher, calls = _refreshing()
@@ -988,7 +1011,7 @@ def test_issue_picker_config_unconfigured_is_503_before_credentials(
 
     with (
         patch(
-            "xagent.web.api.cloud_storage.get_google_credentials",
+            "xagent.web.api.cloud_storage.scoped_user_oauth_query",
             side_effect=AssertionError("credentials must not be read"),
         ),
         pytest.raises(GoogleDriveCredentialError) as exc_info,

@@ -42,6 +42,8 @@ GOOGLE_TOKEN_REFRESH_SKEW = timedelta(minutes=5)
 # the same credentials with this bound (``tools/config.py``); the default
 # google-auth transport would wait up to two minutes.
 _RESOURCE_OWNER_REFRESH_TIMEOUT = 10.0
+# ``UserOAuth.provider`` of a Google Drive connection (its connector app id).
+_GOOGLE_DRIVE_PROVIDER = "google-drive"
 # The OAuth error code for a refresh token that was revoked or has expired.
 _GOOGLE_INVALID_GRANT = "invalid_grant"
 # google-auth replaces an ``invalid_grant`` answer whose ``error_subtype``
@@ -166,28 +168,21 @@ def get_google_oauth_config(db: Session) -> tuple[Optional[str], Optional[str]]:
 
 
 def _resolve_google_oauth_client_per_field(db: Session) -> tuple[str, str]:
-    """Resolve the Google OAuth client the way connector refreshes do.
+    """Resolve the Google OAuth client the way the connector runtime does.
 
     Each field falls back to its ``GOOGLE_*`` environment variable on its own
-    when the provider row leaves it blank, and a missing provider row means
-    the client is not configured. This matches the connect flow that issues
-    credentials stored for a resource owner key and the connector runtime
-    that keeps refreshing them.
+    when the provider row leaves it blank, through the helper the runtime's
+    token refresh uses, and a missing provider row means the client is not
+    configured.
     """
-    from .auth import _resolve_oauth_secret
+    from .auth import _resolve_oauth_client_per_field
 
     provider = (
         db.query(OAuthProvider).filter(OAuthProvider.provider_name == "google").first()
     )
     if provider is None:
         return "", ""
-    client_id = _resolve_oauth_secret(
-        "google", cast(Optional[str], provider.client_id), "CLIENT_ID"
-    )
-    client_secret = _resolve_oauth_secret(
-        "google", cast(Optional[str], provider.client_secret), "CLIENT_SECRET"
-    )
-    return client_id, client_secret
+    return _resolve_oauth_client_per_field("google", provider)
 
 
 def _oauth_account_row_id(oauth_account: Any) -> int | None:
@@ -198,6 +193,77 @@ def _oauth_account_row_id(oauth_account: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _google_drive_query(
+    db: Session,
+    *,
+    user_id: int,
+    account_id: Optional[int],
+    resource_owner_key: str | None,
+) -> Any:
+    query = scoped_user_oauth_query(
+        db,
+        user_id=user_id,
+        resource_owner_key=resource_owner_key,
+    ).filter(UserOAuth.provider == _GOOGLE_DRIVE_PROVIDER)
+    if account_id is not None:
+        query = query.filter(UserOAuth.id == account_id)
+    return query
+
+
+def _require_usable_google_drive_row(
+    oauth_account: Any, *, account_id: Optional[int]
+) -> int | None:
+    """Return the id of a stored credential that has an access token, or raise."""
+    if not oauth_account:
+        if account_id is not None:
+            raise GoogleDriveCredentialError(
+                status_code=404,
+                detail=_DRIVE_ACCOUNT_NOT_FOUND_DETAIL,
+                reason="account_not_found",
+            )
+        raise GoogleDriveCredentialError(
+            status_code=401,
+            detail=_DRIVE_NOT_CONNECTED_DETAIL,
+            reason="account_not_connected",
+        )
+    oauth_account_id = _oauth_account_row_id(oauth_account)
+    if not oauth_account.access_token:
+        raise GoogleDriveCredentialError(
+            status_code=401,
+            detail=_DRIVE_RECONNECT_DETAIL,
+            reason="reauth_required",
+            oauth_account_id=oauth_account_id,
+        )
+    return oauth_account_id
+
+
+def _google_credentials_from_row(
+    oauth_account: Any,
+    client_id: Optional[str],
+    client_secret: Optional[str],
+    *,
+    oauth_account_id: int | None,
+) -> Any:
+    if not client_id or not client_secret:
+        raise GoogleDriveCredentialError(
+            status_code=500,
+            detail=_OAUTH_CONFIG_MISSING_DETAIL,
+            reason="oauth_unconfigured",
+            oauth_account_id=oauth_account_id,
+        )
+    return Credentials(
+        token=oauth_account.access_token,
+        refresh_token=oauth_account.refresh_token,
+        token_uri=GOOGLE_TOKEN_URI,
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=oauth_account.scope.split(" ") if oauth_account.scope else None,
+        expiry=_google_credentials_expiry(
+            cast("datetime | None", oauth_account.expires_at)
+        ),
+    )
 
 
 def get_google_credentials(
@@ -220,97 +286,91 @@ def get_google_credentials(
     The token is refreshed when it expires within ``min_ttl``. Failures raise
     ``GoogleDriveCredentialError``; stored credentials are never cleared here.
     """
-    query = scoped_user_oauth_query(
-        db,
-        user_id=user_id,
-        resource_owner_key=resource_owner_key,
-    ).filter(UserOAuth.provider == "google-drive")
-
-    if account_id is not None:
-        query = query.filter(UserOAuth.id == account_id)
-
     if resource_owner_key is not None:
-        # Delegated connections are replaced by delete-and-insert, so the
-        # newest row is the live one. ``populate_existing`` refreshes a row
-        # the caller's session may already hold from an earlier read.
-        oauth_account = query.order_by(UserOAuth.id.desc()).populate_existing().first()
-    else:
-        oauth_account = query.first()
-
-    if not oauth_account:
-        if account_id is not None:
-            raise GoogleDriveCredentialError(
-                status_code=404,
-                detail=_DRIVE_ACCOUNT_NOT_FOUND_DETAIL,
-                reason="account_not_found",
-            )
-        raise GoogleDriveCredentialError(
-            status_code=401,
-            detail=_DRIVE_NOT_CONNECTED_DETAIL,
-            reason="account_not_connected",
+        return _resource_owner_google_credentials(
+            user_id,
+            db,
+            account_id,
+            resource_owner_key=resource_owner_key,
+            min_ttl=min_ttl,
         )
-    oauth_account_id = _oauth_account_row_id(oauth_account)
-    if not oauth_account.access_token:
-        raise GoogleDriveCredentialError(
-            status_code=401,
-            detail=_DRIVE_RECONNECT_DETAIL,
-            reason="reauth_required",
-            oauth_account_id=oauth_account_id,
-        )
+    return _own_google_credentials(user_id, db, account_id, min_ttl=min_ttl)
 
-    client_id: Optional[str]
-    client_secret: Optional[str]
-    if resource_owner_key is not None:
-        client_id, client_secret = _resolve_google_oauth_client_per_field(db)
-    else:
-        client_id, client_secret = get_google_oauth_config(db)
-        if not client_id or not client_secret:
-            client_id = os.environ.get("GOOGLE_CLIENT_ID")
-            client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
 
+def _own_google_credentials(
+    user_id: int, db: Session, account_id: Optional[int], *, min_ttl: timedelta
+) -> Any:
+    """Read the user's own connection, as the ``/api/cloud`` routes always have."""
+    oauth_account = _google_drive_query(
+        db, user_id=user_id, account_id=account_id, resource_owner_key=None
+    ).first()
+    oauth_account_id = _require_usable_google_drive_row(
+        oauth_account, account_id=account_id
+    )
+
+    client_id, client_secret = get_google_oauth_config(db)
     if not client_id or not client_secret:
-        raise GoogleDriveCredentialError(
-            status_code=500,
-            detail=_OAUTH_CONFIG_MISSING_DETAIL,
-            reason="oauth_unconfigured",
-            oauth_account_id=oauth_account_id,
-        )
-
-    creds = Credentials(
-        token=oauth_account.access_token,
-        refresh_token=oauth_account.refresh_token,
-        token_uri=GOOGLE_TOKEN_URI,
-        client_id=client_id,
-        client_secret=client_secret,
-        scopes=oauth_account.scope.split(" ") if oauth_account.scope else None,
-        expiry=_google_credentials_expiry(
-            cast("datetime | None", oauth_account.expires_at)
-        ),
+        client_id = os.environ.get("GOOGLE_CLIENT_ID")
+        client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
+    creds = _google_credentials_from_row(
+        oauth_account, client_id, client_secret, oauth_account_id=oauth_account_id
     )
 
     # Refresh with a safety margin: the Picker request and user interaction
     # can consume several minutes, so returning a token that is technically
     # valid but close to expiry creates an avoidable mid-flow failure.
     if _google_token_needs_refresh(creds, min_ttl):
-        if not creds.refresh_token:
-            raise GoogleDriveCredentialError(
-                status_code=401,
-                detail=_DRIVE_RECONNECT_DETAIL,
-                reason="reauth_required",
-                oauth_account_id=oauth_account_id,
-            )
+        _refresh_google_credentials(
+            creds, oauth_account, db, oauth_account_id=oauth_account_id
+        )
+    return creds
+
+
+def _resource_owner_google_credentials(
+    user_id: int,
+    db: Session,
+    account_id: Optional[int],
+    *,
+    resource_owner_key: str,
+    min_ttl: timedelta,
+    oauth_client: tuple[str, str] | None = None,
+) -> Any:
+    """Read the credential stored for ``resource_owner_key`` (a delegated one).
+
+    ``oauth_client`` is the client from ``_resolve_google_oauth_client_per_field``
+    when the caller has already resolved it.
+    """
+    # Delegated connections are replaced by delete-and-insert, so the newest
+    # row is the live one. ``populate_existing`` refreshes a row the caller's
+    # session may already hold from an earlier read.
+    oauth_account = (
+        _google_drive_query(
+            db,
+            user_id=user_id,
+            account_id=account_id,
+            resource_owner_key=resource_owner_key,
+        )
+        .order_by(UserOAuth.id.desc())
+        .populate_existing()
+        .first()
+    )
+    oauth_account_id = _require_usable_google_drive_row(
+        oauth_account, account_id=account_id
+    )
+    if oauth_client is None:
+        oauth_client = _resolve_google_oauth_client_per_field(db)
+    creds = _google_credentials_from_row(
+        oauth_account, *oauth_client, oauth_account_id=oauth_account_id
+    )
+
+    if _google_token_needs_refresh(creds, min_ttl):
         _refresh_google_credentials(
             creds,
             oauth_account,
             db,
             oauth_account_id=oauth_account_id,
-            timeout=(
-                _RESOURCE_OWNER_REFRESH_TIMEOUT
-                if resource_owner_key is not None
-                else None
-            ),
+            timeout=_RESOURCE_OWNER_REFRESH_TIMEOUT,
         )
-
     return creds
 
 
@@ -414,8 +474,15 @@ def _refresh_google_credentials(
     ``timeout`` bounds each HTTP call of the refresh, in seconds; ``None``
     keeps the google-auth default. A failure raises
     ``GoogleDriveCredentialError`` and leaves the stored credential as it
-    was.
+    was; without a refresh token the user has to authorize again.
     """
+    if not creds.refresh_token:
+        raise GoogleDriveCredentialError(
+            status_code=401,
+            detail=_DRIVE_RECONNECT_DETAIL,
+            reason="reauth_required",
+            oauth_account_id=oauth_account_id,
+        )
     request = _GoogleTokenRequest(timeout=timeout)
     try:
         creds.refresh(request)
@@ -540,10 +607,13 @@ def issue_google_drive_picker_config(
     # deployment should consistently report 503 rather than leaking account
     # state through a 401/409 response.
     oauth_client_id: Optional[str]
+    owner_client: tuple[str, str] | None = None
     if resource_owner_key is None:
         oauth_client_id, _ = get_google_oauth_config(db)
     else:
-        oauth_client_id = _resolve_google_oauth_client_per_field(db)[0] or None
+        # Resolved once: the credential below is built with the same client.
+        owner_client = _resolve_google_oauth_client_per_field(db)
+        oauth_client_id = owner_client[0] or None
     picker_config = get_google_picker_config(db, oauth_client_id=oauth_client_id)
     if picker_config is None:
         raise GoogleDriveCredentialError(
@@ -554,13 +624,18 @@ def issue_google_drive_picker_config(
     # Logs a warning when an explicit app id points at another project.
     google_picker_app_id_matches_client(picker_config.app_id, oauth_client_id)
 
-    creds = get_google_credentials(
-        user_id,
-        db,
-        account_id,
-        resource_owner_key=resource_owner_key,
-        min_ttl=min_ttl,
-    )
+    if resource_owner_key is None:
+        # The website route: the same call it has always made.
+        creds = get_google_credentials(user_id, db, account_id, min_ttl=min_ttl)
+    else:
+        creds = _resource_owner_google_credentials(
+            user_id,
+            db,
+            account_id,
+            resource_owner_key=resource_owner_key,
+            min_ttl=min_ttl,
+            oauth_client=owner_client,
+        )
     scope_state = classify_google_drive_picker_scopes(
         creds.scopes, minimal=minimal_scopes
     )
