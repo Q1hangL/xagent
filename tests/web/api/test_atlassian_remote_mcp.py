@@ -301,3 +301,44 @@ def test_a_server_row_with_the_previous_catalog_auth_is_not_canonical(db_session
 
     with pytest.raises(RemoteOAuthServerDefinitionError, match="auth"):
         classify_actor_remote_oauth_server(db, server)
+
+
+@pytest.mark.asyncio
+async def test_connect_requests_the_subset_and_keeps_the_required_scope_on_the_row(
+    db_session, vendor_requests
+):
+    """The catalog's required_scope only narrows what a grant must include:
+    the authorization still requests the whole subset, registration carries no
+    scope, and the shared row keeps the catalog auth exactly, so the actor
+    projection still lists the app."""
+    db, user = db_session
+    app = _add_atlassian_catalog_row(db)
+    catalog_auth = app["launch_config"]["auth"]
+    assert catalog_auth["required_scope"] == (
+        "email offline_access read:account read:me"
+    )
+
+    response = await mcp_api.connect_mcp_oauth_app_for_owner(
+        "atlassian",
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+        resource_owner_key="actor:workspace:alice",
+        accept="application/json",
+    )
+
+    authorization_url = json.loads(response.body)["authorization_url"]
+    query = parse_qs(urlparse(authorization_url).query)
+    assert query["scope"] == [ATLASSIAN_MCP_OAUTH_SCOPE]
+    assert "required_scope" not in query
+    registration = next(r for r in vendor_requests if r.method == "POST")
+    registration_body = json.loads(registration.content)
+    assert "scope" not in registration_body
+    assert "required_scope" not in registration_body
+    assert db.query(MCPOAuthFlowState).one().scope == ATLASSIAN_MCP_OAUTH_SCOPE
+
+    server = db.query(MCPServer).filter(MCPServer.name == "atlassian").one()
+    assert server.auth == catalog_auth
+    app_info = classify_actor_remote_oauth_server(db, server)
+    assert app_info is not None
+    assert app_info["id"] == "atlassian"

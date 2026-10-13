@@ -96,6 +96,7 @@ from ..services.mcp_oauth import (
     _same_url,
     create_mcp_oauth_http_client,
     discover_mcp_oauth_metadata,
+    mcp_oauth_required_scope,
     normalize_mcp_oauth_scope,
     oauth_error_log_payload,
     oauth_error_message,
@@ -819,6 +820,34 @@ def _scope_string(scopes: list[str] | tuple[str, ...] | str | None) -> str:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": exc.code, "message": exc.message},
         ) from exc
+
+
+def _validated_mcp_oauth_required_scope(auth_config: dict[str, Any]) -> Any:
+    """Return ``mcp_oauth_required_scope`` or raise its error as a 400."""
+    try:
+        return mcp_oauth_required_scope(auth_config)
+    except MCPOAuthDiscoveryError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+
+
+def _explicit_mcp_oauth_required_scope(server: MCPServer) -> str:
+    """The ``required_scope`` a new grant for ``server`` must cover, or ``""``.
+
+    Only an explicitly configured ``required_scope`` is enforced when a grant
+    is stored. Without one, a grant narrower than the requested scope is still
+    stored as before; it just does not count as usable.
+    """
+    auth_config = cast(Any, server).auth
+    if (
+        not isinstance(auth_config, dict)
+        or auth_config.get("type") != "mcp_oauth"
+        or auth_config.get("required_scope") is None
+    ):
+        return ""
+    return str(_validated_mcp_oauth_required_scope(auth_config))
 
 
 def _bounded_mcp_oauth_value(
@@ -1821,8 +1850,34 @@ def _upsert_mcp_oauth_grant(
     *,
     flow_state: MCPOAuthFlowState,
     token_data: dict[str, Any],
+    required_scope: str = "",
 ) -> MCPOAuthGrant:
+    """Store the granted scope as the provider returned it.
+
+    A token response without ``scope`` was granted the requested scope (RFC
+    6749 section 5.1). When ``required_scope`` is given and the granted scope
+    does not cover it, nothing is stored: such a grant could never be used, so
+    the authorization fails with ``insufficient_scope`` instead of reporting a
+    connection that is not usable.
+    """
     scope = _scope_string(str(token_data.get("scope") or flow_state.scope))
+    missing_scopes = set(required_scope.split()) - set(scope.split())
+    if missing_scopes:
+        logger.warning(
+            "MCP OAuth callback did not connect: server_id=%s "
+            "reason=insufficient_scope missing_scope=%s",
+            flow_state.mcp_server_id,
+            " ".join(sorted(missing_scopes)),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "insufficient_scope",
+                "message": (
+                    "The provider did not grant every scope this connection requires."
+                ),
+            },
+        )
     lookup_hash = mcp_oauth_grant_lookup_hash(
         flow_state.mcp_server_id,
         flow_state.user_id,
@@ -6083,6 +6138,7 @@ async def mcp_oauth_callback(
             db,
             flow_state=locked_flow_state,
             token_data=token_data,
+            required_scope=_explicit_mcp_oauth_required_scope(lifecycle[0]),
         )
         failure_stage = "commit_grant"
         db.commit()
@@ -6203,6 +6259,9 @@ async def _connect_mcp_oauth_for_owner(
         lifecycle_generation=association_generation,
     )
     auth_config = _get_mcp_oauth_config(server)
+    # A required scope that is not part of the requested scope is a
+    # configuration error; report it before any provider request.
+    _validated_mcp_oauth_required_scope(auth_config)
     discovery = await _discover_mcp_oauth_for_server(server, auth_config)
 
     redirect_uri = (

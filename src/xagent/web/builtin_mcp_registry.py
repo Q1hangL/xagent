@@ -45,12 +45,8 @@ ZOOM_MEETING_WRITE_DESCRIPTION = (
 # authorization page opens. This subset covers Jira and Confluence read,
 # write and search, Bitbucket read and write, Rovo search, and the basic
 # identity scopes; it leaves out delete/manage and the other products.
-# The same value is the scope a grant must cover (when the connector is listed
-# as connected, at runtime and on token refresh), so a token response that
-# returns fewer scopes leaves the connector unauthorized: keep it to scopes
-# Atlassian grants to every account that completes consent. Changing it
-# needs a migration like 20261013_atlassian_mcp_scope, and existing users
-# must authorize again to get the new scopes.
+# Changing it needs a migration like 20261013_atlassian_mcp_scope, and
+# existing users must authorize again to get the new scopes.
 ATLASSIAN_MCP_OAUTH_SCOPES: tuple[str, ...] = (
     "email",
     "offline_access",
@@ -70,6 +66,23 @@ ATLASSIAN_MCP_OAUTH_SCOPES: tuple[str, ...] = (
 # space-separated), so the catalog value, the server row and the persisted
 # flow scope are the same string.
 ATLASSIAN_MCP_OAUTH_SCOPE = " ".join(sorted(ATLASSIAN_MCP_OAUTH_SCOPES))
+# The part of that request a grant must include to count as usable (when the
+# connector is listed as connected, at runtime and after a token refresh):
+# the basic identity scopes and offline_access for refresh. Atlassian grants
+# product scopes only for the products the consenting account's site has
+# (a site without Bitbucket gets no Bitbucket scopes), so requiring the whole
+# request would leave such accounts unable to connect. Changing this value
+# also needs a migration, because the shared server row must keep the
+# catalog's auth exactly.
+ATLASSIAN_MCP_OAUTH_REQUIRED_SCOPES: tuple[str, ...] = (
+    "email",
+    "offline_access",
+    "read:account",
+    "read:me",
+)
+ATLASSIAN_MCP_OAUTH_REQUIRED_SCOPE = " ".join(
+    sorted(ATLASSIAN_MCP_OAUTH_REQUIRED_SCOPES)
+)
 
 OAUTH_PROVIDERS_TABLE = sa.table(
     "oauth_providers",
@@ -1158,10 +1171,16 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # Atlassian 3LO, transport "oauth"); both are visible in the
             # connector picker because they expose different tool sets.
             # auth.scope overrides the discovered scopes_supported, which is
-            # too long to request (see ATLASSIAN_MCP_OAUTH_SCOPES).
+            # too long to request (see ATLASSIAN_MCP_OAUTH_SCOPES);
+            # auth.required_scope is the part of it a grant must include (see
+            # ATLASSIAN_MCP_OAUTH_REQUIRED_SCOPES).
             "launch_config": {
                 "url": "https://mcp.atlassian.com/v2/mcp",
-                "auth": {"type": "mcp_oauth", "scope": ATLASSIAN_MCP_OAUTH_SCOPE},
+                "auth": {
+                    "type": "mcp_oauth",
+                    "scope": ATLASSIAN_MCP_OAUTH_SCOPE,
+                    "required_scope": ATLASSIAN_MCP_OAUTH_REQUIRED_SCOPE,
+                },
                 # Stable ownership marker used by the seed migration
                 # (whatsapp/shopify pattern): a pre-existing operator row
                 # under this app_id is neither adopted on upgrade nor

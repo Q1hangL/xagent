@@ -591,3 +591,35 @@ def test_legacy_launch_config_is_what_the_seed_inserted():
 
     assert migration.LEGACY_LAUNCH_CONFIG == seed.ROW["launch_config"]
     assert migration.SERVER_URL == seed.ROW["launch_config"]["url"]
+
+
+def test_scoped_auth_requires_only_the_basic_identity_scopes():
+    """The migrated catalog auth requests the subset but requires only the
+    identity scopes Atlassian grants on every consent; product scopes depend
+    on what the account's site has."""
+    from xagent.web.builtin_mcp_registry import ATLASSIAN_MCP_OAUTH_REQUIRED_SCOPE
+    from xagent.web.services.mcp_oauth import mcp_oauth_required_scope
+
+    migration = _load_migration()
+
+    assert migration.REQUIRED_SCOPE == "email offline_access read:account read:me"
+    assert migration.REQUIRED_SCOPE == ATLASSIAN_MCP_OAUTH_REQUIRED_SCOPE
+    assert migration.SCOPED_AUTH == {
+        "type": "mcp_oauth",
+        "scope": migration.SCOPE,
+        "required_scope": migration.REQUIRED_SCOPE,
+    }
+    assert set(migration.REQUIRED_SCOPE.split()) < set(migration.SCOPE.split())
+    assert mcp_oauth_required_scope(migration.SCOPED_AUTH) == migration.REQUIRED_SCOPE
+
+
+def test_upgrade_writes_the_required_scope_into_the_catalog(tmp_path):
+    migration = _load_migration()
+    engine, _metadata, apps, _servers, _links = _setup(tmp_path, migration)
+    with engine.begin() as connection:
+        _run(connection, migration, "upgrade")
+
+        auth = _launch_config(connection, apps)["auth"]
+
+    assert auth["required_scope"] == "email offline_access read:account read:me"
+    assert auth["scope"] == migration.SCOPE

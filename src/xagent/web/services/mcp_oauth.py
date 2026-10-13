@@ -634,7 +634,14 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
     normalized_resource = _runtime_config_value(resource, auth_config, "resource")
     if normalized_resource:
         normalized_resource = _canonical_resource(normalized_resource)
-    selected_scope = scope if scope is not None else auth_config.get("scope")
+    # An explicit scope replaces the configured requirement, as it always has.
+    if scope is not None:
+        selected_scope: Any = scope
+    else:
+        try:
+            selected_scope = mcp_oauth_required_scope(auth_config)
+        except MCPOAuthDiscoveryError as exc:
+            raise MCPOAuthRuntimeError(exc.code, exc.message) from exc
     try:
         normalized_scope = (
             normalize_mcp_oauth_scope(selected_scope) if selected_scope else None
@@ -922,7 +929,19 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
     normalized_issuer = _runtime_config_value(issuer, auth_config, "issuer")
     if normalized_issuer:
         normalized_issuer = _canonical_issuer(normalized_issuer)
-    selected_scope = scope if scope is not None else auth_config.get("scope")
+    # Without an explicit scope, a grant must cover the configured required
+    # scope (see mcp_oauth_required_scope), which is the whole requested scope
+    # unless required_scope narrows it.
+    if scope is not None:
+        selected_scope: Any = scope
+    else:
+        try:
+            selected_scope = mcp_oauth_required_scope(auth_config)
+        except MCPOAuthDiscoveryError:
+            # No grant is usable under a configuration that cannot say what it
+            # requires. Connect and runtime report the configuration error;
+            # this side-effect-free selector just matches nothing.
+            return []
     normalized_scope = _normalize_scope(selected_scope) if selected_scope else None
     configured_client_id = _runtime_config_value(None, auth_config, "client_id")
 
@@ -1331,6 +1350,48 @@ def normalize_mcp_oauth_scope(value: Any) -> str:
             f"MCP OAuth scope must be at most {MCP_OAUTH_SCOPE_MAX_LENGTH} characters",
         )
     return scope
+
+
+def mcp_oauth_required_scope(auth_config: dict[str, Any]) -> Any:
+    """Return the configured scope an MCP OAuth grant must cover to be usable.
+
+    ``scope`` is what an authorization requests. A provider may grant less than
+    that, for example only the scopes of the products an account has. The
+    optional ``required_scope`` names the part of ``scope`` a grant must still
+    include to count as usable: when the connector is listed as connected, at
+    runtime and after a token refresh. Authorization requests and client
+    registration keep using ``scope``.
+
+    Without ``required_scope`` the whole ``scope`` is required, and this
+    returns ``scope`` exactly as configured, so callers normalize it as they
+    always have. With it, the value is normalized like ``scope``.
+
+    Raises ``MCPOAuthDiscoveryError`` with code ``invalid_configuration`` when
+    ``required_scope`` is set but is not a scope string or list, names no
+    scope, is not accompanied by an explicit ``scope``, or names a scope that
+    ``scope`` does not request.
+    """
+    required_scope = auth_config.get("required_scope")
+    if required_scope is None:
+        return auth_config.get("scope")
+    if not isinstance(required_scope, (str, list, tuple, set)):
+        raise _invalid_required_scope("must be a scope string or a list of scopes")
+    normalized_required_scope = _normalize_scope(required_scope)
+    if not normalized_required_scope:
+        raise _invalid_required_scope("must name at least one scope")
+    requested_scopes = _scope_set(auth_config.get("scope"))
+    if not requested_scopes:
+        raise _invalid_required_scope("needs an explicit scope")
+    if not set(normalized_required_scope.split()).issubset(requested_scopes):
+        raise _invalid_required_scope("must only name scopes that scope requests")
+    return normalized_required_scope
+
+
+def _invalid_required_scope(reason: str) -> MCPOAuthDiscoveryError:
+    return MCPOAuthDiscoveryError(
+        "invalid_configuration",
+        f"MCP OAuth required_scope {reason}",
+    )
 
 
 def validate_mcp_oauth_persisted_value(

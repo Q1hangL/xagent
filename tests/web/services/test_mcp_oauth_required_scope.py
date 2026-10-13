@@ -1,0 +1,533 @@
+"""An MCP OAuth configuration can require less than it requests.
+
+``auth.scope`` is what an authorization requests. The optional
+``auth.required_scope`` is the part of it a grant must include to count as
+usable: when the connector is listed as connected, at runtime and after a
+token refresh. Without it the whole requested scope stays required.
+
+The remote Atlassian connector requests a product subset but requires only the
+basic identity scopes, because Atlassian grants product scopes only for the
+products the consenting account's site has.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qs
+
+import httpx
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from xagent.core.utils.encryption import decrypt_value, encrypt_value
+from xagent.web.builtin_mcp_registry import (
+    ATLASSIAN_MCP_OAUTH_REQUIRED_SCOPE,
+    ATLASSIAN_MCP_OAUTH_SCOPE,
+    get_builtin_public_mcp_app,
+)
+from xagent.web.models.database import Base
+from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
+from xagent.web.models.user import User
+from xagent.web.services.mcp_oauth import (
+    MCPOAuthDiscoveryError,
+    MCPOAuthRuntimeError,
+    mcp_oauth_required_scope,
+    resolve_mcp_oauth_runtime_auth,
+    select_mcp_oauth_grants,
+    select_mcp_oauth_owner,
+)
+from xagent.web.services.mcp_runtime import build_mcp_runtime_connection
+
+MCP_URL = "https://mcp.atlassian.com/v2/mcp"
+ISSUER = "https://auth.atlassian.com/tenant"
+TOKEN_ENDPOINT = "https://auth.atlassian.com/oauth/token"
+ACTOR_OWNER = "actor:workspace:alice"
+BASIC_IDENTITY_SCOPES = ("email", "offline_access", "read:account", "read:me")
+BITBUCKET_SCOPES = ("read:bitbucket:agent-interface", "write:bitbucket:agent-interface")
+
+
+def _scope_without(*left_out: str) -> str:
+    return " ".join(
+        scope for scope in ATLASSIAN_MCP_OAUTH_SCOPE.split() if scope not in left_out
+    )
+
+
+# What a site with Jira and Confluence but no Bitbucket was granted for the
+# catalog request: everything except the two Bitbucket scopes (11 of 13).
+GRANTED_WITHOUT_BITBUCKET = _scope_without(*BITBUCKET_SCOPES)
+
+
+def _atlassian_auth() -> dict:
+    app = get_builtin_public_mcp_app("atlassian")
+    assert app is not None
+    return dict(app["launch_config"]["auth"])
+
+
+@pytest.fixture()
+def db_session(tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'required-scope.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine, autoflush=False, autocommit=False)()
+    user = User(username="alice", password_hash="x", is_admin=False)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    yield db, user
+    db.close()
+    engine.dispose()
+
+
+def _add_server(db, user: User, auth: dict) -> MCPServer:
+    server = MCPServer.from_config(
+        {
+            "name": "atlassian",
+            "managed": "external",
+            "transport": "streamable_http",
+            "url": MCP_URL,
+            "auth": auth,
+        }
+    )
+    db.add(server)
+    db.commit()
+    db.refresh(server)
+    db.add(
+        UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=False,
+            is_active=True,
+        )
+    )
+    db.commit()
+    return server
+
+
+def _add_grant(
+    db,
+    *,
+    server: MCPServer,
+    user: User,
+    scope: str,
+    access_token: str = "granted-access-token",
+    refresh_token: str | None = None,
+    expires_at: datetime | None = None,
+) -> MCPOAuthGrant:
+    oauth_client = (
+        db.query(MCPOAuthClient)
+        .filter(MCPOAuthClient.mcp_server_id == server.id)
+        .first()
+    )
+    if oauth_client is None:
+        oauth_client = MCPOAuthClient(
+            mcp_server_id=server.id,
+            issuer=ISSUER,
+            authorization_endpoint="https://auth.atlassian.com/authorize",
+            token_endpoint=TOKEN_ENDPOINT,
+            client_id="atlassian-dynamic-client",
+            token_endpoint_auth_method="none",
+            redirect_uri="https://api.xagent.test/api/mcp/oauth/callback",
+        )
+        db.add(oauth_client)
+        db.flush()
+    grant = MCPOAuthGrant(
+        mcp_server_id=server.id,
+        user_id=user.id,
+        mcp_oauth_client_id=oauth_client.id,
+        resource_owner_key=ACTOR_OWNER,
+        issuer=ISSUER,
+        resource=MCP_URL,
+        scope=scope,
+        access_token=encrypt_value(access_token),
+        refresh_token=encrypt_value(refresh_token) if refresh_token else None,
+        expires_at=expires_at,
+        status="active",
+    )
+    db.add(grant)
+    db.commit()
+    db.refresh(grant)
+    return grant
+
+
+def _select(db, server: MCPServer, user: User, auth: dict) -> list:
+    return select_mcp_oauth_grants(
+        db,
+        server_id=server.id,
+        user_id=user.id,
+        auth_config=auth,
+        resource_owner_key=ACTOR_OWNER,
+    )
+
+
+async def _resolve(db, server: MCPServer, user: User, auth: dict, **kwargs):
+    return await resolve_mcp_oauth_runtime_auth(
+        db,
+        server_id=server.id,
+        user_id=user.id,
+        auth_config=auth,
+        resource_owner_key=ACTOR_OWNER,
+        **kwargs,
+    )
+
+
+def _token_endpoint(requests: list[dict], scope: str) -> httpx.AsyncClient:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == TOKEN_ENDPOINT
+        requests.append(parse_qs(request.content.decode()))
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "refreshed-access-token",
+                "refresh_token": "rotated-refresh-token",
+                "token_type": "Bearer",
+                "expires_in": 28800,
+                "scope": scope,
+            },
+        )
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+# --- the configuration -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [
+        {"type": "mcp_oauth", "scope": "records.write records.read"},
+        {"type": "mcp_oauth", "scope": ["records.write", "records.read"]},
+        {"type": "mcp_oauth", "scope": "records.read", "required_scope": None},
+        {"type": "mcp_oauth", "scope": ""},
+        {"type": "mcp_oauth"},
+    ],
+    ids=("string", "list", "explicit-null", "empty-scope", "no-scope"),
+)
+def test_without_required_scope_the_requested_scope_is_required_as_configured(
+    auth,
+):
+    """Behavior of every configuration without required_scope is unchanged:
+    the requirement is the configured scope, returned untouched so each
+    caller normalizes it exactly as before."""
+    assert mcp_oauth_required_scope(auth) is auth.get("scope")
+
+
+@pytest.mark.parametrize(
+    "required_scope",
+    ["records.read  admin records.read", ["admin", "records.read"]],
+    ids=("string", "list"),
+)
+def test_required_scope_is_normalized_like_scope(required_scope):
+    auth = {
+        "type": "mcp_oauth",
+        "scope": "records.write admin records.read",
+        "required_scope": required_scope,
+    }
+
+    assert mcp_oauth_required_scope(auth) == "admin records.read"
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [
+        {"scope": "records.read", "required_scope": "records.read records.write"},
+        {"scope": "records.read", "required_scope": "admin"},
+        {"required_scope": "records.read"},
+        {"scope": "", "required_scope": "records.read"},
+        {"scope": "records.read", "required_scope": ""},
+        {"scope": "records.read", "required_scope": []},
+        {"scope": "records.read", "required_scope": 7},
+        {"scope": "records.read", "required_scope": {"records.read": True}},
+    ],
+    ids=(
+        "not-a-subset",
+        "unrequested-scope",
+        "no-scope",
+        "empty-scope",
+        "empty-string",
+        "empty-list",
+        "number",
+        "object",
+    ),
+)
+def test_required_scope_outside_the_requested_scope_is_a_configuration_error(auth):
+    with pytest.raises(MCPOAuthDiscoveryError) as exc_info:
+        mcp_oauth_required_scope({"type": "mcp_oauth", **auth})
+
+    assert exc_info.value.code == "invalid_configuration"
+
+
+def test_atlassian_requests_the_subset_but_requires_only_basic_identity():
+    auth = _atlassian_auth()
+
+    assert auth["scope"] == ATLASSIAN_MCP_OAUTH_SCOPE
+    assert len(auth["scope"].split()) == 13
+    assert auth["required_scope"] == "email offline_access read:account read:me"
+    assert auth["required_scope"] == ATLASSIAN_MCP_OAUTH_REQUIRED_SCOPE
+    assert mcp_oauth_required_scope(auth) == auth["required_scope"]
+    # Granting the whole request less Bitbucket still covers the requirement.
+    assert set(BITBUCKET_SCOPES) <= set(auth["scope"].split())
+    assert set(BASIC_IDENTITY_SCOPES) <= set(GRANTED_WITHOUT_BITBUCKET.split())
+
+
+# --- listing a grant as usable -----------------------------------------------
+
+
+def test_atlassian_grant_without_bitbucket_scopes_is_selected(db_session):
+    db, user = db_session
+    auth = _atlassian_auth()
+    server = _add_server(db, user, auth)
+    grant = _add_grant(db, server=server, user=user, scope=GRANTED_WITHOUT_BITBUCKET)
+
+    assert [selected.id for selected in _select(db, server, user, auth)] == [grant.id]
+    # The actor's own grant is usable, so the actor (not the workspace owner)
+    # is the resource owner its runtime uses.
+    assert (
+        select_mcp_oauth_owner(
+            db,
+            server_id=server.id,
+            user_id=user.id,
+            actor_owner_key=ACTOR_OWNER,
+            auth_config=auth,
+        )
+        == ACTOR_OWNER
+    )
+
+
+@pytest.mark.parametrize("left_out", BASIC_IDENTITY_SCOPES)
+def test_atlassian_grant_without_a_basic_identity_scope_is_not_selected(
+    db_session, left_out
+):
+    db, user = db_session
+    auth = _atlassian_auth()
+    server = _add_server(db, user, auth)
+    _add_grant(db, server=server, user=user, scope=_scope_without(left_out))
+
+    assert _select(db, server, user, auth) == []
+
+
+def test_without_required_scope_a_grant_must_still_cover_the_whole_request(
+    db_session,
+):
+    db, user = db_session
+    auth = {"type": "mcp_oauth", "scope": ATLASSIAN_MCP_OAUTH_SCOPE}
+    server = _add_server(db, user, auth)
+    _add_grant(db, server=server, user=user, scope=GRANTED_WITHOUT_BITBUCKET)
+
+    assert _select(db, server, user, auth) == []
+
+    full_grant = _add_grant(
+        db,
+        server=server,
+        user=user,
+        scope=ATLASSIAN_MCP_OAUTH_SCOPE,
+        access_token="full-access-token",
+    )
+    assert [selected.id for selected in _select(db, server, user, auth)] == [
+        full_grant.id
+    ]
+
+
+def test_an_invalid_required_scope_makes_no_grant_usable(db_session):
+    db, user = db_session
+    auth = {**_atlassian_auth(), "required_scope": "read:me manage:jira-configuration"}
+    server = _add_server(db, user, auth)
+    _add_grant(db, server=server, user=user, scope=ATLASSIAN_MCP_OAUTH_SCOPE)
+
+    assert _select(db, server, user, auth) == []
+
+
+# --- runtime -----------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_runtime_uses_an_atlassian_grant_without_bitbucket_scopes(db_session):
+    db, user = db_session
+    auth = _atlassian_auth()
+    server = _add_server(db, user, auth)
+    grant = _add_grant(
+        db,
+        server=server,
+        user=user,
+        scope=GRANTED_WITHOUT_BITBUCKET,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+
+    runtime_auth = await _resolve(db, server, user, auth)
+
+    assert runtime_auth.access_token == "granted-access-token"
+    assert runtime_auth.grant_id == grant.id
+    assert runtime_auth.scope == GRANTED_WITHOUT_BITBUCKET
+    assert runtime_auth.refreshed is False
+
+
+@pytest.mark.asyncio
+async def test_atlassian_grant_without_bitbucket_scopes_stays_usable_after_refresh(
+    db_session,
+):
+    db, user = db_session
+    auth = _atlassian_auth()
+    server = _add_server(db, user, auth)
+    grant = _add_grant(
+        db,
+        server=server,
+        user=user,
+        scope=GRANTED_WITHOUT_BITBUCKET,
+        access_token="expired-access-token",
+        refresh_token="refresh-token",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    requests: list[dict] = []
+
+    async with _token_endpoint(requests, GRANTED_WITHOUT_BITBUCKET) as client:
+        refreshed = await _resolve(db, server, user, auth, client=client)
+
+    assert [request["grant_type"] for request in requests] == [["refresh_token"]]
+    assert requests[0]["refresh_token"] == ["refresh-token"]
+    assert refreshed.refreshed is True
+    assert refreshed.access_token == "refreshed-access-token"
+    assert refreshed.scope == GRANTED_WITHOUT_BITBUCKET
+    db.refresh(grant)
+    assert decrypt_value(grant.access_token) == "refreshed-access-token"
+    assert decrypt_value(grant.refresh_token) == "rotated-refresh-token"
+    assert grant.scope == GRANTED_WITHOUT_BITBUCKET
+
+    # The refreshed grant is still listed as usable and used without another
+    # refresh.
+    assert [selected.id for selected in _select(db, server, user, auth)] == [grant.id]
+    again = await _resolve(db, server, user, auth)
+    assert again.refreshed is False
+    assert again.access_token == "refreshed-access-token"
+
+
+@pytest.mark.asyncio
+async def test_refresh_that_drops_a_basic_identity_scope_is_refused(db_session):
+    db, user = db_session
+    auth = _atlassian_auth()
+    server = _add_server(db, user, auth)
+    grant = _add_grant(
+        db,
+        server=server,
+        user=user,
+        scope=GRANTED_WITHOUT_BITBUCKET,
+        access_token="expired-access-token",
+        refresh_token="refresh-token",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    requests: list[dict] = []
+
+    async with _token_endpoint(
+        requests, _scope_without(*BITBUCKET_SCOPES, "read:me")
+    ) as client:
+        with pytest.raises(MCPOAuthRuntimeError) as exc_info:
+            await _resolve(db, server, user, auth, client=client)
+
+    assert exc_info.value.code == "insufficient_scope"
+    assert len(requests) == 1
+    db.refresh(grant)
+    assert decrypt_value(grant.access_token) == "expired-access-token"
+    assert grant.scope == GRANTED_WITHOUT_BITBUCKET
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("left_out", BASIC_IDENTITY_SCOPES)
+async def test_runtime_refuses_a_grant_without_a_basic_identity_scope(
+    db_session, left_out
+):
+    db, user = db_session
+    auth = _atlassian_auth()
+    server = _add_server(db, user, auth)
+    _add_grant(db, server=server, user=user, scope=_scope_without(left_out))
+
+    with pytest.raises(MCPOAuthRuntimeError) as exc_info:
+        await _resolve(db, server, user, auth)
+
+    assert exc_info.value.code == "insufficient_scope"
+
+
+@pytest.mark.asyncio
+async def test_runtime_without_required_scope_still_requires_the_whole_request(
+    db_session,
+):
+    db, user = db_session
+    auth = {"type": "mcp_oauth", "scope": ATLASSIAN_MCP_OAUTH_SCOPE}
+    server = _add_server(db, user, auth)
+    _add_grant(db, server=server, user=user, scope=GRANTED_WITHOUT_BITBUCKET)
+
+    with pytest.raises(MCPOAuthRuntimeError) as exc_info:
+        await _resolve(db, server, user, auth)
+
+    assert exc_info.value.code == "insufficient_scope"
+
+
+@pytest.mark.asyncio
+async def test_runtime_reports_an_invalid_required_scope_as_a_configuration_error(
+    db_session,
+):
+    db, user = db_session
+    auth = {**_atlassian_auth(), "required_scope": "read:me manage:jira-configuration"}
+    server = _add_server(db, user, auth)
+    _add_grant(db, server=server, user=user, scope=ATLASSIAN_MCP_OAUTH_SCOPE)
+
+    with pytest.raises(MCPOAuthRuntimeError) as exc_info:
+        await _resolve(db, server, user, auth)
+
+    assert exc_info.value.code == "invalid_configuration"
+
+
+@pytest.mark.asyncio
+async def test_runtime_connection_carries_the_atlassian_grant(db_session):
+    db, user = db_session
+    auth = _atlassian_auth()
+    server = _add_server(db, user, auth)
+    _add_grant(db, server=server, user=user, scope=GRANTED_WITHOUT_BITBUCKET)
+
+    build = await build_mcp_runtime_connection(
+        db,
+        server,
+        user_id=user.id,
+        mcp_auth_context={str(server.id): {"resource_owner_key": ACTOR_OWNER}},
+    )
+
+    assert build.diagnostic is None
+    assert build.connection is not None
+    assert build.connection["headers"]["Authorization"] == (
+        "Bearer granted-access-token"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("auth", "expected_scope"),
+    [
+        (_atlassian_auth(), "email offline_access read:account read:me"),
+        (
+            {"type": "mcp_oauth", "scope": ATLASSIAN_MCP_OAUTH_SCOPE},
+            ATLASSIAN_MCP_OAUTH_SCOPE,
+        ),
+    ],
+    ids=("required-scope", "no-required-scope"),
+)
+async def test_runtime_diagnostic_names_the_scope_a_grant_had_to_cover(
+    db_session, auth, expected_scope
+):
+    db, user = db_session
+    server = _add_server(db, user, auth)
+    _add_grant(
+        db, server=server, user=user, scope=_scope_without(*BITBUCKET_SCOPES, "email")
+    )
+
+    build = await build_mcp_runtime_connection(
+        db,
+        server,
+        user_id=user.id,
+        mcp_auth_context={str(server.id): {"resource_owner_key": ACTOR_OWNER}},
+    )
+
+    assert build.connection is None
+    assert build.diagnostic is not None
+    assert build.diagnostic["code"] == "insufficient_scope"
+    assert build.diagnostic["scope"] == expected_scope

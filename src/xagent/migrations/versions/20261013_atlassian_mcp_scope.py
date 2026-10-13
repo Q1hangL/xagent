@@ -8,7 +8,11 @@ Atlassian's protected-resource metadata lists 38 scopes (1023 characters once
 normalized) and its 401 challenge carries no scope, so the connector, which
 requested every discovered scope, exceeded the 1000-character MCP OAuth scope
 limit and could not start authorization. The catalog row now sets
-``launch_config.auth.scope`` to a fixed subset.
+``launch_config.auth.scope`` to a fixed subset, and
+``launch_config.auth.required_scope`` to the basic identity scopes a grant
+must include. Atlassian grants product scopes only for the products the
+consenting account's site has, so a grant is usable without, for example, the
+Bitbucket scopes.
 
 The shared ``atlassian`` server row the connect path created still carries the
 old auth, which the canonical-definition check rejects, so it is deleted
@@ -51,8 +55,9 @@ BUILTIN_PROVENANCE = {
     "app_id": APP_ID,
     "version": 1,
 }
-# Frozen copy of builtin_mcp_registry.ATLASSIAN_MCP_OAUTH_SCOPE at the time this
-# migration was written (tests/alembic pins the two against each other).
+# Frozen copies of builtin_mcp_registry.ATLASSIAN_MCP_OAUTH_SCOPE and
+# ATLASSIAN_MCP_OAUTH_REQUIRED_SCOPE at the time this migration was written
+# (tests/alembic pins them against the registry).
 SCOPE = (
     "email offline_access read:account read:bitbucket:agent-interface "
     "read:confluence:agent-interface read:jira:agent-interface read:me "
@@ -60,8 +65,13 @@ SCOPE = (
     "search:rovo:agent-interface write:bitbucket:agent-interface "
     "write:confluence:agent-interface write:jira:agent-interface"
 )
+REQUIRED_SCOPE = "email offline_access read:account read:me"
 LEGACY_AUTH = {"type": "mcp_oauth"}
-SCOPED_AUTH = {"type": "mcp_oauth", "scope": SCOPE}
+SCOPED_AUTH = {
+    "type": "mcp_oauth",
+    "scope": SCOPE,
+    "required_scope": REQUIRED_SCOPE,
+}
 LEGACY_LAUNCH_CONFIG = {
     "url": SERVER_URL,
     "auth": LEGACY_AUTH,
