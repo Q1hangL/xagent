@@ -424,3 +424,39 @@ async def _stub_discovery_and_registration(monkeypatch):
     monkeypatch.setattr(mcp_api, "_discover_mcp_oauth_for_server", fake_discovery)
     monkeypatch.setattr(mcp_api, "register_mcp_oauth_public_client", fake_registration)
     return state
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [
+        None,
+        "mcp_oauth",
+        {"type": "oauth", "scope": "read:me", "required_scope": "read:me"},
+        {"scope": "read:me", "required_scope": "read:me"},
+        {"type": "mcp_oauth", "scope": ATLASSIAN_MCP_OAUTH_SCOPE},
+    ],
+    ids=(
+        "no-auth",
+        "not-an-object",
+        "another-auth-type",
+        "no-auth-type",
+        "no-required-scope",
+    ),
+)
+def test_callback_takes_required_scope_only_from_an_mcp_oauth_auth(auth):
+    """The callback reads the server row again after the token exchange, so
+    it can find an auth that changed while the user was authorizing. Only an
+    ``mcp_oauth`` auth that sets ``required_scope`` gives a new grant a scope
+    it must cover; with any other auth there is none, and nothing raises."""
+    server = SimpleNamespace(auth=auth)
+
+    assert mcp_api._explicit_mcp_oauth_required_scope(server) == ""
+
+
+def test_callback_takes_the_atlassian_required_scope_from_its_auth():
+    server = SimpleNamespace(auth=_atlassian_auth())
+
+    assert (
+        mcp_api._explicit_mcp_oauth_required_scope(server)
+        == "email offline_access read:account read:me"
+    )
