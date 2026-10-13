@@ -4196,7 +4196,10 @@ async def test_callback_sanitizes_authorization_error_response(db_session, monke
     assert query["mcp_oauth_error"] == ["provider_error"]
     assert query["mcp_oauth_provider_error"] == ["unknown_error"]
     assert len(query["mcp_oauth_error_message"][0]) <= 500
-    assert "x" * 100 not in response.headers["location"]
+    # No part of the provider's value is forwarded, not even a shortened one.
+    location = unquote_plus(response.headers["location"])
+    assert "access_denied_" not in location
+    assert "x" * 10 not in location
     assert db.query(MCPOAuthGrant).count() == 0
 
 
