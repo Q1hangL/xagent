@@ -92,6 +92,10 @@ ATLASSIAN_SCOPES_SUPPORTED = (
     "read:assets:agent-interface",
     "write:assets:agent-interface",
 )
+# Atlassian grants only the scopes of the products a site has, so a grant must
+# include just the basic identity scopes; the rest of the subset is requested
+# but optional.
+REQUIRED_SCOPE = "email offline_access read:account read:me"
 PROTECTED_RESOURCE_METADATA = {
     "resource": MCP_URL,
     "authorization_servers": [ISSUER],
@@ -216,12 +220,17 @@ def test_catalog_scope_is_a_short_canonical_subset_of_the_advertised_scopes():
     assert not [
         scope for scope in requested if scope.startswith(("delete:", "manage:"))
     ]
+    # Only the basic identity scopes are required of a grant; they are part of
+    # the request and kept in the same canonical form.
+    assert set(REQUIRED_SCOPE.split()) < set(requested)
+    assert normalize_mcp_oauth_scope(REQUIRED_SCOPE) == REQUIRED_SCOPE
 
     app = get_builtin_public_mcp_app("atlassian")
     assert app is not None
     assert app["launch_config"]["auth"] == {
         "type": "mcp_oauth",
         "scope": ATLASSIAN_MCP_OAUTH_SCOPE,
+        "required_scope": REQUIRED_SCOPE,
     }
 
 
@@ -255,10 +264,15 @@ async def test_trusted_connect_requests_the_catalog_scope_and_stays_canonical(
     ]
     assert db.query(MCPOAuthFlowState).one().scope == ATLASSIAN_MCP_OAUTH_SCOPE
 
-    # The shared row the connect created matches the catalog, so the actor
-    # projection keeps listing the app instead of rejecting its definition.
+    # The shared row the connect created matches the catalog, required_scope
+    # included, so the actor projection keeps listing the app instead of
+    # rejecting its definition.
     server = db.query(MCPServer).filter(MCPServer.name == "atlassian").one()
-    assert server.auth == {"type": "mcp_oauth", "scope": ATLASSIAN_MCP_OAUTH_SCOPE}
+    assert server.auth == {
+        "type": "mcp_oauth",
+        "scope": ATLASSIAN_MCP_OAUTH_SCOPE,
+        "required_scope": REQUIRED_SCOPE,
+    }
     app_info = classify_actor_remote_oauth_server(db, server)
     assert app_info is not None
     assert app_info["id"] == "atlassian"

@@ -258,10 +258,11 @@ def test_upgrade_raises_when_launch_config_column_is_missing(tmp_path):
         assert APP_ID not in _app_ids(connection)
 
 
-def test_seed_row_matches_registry_apart_from_the_later_scope():
+def test_seed_row_matches_registry_apart_from_the_later_scope_fields():
     """The migration is a frozen copy of the registry row. The registry has
-    since pinned launch_config.auth.scope (20261013_atlassian_mcp_scope), so
-    everything except that auth must still match; this catches other drift."""
+    since pinned launch_config.auth.scope and auth.required_scope
+    (20261013_atlassian_mcp_scope), so everything except those two auth
+    fields must still match; this catches other drift."""
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 
     migration = _load_migration()
@@ -277,6 +278,7 @@ def test_seed_row_matches_registry_apart_from_the_later_scope():
         "launch_config": registry_launch,
     }
     assert registry_auth.pop("scope")
+    assert registry_auth.pop("required_scope")
     assert seed_auth == registry_auth
     assert registry_row["is_visible_in_connector"] is True
 

@@ -960,7 +960,9 @@ def test_builtin_registry_remote_mcp_apps_launch_config() -> None:
     # Its metadata advertises more scopes than one request can carry, so the
     # catalog pins a subset. It is the permission set users consent to, so it
     # is pinned literally here like every other row; changing it after release
-    # also needs a new migration (see 20261013_atlassian_mcp_scope).
+    # also needs a new migration (see 20261013_atlassian_mcp_scope). Atlassian
+    # grants only the scopes of the products a site has, so a grant must
+    # include just the basic identity scopes (required_scope).
     assert rows_by_app_id["atlassian"]["launch_config"] == {
         "url": "https://mcp.atlassian.com/v2/mcp",
         "auth": {
@@ -973,6 +975,7 @@ def test_builtin_registry_remote_mcp_apps_launch_config() -> None:
                 "search:rovo:agent-interface write:bitbucket:agent-interface "
                 "write:confluence:agent-interface write:jira:agent-interface"
             ),
+            "required_scope": "email offline_access read:account read:me",
         },
         "builtin_provenance": {
             "registry": "xagent",
