@@ -623,3 +623,73 @@ def test_upgrade_writes_the_required_scope_into_the_catalog(tmp_path):
 
     assert auth["required_scope"] == "email offline_access read:account read:me"
     assert auth["scope"] == migration.SCOPE
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [None, "mcp_oauth", ["mcp_oauth"], 1],
+    ids=("null", "string", "list", "number"),
+)
+def test_upgrade_keeps_a_server_whose_auth_is_not_an_object(tmp_path, auth):
+    """Only an auth object can be the catalog definition; any other stored
+    value is not a row the catalog connect path wrote."""
+    migration = _load_migration()
+    engine, metadata, apps, servers, links = _setup(tmp_path, migration)
+    with engine.begin() as connection:
+        _add_server(connection, metadata, servers, links, server_id=1, auth=auth)
+
+        _run(connection, migration, "upgrade")
+
+        assert _launch_config(connection, apps) == migration.SCOPED_LAUNCH_CONFIG
+        assert _server_ids(connection, servers) == {1}
+        assert _child_count(connection, metadata, 1) == 4
+
+
+def test_upgrade_deletes_dependents_only_where_a_table_links_the_server(tmp_path):
+    """A database without one of the OAuth tables, or with a table that has
+    no server column, still loses the catalog row and the dependents it can
+    find; a table that cannot reference the server is left alone."""
+    migration = _load_migration()
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    metadata = MetaData()
+    apps, servers, links = _schema(metadata)
+    metadata.remove(metadata.tables["mcp_oauth_flow_states"])
+    metadata.remove(metadata.tables["mcp_oauth_clients"])
+    clients = Table(
+        "mcp_oauth_clients",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("server_id", Integer),
+    )
+    grants = metadata.tables["mcp_oauth_grants"]
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            apps.insert().values(
+                app_id="atlassian", launch_config=migration.LEGACY_LAUNCH_CONFIG
+            )
+        )
+        connection.execute(
+            servers.insert().values(
+                id=1,
+                name="atlassian",
+                transport="streamable_http",
+                url=migration.SERVER_URL,
+                auth=migration.LEGACY_AUTH,
+            )
+        )
+        connection.execute(
+            links.insert().values(user_id=7, mcpserver_id=1, is_owner=False)
+        )
+        connection.execute(grants.insert().values(mcp_server_id=1))
+        connection.execute(clients.insert().values(server_id=1))
+
+        _run(connection, migration, "upgrade")
+
+        assert _launch_config(connection, apps) == migration.SCOPED_LAUNCH_CONFIG
+        assert _server_ids(connection, servers) == set()
+        for table, expected in ((links, 0), (grants, 0), (clients, 1)):
+            count = connection.execute(
+                select(func.count()).select_from(table)
+            ).scalar_one()
+            assert count == expected, table.name
