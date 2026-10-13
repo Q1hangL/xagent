@@ -4201,6 +4201,52 @@ async def test_callback_sanitizes_authorization_error_response(db_session, monke
 
 
 @pytest.mark.asyncio
+async def test_callback_truncates_a_long_token_exchange_error_message(
+    db_session, monkeypatch
+):
+    """The redirect message is capped at OAUTH_ERROR_MESSAGE_MAX_LENGTH and
+    marked as cut; a token endpoint error is the path that still carries
+    provider text into it."""
+    db, user, _ = db_session
+    _add_callback_client_and_state(
+        db,
+        user,
+        state="long-token-error-state",
+        redirect_after="/mcp",
+    )
+    real_async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={"error": "invalid_grant", "error_description": "x" * 1000},
+        )
+
+    monkeypatch.setattr(
+        mcp_api,
+        "create_mcp_oauth_http_client",
+        lambda *args, **kwargs: real_async_client(
+            transport=httpx.MockTransport(handler)
+        ),
+    )
+
+    response = await mcp_oauth_callback(
+        _request("/api/mcp/oauth/callback?code=auth-code&state=long-token-error-state"),
+        db,
+    )
+
+    assert response.status_code == 307
+    assert urlparse(response.headers["location"]).path == "/mcp"
+    query = _redirect_query(response)
+    assert query["mcp_oauth_error"] == ["token_exchange_failed"]
+    message = query["mcp_oauth_error_message"][0]
+    assert len(message) == mcp_oauth_service.OAUTH_ERROR_MESSAGE_MAX_LENGTH
+    assert message.endswith("...")
+    assert message[:-3] == "x" * (len(message) - 3)
+    assert db.query(MCPOAuthGrant).count() == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "extra_query",
     ["", "&error_description=Your+team+admin+has+not+approved+this+app"],

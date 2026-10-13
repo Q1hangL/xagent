@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import (
@@ -451,6 +452,70 @@ def test_upgrade_skips_servers_when_the_server_table_lacks_identity_columns(
 
         assert _launch_config(connection, apps) == migration.SCOPED_LAUNCH_CONFIG
         assert _server_ids(connection, servers) == {1}
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"headers": {"X-Debug": "1"}},
+        {"timeout": 120},
+        {"env": {"HTTP_PROXY": "http://proxy.internal:3128"}},
+        {"managed": "internal"},
+    ],
+    ids=("headers", "timeout", "env", "managed"),
+)
+def test_upgrade_deletes_the_catalog_row_even_after_an_admin_edited_it(
+    tmp_path, policy
+):
+    """Deliberate (as in the HubSpot and Zendesk switches): an administrator's
+    edits to the shared catalog row go with it. Under the old auth the actor
+    projection rejects the row regardless of those edits."""
+    migration = _load_migration()
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    metadata = MetaData()
+    apps, _servers, links = _schema(metadata)
+    metadata.remove(metadata.tables["mcp_servers"])
+    servers = Table(
+        "mcp_servers",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("name", String, unique=True),
+        Column("transport", String),
+        Column("url", String),
+        Column("auth", JSON),
+        Column("headers", JSON),
+        Column("env", JSON),
+        Column("timeout", Integer),
+        Column("managed", String),
+    )
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            apps.insert().values(
+                app_id="atlassian",
+                name="Atlassian (Jira, Confluence, Bitbucket)",
+                transport="streamable_http",
+                launch_config=migration.LEGACY_LAUNCH_CONFIG,
+            )
+        )
+        connection.execute(
+            servers.insert().values(
+                id=1,
+                name="atlassian",
+                transport="streamable_http",
+                url=migration.SERVER_URL,
+                auth=migration.LEGACY_AUTH,
+                **{"managed": "external", **policy},
+            )
+        )
+        connection.execute(
+            links.insert().values(user_id=7, mcpserver_id=1, is_owner=False)
+        )
+
+        _run(connection, migration, "upgrade")
+
+        assert _server_ids(connection, servers) == set()
+        assert _child_count(connection, metadata, 1) == 0
 
 
 def test_upgrade_deletes_no_server_when_ownership_cannot_be_checked(tmp_path):

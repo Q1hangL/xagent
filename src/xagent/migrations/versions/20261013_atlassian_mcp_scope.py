@@ -15,9 +15,20 @@ old auth, which the canonical-definition check rejects, so it is deleted
 together with its OAuth flow states, grants, client registrations and user
 links, as the HubSpot and Zendesk switches did. The next connect recreates the
 row from the catalog and registers a fresh client. Users who had connected
-Atlassian must connect again. Rows in other tables that reference the deleted
-server with ON DELETE CASCADE are removed with it on databases that enforce
-foreign keys.
+Atlassian must connect again.
+
+- The row is deleted even when an administrator has since edited its policy
+  fields (headers, env, timeout, managed and the like); those edits go with
+  it. Under the old auth the actor projection rejects that row anyway, so
+  keeping it would keep the connector unavailable there, and a row whose
+  ``managed`` value was changed could never be repaired by a later connect.
+- Rows in other tables that reference the deleted server are not handled
+  here. PostgreSQL removes them through their ON DELETE CASCADE foreign keys.
+  On SQLite the startup migration runner turns foreign keys off and rejects
+  any new violation, so such rows must be removed before upgrading.
+- Downgrade is symmetric: it restores the previous catalog value and deletes
+  the server row recreated under the scoped auth, which disconnects users
+  who connected after the upgrade.
 """
 
 from typing import Any, Sequence, Union
@@ -146,7 +157,9 @@ def _delete_catalog_servers_with_auth(
     user link. A user-created server under the same name has an owner, and a
     server with other auth keys (a client id, another scope) is a custom
     OAuth configuration; neither is touched. Without the columns that prove
-    either, nothing is deleted.
+    either, nothing is deleted. Policy columns are deliberately not compared:
+    an administrator's edits to the catalog row are deleted with it (see the
+    module docstring).
     """
     if not {"id", "name", "transport", "url", "auth"}.issubset(
         _columns(bind, "mcp_servers")

@@ -26,7 +26,6 @@ from xagent.web.api.auth import (
     auth_router,
 )
 from xagent.web.api.mcp import mcp_router
-from xagent.web.builtin_mcp_registry import ATLASSIAN_MCP_OAUTH_SCOPE
 from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.database import Base, get_db, get_engine
 from xagent.web.models.mcp import MCPServer, UserMCPServer
@@ -959,11 +958,22 @@ def test_builtin_registry_remote_mcp_apps_launch_config() -> None:
     # unsupported after 2026-06-30 and must not be what the catalog points at.
     assert rows_by_app_id["atlassian"]["transport"] == "streamable_http"
     # Its metadata advertises more scopes than one request can carry, so the
-    # catalog pins a subset (checked against the migration's frozen copy in
-    # tests/alembic/test_20261013_atlassian_mcp_scope.py).
+    # catalog pins a subset. It is the permission set users consent to, so it
+    # is pinned literally here like every other row; changing it after release
+    # also needs a new migration (see 20261013_atlassian_mcp_scope).
     assert rows_by_app_id["atlassian"]["launch_config"] == {
         "url": "https://mcp.atlassian.com/v2/mcp",
-        "auth": {"type": "mcp_oauth", "scope": ATLASSIAN_MCP_OAUTH_SCOPE},
+        "auth": {
+            "type": "mcp_oauth",
+            "scope": (
+                "email offline_access read:account "
+                "read:bitbucket:agent-interface read:confluence:agent-interface "
+                "read:jira:agent-interface read:me "
+                "search:confluence:agent-interface search:jira:agent-interface "
+                "search:rovo:agent-interface write:bitbucket:agent-interface "
+                "write:confluence:agent-interface write:jira:agent-interface"
+            ),
+        },
         "builtin_provenance": {
             "registry": "xagent",
             "app_id": "atlassian",
