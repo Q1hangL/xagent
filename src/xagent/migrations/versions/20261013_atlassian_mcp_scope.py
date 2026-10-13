@@ -156,6 +156,50 @@ def _set_owned_launch_config(
     return True
 
 
+def _has_identifying_columns(bind: sa.engine.Connection) -> bool:
+    """Whether the columns that tell the catalog row from other servers exist."""
+    return {"id", "name", "transport", "url", "auth"}.issubset(
+        _columns(bind, "mcp_servers")
+    ) and {"mcpserver_id", "is_owner"}.issubset(_columns(bind, "user_mcpservers"))
+
+
+def _matches_catalog_definition(row: Any, auth: dict[str, Any]) -> bool:
+    """Whether a server row has the catalog transport and URL and stores
+    exactly ``auth``, apart from an ``app_id`` key."""
+    stored_auth = row["auth"]
+    if not isinstance(stored_auth, dict):
+        return False
+    comparable_auth = {
+        key: value for key, value in stored_auth.items() if key != "app_id"
+    }
+    return (
+        str(row["transport"] or "").lower() == SERVER_TRANSPORT
+        and row["url"] == SERVER_URL
+        and comparable_auth == auth
+    )
+
+
+def _has_owning_user(bind: sa.engine.Connection, server_id: int) -> bool:
+    owned = bind.execute(
+        sa.select(USER_MCPSERVERS.c.mcpserver_id).where(
+            USER_MCPSERVERS.c.mcpserver_id == server_id,
+            USER_MCPSERVERS.c.is_owner.is_(True),
+        )
+    ).first()
+    return owned is not None
+
+
+def _delete_server_and_dependents(bind: sa.engine.Connection, server_id: int) -> None:
+    # Be explicit for SQLite deployments where migration connections may
+    # not have foreign-key cascade enforcement enabled.
+    for table_name, server_column in SERVER_CHILD_TABLES:
+        if server_column not in _columns(bind, table_name):
+            continue
+        child = sa.table(table_name, sa.column(server_column, sa.Integer))
+        bind.execute(sa.delete(child).where(child.c[server_column] == server_id))
+    bind.execute(sa.delete(MCP_SERVERS).where(MCP_SERVERS.c.id == server_id))
+
+
 def _delete_catalog_servers_with_auth(
     bind: sa.engine.Connection, auth: dict[str, Any]
 ) -> None:
@@ -171,9 +215,7 @@ def _delete_catalog_servers_with_auth(
     an administrator's edits to the catalog row are deleted with it (see the
     module docstring).
     """
-    if not {"id", "name", "transport", "url", "auth"}.issubset(
-        _columns(bind, "mcp_servers")
-    ) or not {"mcpserver_id", "is_owner"}.issubset(_columns(bind, "user_mcpservers")):
+    if not _has_identifying_columns(bind):
         return
     rows = (
         bind.execute(
@@ -188,35 +230,12 @@ def _delete_catalog_servers_with_auth(
         .all()
     )
     for row in rows:
-        stored_auth = row["auth"]
-        if not isinstance(stored_auth, dict):
-            continue
-        comparable_auth = {
-            key: value for key, value in stored_auth.items() if key != "app_id"
-        }
-        if (
-            str(row["transport"] or "").lower() != SERVER_TRANSPORT
-            or row["url"] != SERVER_URL
-            or comparable_auth != auth
-        ):
+        if not _matches_catalog_definition(row, auth):
             continue
         server_id = int(row["id"])
-        owned = bind.execute(
-            sa.select(USER_MCPSERVERS.c.mcpserver_id).where(
-                USER_MCPSERVERS.c.mcpserver_id == server_id,
-                USER_MCPSERVERS.c.is_owner.is_(True),
-            )
-        ).first()
-        if owned is not None:
+        if _has_owning_user(bind, server_id):
             continue
-        # Be explicit for SQLite deployments where migration connections may
-        # not have foreign-key cascade enforcement enabled.
-        for table_name, server_column in SERVER_CHILD_TABLES:
-            if server_column not in _columns(bind, table_name):
-                continue
-            child = sa.table(table_name, sa.column(server_column, sa.Integer))
-            bind.execute(sa.delete(child).where(child.c[server_column] == server_id))
-        bind.execute(sa.delete(MCP_SERVERS).where(MCP_SERVERS.c.id == server_id))
+        _delete_server_and_dependents(bind, server_id)
 
 
 def upgrade() -> None:
