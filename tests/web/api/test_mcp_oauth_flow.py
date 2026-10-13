@@ -4204,9 +4204,9 @@ async def test_callback_sanitizes_authorization_error_response(db_session, monke
 async def test_callback_truncates_a_long_token_exchange_error_message(
     db_session, monkeypatch
 ):
-    """The redirect message is capped at OAUTH_ERROR_MESSAGE_MAX_LENGTH and
-    marked as cut; a token endpoint error is the path that still carries
-    provider text into it."""
+    """The redirect message is capped at 500 characters and marked as cut; a
+    token endpoint error is the path that still carries provider text into
+    it."""
     db, user, _ = db_session
     _add_callback_client_and_state(
         db,
@@ -4240,7 +4240,7 @@ async def test_callback_truncates_a_long_token_exchange_error_message(
     query = _redirect_query(response)
     assert query["mcp_oauth_error"] == ["token_exchange_failed"]
     message = query["mcp_oauth_error_message"][0]
-    assert len(message) == mcp_oauth_service.OAUTH_ERROR_MESSAGE_MAX_LENGTH
+    assert len(message) == 500
     assert message.endswith("...")
     assert message[:-3] == "x" * (len(message) - 3)
     assert db.query(MCPOAuthGrant).count() == 0
