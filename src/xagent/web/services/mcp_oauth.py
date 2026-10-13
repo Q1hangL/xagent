@@ -634,15 +634,8 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
     normalized_resource = _runtime_config_value(resource, auth_config, "resource")
     if normalized_resource:
         normalized_resource = _canonical_resource(normalized_resource)
-    # An explicit scope replaces the configured requirement, as it always has.
-    if scope is not None:
-        selected_scope: Any = scope
-    else:
-        try:
-            selected_scope = mcp_oauth_required_scope(auth_config)
-        except MCPOAuthDiscoveryError as exc:
-            raise MCPOAuthRuntimeError(exc.code, exc.message) from exc
     try:
+        selected_scope = _scope_a_grant_must_cover(scope, auth_config)
         normalized_scope = (
             normalize_mcp_oauth_scope(selected_scope) if selected_scope else None
         )
@@ -929,19 +922,13 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
     normalized_issuer = _runtime_config_value(issuer, auth_config, "issuer")
     if normalized_issuer:
         normalized_issuer = _canonical_issuer(normalized_issuer)
-    # Without an explicit scope, a grant must cover the configured required
-    # scope (see mcp_oauth_required_scope), which is the whole requested scope
-    # unless required_scope narrows it.
-    if scope is not None:
-        selected_scope: Any = scope
-    else:
-        try:
-            selected_scope = mcp_oauth_required_scope(auth_config)
-        except MCPOAuthDiscoveryError:
-            # No grant is usable under a configuration that cannot say what it
-            # requires. Connect and runtime report the configuration error;
-            # this side-effect-free selector just matches nothing.
-            return []
+    try:
+        selected_scope = _scope_a_grant_must_cover(scope, auth_config)
+    except MCPOAuthDiscoveryError:
+        # No grant is usable under a configuration that cannot say what it
+        # requires. Connect and runtime report the configuration error; this
+        # side-effect-free selector just matches nothing.
+        return []
     normalized_scope = _normalize_scope(selected_scope) if selected_scope else None
     configured_client_id = _runtime_config_value(None, auth_config, "client_id")
 
@@ -1392,6 +1379,19 @@ def _invalid_required_scope(reason: str) -> MCPOAuthDiscoveryError:
         "invalid_configuration",
         f"MCP OAuth required_scope {reason}",
     )
+
+
+def _scope_a_grant_must_cover(scope: Any, auth_config: dict[str, Any]) -> Any:
+    """Return the scope a grant must cover for grant selection and runtime.
+
+    A scope the caller passes explicitly replaces the configured requirement,
+    as it always has. Otherwise a grant must cover ``mcp_oauth_required_scope``,
+    which is the whole requested scope unless ``required_scope`` narrows it.
+    Raises ``MCPOAuthDiscoveryError`` like ``mcp_oauth_required_scope``.
+    """
+    if scope is not None:
+        return scope
+    return mcp_oauth_required_scope(auth_config)
 
 
 def validate_mcp_oauth_persisted_value(
