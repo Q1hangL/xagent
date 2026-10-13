@@ -187,8 +187,8 @@ function ToolsPageContent() {
   const { getAppIcon, apps: catalogApps } = useMcpApps()
   const isAdmin = Boolean(user?.is_admin)
 
-  // F8: strip all three mcp_oauth redirect params in both effects below, not
-  // just the one each effect owns. The two backend redirects are mutually
+  // F8: strip every mcp_oauth redirect param in both effects below, not just
+  // the one each effect owns. The two backend redirects are mutually
   // exclusive today (never both present at once), but if that ever changed,
   // one effect's router.replace could otherwise undo the other's cleanup and
   // cause a duplicate-toast loop.
@@ -196,6 +196,7 @@ function ToolsPageContent() {
     const next = new URLSearchParams(params.toString())
     next.delete("mcp_oauth_error")
     next.delete("mcp_oauth_error_message")
+    next.delete("mcp_oauth_provider_error")
     next.delete(MCP_OAUTH_SUCCESS_PARAM)
     const nextQuery = next.toString()
     router.replace(nextQuery ? `/tools?${nextQuery}` : "/tools", { scroll: false })

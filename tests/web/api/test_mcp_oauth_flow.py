@@ -6,7 +6,7 @@ import threading
 import time
 from datetime import timedelta
 from types import SimpleNamespace
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 from uuid import uuid4
 
 import httpx
@@ -3269,7 +3269,7 @@ async def test_callback_exchanges_code_and_stores_encrypted_grant(
     ("callback_query", "lose_claim", "expected_error"),
     [
         ("code=auth-code", True, "state_already_consumed"),
-        ("error=access_denied", False, "token_exchange_failed"),
+        ("error=access_denied", False, "provider_error"),
         ("", False, "invalid_state"),
     ],
     ids=("claim-lost", "provider-error", "missing-code"),
@@ -4192,10 +4192,111 @@ async def test_callback_sanitizes_authorization_error_response(db_session, monke
 
     assert response.status_code == 307
     query = _redirect_query(response)
-    assert query["mcp_oauth_error"] == ["token_exchange_failed"]
+    # A value that is not a short OAuth error code is replaced, never echoed.
+    assert query["mcp_oauth_error"] == ["provider_error"]
+    assert query["mcp_oauth_provider_error"] == ["unknown_error"]
     assert len(query["mcp_oauth_error_message"][0]) <= 500
-    assert query["mcp_oauth_error_message"][0].endswith("...")
+    assert "x" * 100 not in response.headers["location"]
     assert db.query(MCPOAuthGrant).count() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra_query",
+    ["", "&error_description=Your+team+admin+has+not+approved+this+app"],
+    ids=("without-description", "with-description"),
+)
+async def test_callback_reports_provider_refusal_as_provider_error(
+    db_session, monkeypatch, caplog, extra_query
+):
+    monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://app.example.com/")
+    db, user, _ = db_session
+    server, _, _ = _add_callback_client_and_state(
+        db,
+        user,
+        state="provider-refusal-state",
+        redirect_after="/api/connector/oauth/complete",
+    )
+
+    async def fail_exchange(**kwargs):
+        pytest.fail("token exchange must not run for authorization error callbacks")
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fail_exchange)
+
+    with caplog.at_level("WARNING", logger=mcp_api.logger.name):
+        response = await mcp_oauth_callback(
+            _request(
+                "/api/mcp/oauth/callback?error=access_denied"
+                f"&state=provider-refusal-state{extra_query}"
+            ),
+            db,
+        )
+
+    assert response.status_code == 307
+    location = response.headers["location"]
+    assert urlparse(location).path == "/api/connector/oauth/complete"
+    query = _redirect_query(response)
+    assert query["mcp_oauth_error"] == ["provider_error"]
+    assert query["mcp_oauth_provider_error"] == ["access_denied"]
+    assert query["mcp_oauth_error_message"] == [
+        "The provider did not authorize the connection (access_denied)."
+    ]
+    assert "mcp_oauth_success" not in query
+    # The provider's free text is neither forwarded nor logged.
+    assert "approved" not in location
+    assert "approved" not in caplog.text
+    records = [
+        record.getMessage()
+        for record in caplog.records
+        if "MCP OAuth callback did not connect" in record.getMessage()
+    ]
+    assert records == [
+        "MCP OAuth callback did not connect: "
+        f"server_id={server.id} reason=provider_error provider_error=access_denied"
+    ]
+    assert "provider-refusal-state" not in caplog.text
+    assert db.query(MCPOAuthGrant).count() == 0
+    assert db.query(MCPOAuthFlowState).one().consumed_at is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_error", "expected"),
+    [
+        ("temporarily_unavailable", "temporarily_unavailable"),
+        ("invalid_scope", "invalid_scope"),
+        ("access denied", "unknown_error"),
+        ("<script>", "unknown_error"),
+        ("a" * 65, "unknown_error"),
+    ],
+)
+async def test_callback_forwards_only_code_shaped_provider_errors(
+    db_session, monkeypatch, caplog, raw_error, expected
+):
+    db, user, _ = db_session
+    _add_callback_client_and_state(db, user, state="provider-code-state")
+
+    async def fail_exchange(**kwargs):
+        pytest.fail("token exchange must not run for authorization error callbacks")
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fail_exchange)
+
+    with caplog.at_level("WARNING", logger=mcp_api.logger.name):
+        response = await mcp_oauth_callback(
+            _request(
+                "/api/mcp/oauth/callback?"
+                + urlencode({"error": raw_error, "state": "provider-code-state"})
+            ),
+            db,
+        )
+
+    query = _redirect_query(response)
+    assert query["mcp_oauth_error"] == ["provider_error"]
+    assert query["mcp_oauth_provider_error"] == [expected]
+    assert f"provider_error={expected}" in caplog.text
+    if expected == "unknown_error":
+        assert raw_error not in response.headers["location"]
+        assert raw_error not in caplog.text
 
 
 @pytest.mark.asyncio

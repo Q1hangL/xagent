@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import secrets
 import shlex
 import weakref
@@ -678,6 +679,22 @@ def _redirect_after_with_params(
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
 
 
+# A provider's error redirect names its error with a short ASCII code (RFC 6749
+# section 4.1.2.1). Only a value of that shape is passed on or logged.
+_MCP_OAUTH_PROVIDER_ERROR_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+
+
+def _mcp_oauth_provider_error_code(value: str) -> str:
+    """Return the provider's ``error`` when it is code-shaped, else a fallback.
+
+    The provider's free-text ``error_description`` is never read, shown or
+    logged.
+    """
+    if _MCP_OAUTH_PROVIDER_ERROR_RE.fullmatch(value):
+        return value
+    return "unknown_error"
+
+
 def _mcp_oauth_callback_error_redirect(
     flow_state: MCPOAuthFlowState,
     *,
@@ -699,17 +716,18 @@ def _mcp_oauth_callback_error_redirect_for_path(
     *,
     error_code: str,
     message: str,
+    provider_error: str | None = None,
 ) -> RedirectResponse:
-    redirect_path = _redirect_after_with_params(
-        raw_redirect_after,
+    params: tuple[tuple[str, str], ...] = (
+        ("mcp_oauth_error", error_code),
         (
-            ("mcp_oauth_error", error_code),
-            (
-                "mcp_oauth_error_message",
-                oauth_error_message(message, "MCP OAuth authorization failed"),
-            ),
+            "mcp_oauth_error_message",
+            oauth_error_message(message, "MCP OAuth authorization failed"),
         ),
     )
+    if provider_error is not None:
+        params += (("mcp_oauth_provider_error", provider_error),)
+    redirect_path = _redirect_after_with_params(raw_redirect_after, params)
     response = RedirectResponse(_mcp_oauth_redirect_after_url(redirect_path))
     _clear_mcp_oauth_state_cookie(response)
     return response
@@ -6004,12 +6022,24 @@ async def mcp_oauth_callback(
             message=message,
         )
     if error:
+        # The provider refused or failed the authorization before any token
+        # exchange, so report it as the provider's error rather than as a
+        # failed exchange. The redirect carries the code so the page that
+        # receives it can explain it.
+        provider_error = _mcp_oauth_provider_error_code(error)
+        logger.warning(
+            "MCP OAuth callback did not connect: server_id=%s reason=provider_error "
+            "provider_error=%s",
+            flow_identity.server_id,
+            provider_error,
+        )
         return _mcp_oauth_callback_error_redirect_for_path(
             callback_redirect_after,
-            error_code="token_exchange_failed",
-            message=oauth_error_message(
-                {"error": error}, "MCP OAuth authorization failed"
+            error_code="provider_error",
+            message=(
+                f"The provider did not authorize the connection ({provider_error})."
             ),
+            provider_error=provider_error,
         )
     if not code:
         return _mcp_oauth_callback_error_redirect_for_path(
