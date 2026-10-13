@@ -460,3 +460,75 @@ def test_callback_takes_the_atlassian_required_scope_from_its_auth():
         mcp_api._explicit_mcp_oauth_required_scope(server)
         == "email offline_access read:account read:me"
     )
+
+
+# A required_scope made only of whitespace or empty entries names no scope.
+BLANK_REQUIRED_SCOPES = (
+    pytest.param([" "], id="blank-entry"),
+    pytest.param(["", " "], id="empty-and-blank-entries"),
+    pytest.param("  ", id="blank-string"),
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("required_scope", BLANK_REQUIRED_SCOPES)
+async def test_callback_refuses_a_grant_when_required_scope_names_no_scope(
+    db_session, monkeypatch, required_scope
+):
+    """Such a required_scope would let any grant through, so the callback
+    reports the configuration and stores nothing."""
+    db, user = db_session
+    _add_flow(
+        db,
+        user,
+        {**_atlassian_auth(), "required_scope": required_scope},
+        state="state-blank",
+        requested_scope=ATLASSIAN_MCP_OAUTH_SCOPE,
+    )
+    revoked = _token_response(monkeypatch, {**ISSUED_TOKENS, "scope": "unrelated"})
+
+    response = await mcp_oauth_callback(_callback_request("state-blank"), db)
+
+    assert _redirect_query(response)["mcp_oauth_error"] == ["invalid_configuration"]
+    assert db.query(MCPOAuthGrant).count() == 0
+    assert len(revoked) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("required_scope", BLANK_REQUIRED_SCOPES)
+async def test_connect_rejects_a_required_scope_that_names_no_scope(
+    db_session, monkeypatch, required_scope
+):
+    db, user = db_session
+    server = _add_server(
+        db, user, {**_atlassian_auth(), "required_scope": required_scope}
+    )
+
+    async def unexpected_discovery(*_args, **_kwargs):
+        raise AssertionError("discovery must not run for an invalid configuration")
+
+    monkeypatch.setattr(mcp_api, "_discover_mcp_oauth_for_server", unexpected_discovery)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await connect_mcp_oauth(
+            server.id,
+            MCPOAuthConnectRequest(redirect_after="/tools"),
+            user,
+            db,
+            "application/json",
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == {
+        "code": "invalid_configuration",
+        "message": "MCP OAuth required_scope must name at least one scope",
+    }
+    assert db.query(MCPOAuthFlowState).count() == 0
+
+
+def test_callback_ignores_blank_entries_beside_a_required_scope():
+    server = SimpleNamespace(
+        auth={**_atlassian_auth(), "required_scope": ["read:me", " ", ""]}
+    )
+
+    assert mcp_api._explicit_mcp_oauth_required_scope(server) == "read:me"

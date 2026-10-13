@@ -727,3 +727,141 @@ async def test_runtime_diagnostic_names_the_requested_scope_when_required_scope_
     # The required scope cannot be worked out, so the diagnostic names the
     # scope the configuration requests.
     assert build.diagnostic["scope"] == ATLASSIAN_MCP_OAUTH_SCOPE
+
+
+# --- blank entries in required_scope -----------------------------------------
+
+# Whitespace and empty entries name no scope, in a list as in a string. A
+# required_scope made only of them would require nothing, so it is rejected
+# like an empty one. JSON values only: each one is stored on a server row.
+BLANK_REQUIRED_SCOPES = (
+    pytest.param([" "], id="blank-entry"),
+    pytest.param(["", " "], id="empty-and-blank-entries"),
+    pytest.param(["\t", " \n "], id="whitespace-entries"),
+    pytest.param("  ", id="blank-string"),
+)
+
+
+@pytest.mark.parametrize(
+    "required_scope",
+    [*BLANK_REQUIRED_SCOPES, pytest.param((" ",), id="blank-tuple-entry")],
+)
+def test_a_required_scope_of_only_blank_entries_names_no_scope(required_scope):
+    auth = {
+        "type": "mcp_oauth",
+        "scope": "records.read",
+        "required_scope": required_scope,
+    }
+
+    with pytest.raises(MCPOAuthDiscoveryError) as exc_info:
+        mcp_oauth_required_scope(auth)
+
+    assert exc_info.value.code == "invalid_configuration"
+    assert exc_info.value.message == (
+        "MCP OAuth required_scope must name at least one scope"
+    )
+
+
+@pytest.mark.parametrize("required_scope", BLANK_REQUIRED_SCOPES)
+def test_a_required_scope_of_only_blank_entries_makes_no_grant_usable(
+    db_session, required_scope
+):
+    db, user = db_session
+    auth = {**_atlassian_auth(), "required_scope": required_scope}
+    server = _add_server(db, user, auth)
+    _add_grant(db, server=server, user=user, scope="unrelated")
+
+    assert _select(db, server, user, auth) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("required_scope", BLANK_REQUIRED_SCOPES)
+async def test_runtime_reports_a_required_scope_of_only_blank_entries(
+    db_session, required_scope
+):
+    db, user = db_session
+    auth = {**_atlassian_auth(), "required_scope": required_scope}
+    server = _add_server(db, user, auth)
+    _add_grant(db, server=server, user=user, scope="unrelated")
+
+    with pytest.raises(MCPOAuthRuntimeError) as exc_info:
+        await _resolve(db, server, user, auth)
+
+    assert exc_info.value.code == "invalid_configuration"
+    assert exc_info.value.message == (
+        "MCP OAuth required_scope must name at least one scope"
+    )
+
+
+@pytest.mark.parametrize(
+    ("required_scope", "expected"),
+    [
+        (["read:me", " "], "read:me"),
+        (["", "read:me"], "read:me"),
+        ([" read:me ", "\temail"], "email read:me"),
+        ((" read:me", "email "), "email read:me"),
+        (" read:me \t email ", "email read:me"),
+    ],
+    ids=(
+        "blank-entry-after",
+        "empty-entry-before",
+        "padded-entries",
+        "padded-tuple-entries",
+        "padded-string",
+    ),
+)
+def test_blank_entries_next_to_a_scope_are_ignored(required_scope, expected):
+    """A blank entry beside real scopes is dropped and the real scopes stay
+    required, as whitespace around the scopes of a string always was."""
+    auth = {**_atlassian_auth(), "required_scope": required_scope}
+
+    assert mcp_oauth_required_scope(auth) == expected
+
+
+def test_a_blank_entry_next_to_a_scope_still_requires_that_scope(db_session):
+    db, user = db_session
+    auth = {**_atlassian_auth(), "required_scope": ["read:me", " "]}
+    server = _add_server(db, user, auth)
+    _add_grant(db, server=server, user=user, scope="email read:account")
+
+    assert _select(db, server, user, auth) == []
+
+    grant = _add_grant(
+        db,
+        server=server,
+        user=user,
+        scope="read:me",
+        access_token="read-me-access-token",
+    )
+    assert [selected.id for selected in _select(db, server, user, auth)] == [grant.id]
+
+
+@pytest.mark.parametrize(
+    ("required_scope", "expected"),
+    [
+        ("read:me", "read:me"),
+        ("read:me email", "email read:me"),
+        (["read:me"], "read:me"),
+        (["read:me", "email"], "email read:me"),
+        (["read:me", "read:me"], "read:me"),
+        (("read:me", "email"), "email read:me"),
+        ({"read:me", "email"}, "email read:me"),
+        (ATLASSIAN_MCP_OAUTH_REQUIRED_SCOPE, ATLASSIAN_MCP_OAUTH_REQUIRED_SCOPE),
+    ],
+    ids=(
+        "one-scope",
+        "string",
+        "one-entry",
+        "list",
+        "repeated-entry",
+        "tuple",
+        "set",
+        "atlassian",
+    ),
+)
+def test_a_valid_required_scope_is_returned_as_before(required_scope, expected):
+    """Ignoring blank entries changes nothing for a required_scope without
+    them: the same sorted, space-separated scopes come back."""
+    auth = {**_atlassian_auth(), "required_scope": required_scope}
+
+    assert mcp_oauth_required_scope(auth) == expected

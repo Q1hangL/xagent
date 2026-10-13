@@ -1351,7 +1351,9 @@ def mcp_oauth_required_scope(auth_config: dict[str, Any]) -> Any:
 
     Without ``required_scope`` the whole ``scope`` is required, and this
     returns ``scope`` exactly as configured, so callers normalize it as they
-    always have. With it, the value is normalized like ``scope``.
+    always have. With it, the scopes it names are returned sorted and
+    space-separated. Whitespace and empty entries name no scope, in a list as
+    in a string.
 
     Raises ``MCPOAuthDiscoveryError`` with code ``invalid_configuration`` when
     ``required_scope`` is set but is not a scope string or list, names no
@@ -1363,15 +1365,15 @@ def mcp_oauth_required_scope(auth_config: dict[str, Any]) -> Any:
         return auth_config.get("scope")
     if not isinstance(required_scope, (str, list, tuple, set)):
         raise _invalid_required_scope("must be a scope string or a list of scopes")
-    normalized_required_scope = _normalize_scope(required_scope)
-    if not normalized_required_scope:
+    required_scopes = _scope_set(required_scope)
+    if not required_scopes:
         raise _invalid_required_scope("must name at least one scope")
     requested_scopes = _scope_set(auth_config.get("scope"))
     if not requested_scopes:
         raise _invalid_required_scope("needs an explicit scope")
-    if not set(normalized_required_scope.split()).issubset(requested_scopes):
+    if not required_scopes.issubset(requested_scopes):
         raise _invalid_required_scope("must only name scopes that scope requests")
-    return normalized_required_scope
+    return " ".join(sorted(required_scopes))
 
 
 def _invalid_required_scope(reason: str) -> MCPOAuthDiscoveryError:
