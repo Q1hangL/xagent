@@ -258,17 +258,47 @@ def test_upgrade_raises_when_launch_config_column_is_missing(tmp_path):
         assert APP_ID not in _app_ids(connection)
 
 
-def test_seed_row_matches_registry():
-    """The migration snapshot and the runtime registry must define the same
-    row (the migration is a frozen copy; this catches drift)."""
+def test_seed_row_matches_registry_apart_from_the_later_scope():
+    """The migration is a frozen copy of the registry row. The registry has
+    since pinned launch_config.auth.scope (20261013_atlassian_mcp_scope), so
+    everything except that auth must still match; this catches other drift."""
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 
     migration = _load_migration()
     registry_row = next(
         r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == APP_ID
     )
-    assert migration.ROW == registry_row
+    seed_launch = dict(migration.ROW["launch_config"])
+    registry_launch = dict(registry_row["launch_config"])
+    seed_auth = seed_launch.pop("auth")
+    registry_auth = dict(registry_launch.pop("auth"))
+    assert {**migration.ROW, "launch_config": seed_launch} == {
+        **registry_row,
+        "launch_config": registry_launch,
+    }
+    assert registry_auth.pop("scope")
+    assert seed_auth == registry_auth
     assert registry_row["is_visible_in_connector"] is True
+
+
+def test_seed_row_is_the_shape_the_scope_migration_migrates_from():
+    """The scope migration must recognize exactly what this seeded, or it
+    would leave a seeded database on the old auth."""
+    scope_migration_path = (
+        Path(__file__).parents[2]
+        / "src/xagent/migrations/versions/20261013_atlassian_mcp_scope.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "atlassian_scope_migration", scope_migration_path
+    )
+    assert spec is not None
+    scope_migration = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(scope_migration)
+
+    migration = _load_migration()
+    assert migration.ROW["launch_config"] == scope_migration.LEGACY_LAUNCH_CONFIG
+    assert migration.ROW["launch_config"]["auth"] == scope_migration.LEGACY_AUTH
 
 
 def test_seed_row_classifies_as_mcp_oauth():
