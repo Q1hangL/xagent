@@ -6,7 +6,7 @@ import threading
 import time
 from datetime import timedelta
 from types import SimpleNamespace
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, unquote_plus, urlencode, urlparse
 from uuid import uuid4
 
 import httpx
@@ -4295,7 +4295,7 @@ async def test_callback_forwards_only_code_shaped_provider_errors(
     assert query["mcp_oauth_provider_error"] == [expected]
     assert f"provider_error={expected}" in caplog.text
     if expected == "unknown_error":
-        assert raw_error not in response.headers["location"]
+        assert raw_error not in unquote_plus(response.headers["location"])
         assert raw_error not in caplog.text
 
 

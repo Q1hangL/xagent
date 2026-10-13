@@ -453,6 +453,56 @@ def test_upgrade_skips_servers_when_the_server_table_lacks_identity_columns(
         assert _server_ids(connection, servers) == {1}
 
 
+def test_upgrade_deletes_no_server_when_ownership_cannot_be_checked(tmp_path):
+    """Fail closed: without user_mcpservers.is_owner a user-owned server
+    cannot be told apart from the catalog row."""
+    migration = _load_migration()
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    metadata = MetaData()
+    apps = Table(
+        "public_mcp_apps",
+        metadata,
+        Column("app_id", String, primary_key=True),
+        Column("launch_config", JSON),
+    )
+    servers = Table(
+        "mcp_servers",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("name", String),
+        Column("transport", String),
+        Column("url", String),
+        Column("auth", JSON),
+    )
+    Table(
+        "user_mcpservers",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("mcpserver_id", Integer),
+    )
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            apps.insert().values(
+                app_id="atlassian", launch_config=migration.LEGACY_LAUNCH_CONFIG
+            )
+        )
+        connection.execute(
+            servers.insert().values(
+                id=1,
+                name="atlassian",
+                transport="streamable_http",
+                url=migration.SERVER_URL,
+                auth=migration.LEGACY_AUTH,
+            )
+        )
+
+        _run(connection, migration, "upgrade")
+
+        assert _launch_config(connection, apps) == migration.SCOPED_LAUNCH_CONFIG
+        assert _server_ids(connection, servers) == {1}
+
+
 def test_scoped_launch_config_matches_the_registry():
     """The migration holds a frozen copy of the catalog value; this catches
     drift between the two."""

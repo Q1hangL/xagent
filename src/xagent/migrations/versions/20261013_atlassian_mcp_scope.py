@@ -15,7 +15,9 @@ old auth, which the canonical-definition check rejects, so it is deleted
 together with its OAuth flow states, grants, client registrations and user
 links, as the HubSpot and Zendesk switches did. The next connect recreates the
 row from the catalog and registers a fresh client. Users who had connected
-Atlassian must connect again.
+Atlassian must connect again. Rows in other tables that reference the deleted
+server with ON DELETE CASCADE are removed with it on databases that enforce
+foreign keys.
 """
 
 from typing import Any, Sequence, Union
@@ -143,15 +145,13 @@ def _delete_catalog_servers_with_auth(
     ignored, as the canonical-definition check ignores it) and has no owning
     user link. A user-created server under the same name has an owner, and a
     server with other auth keys (a client id, another scope) is a custom
-    OAuth configuration; neither is touched.
+    OAuth configuration; neither is touched. Without the columns that prove
+    either, nothing is deleted.
     """
     if not {"id", "name", "transport", "url", "auth"}.issubset(
         _columns(bind, "mcp_servers")
-    ):
+    ) or not {"mcpserver_id", "is_owner"}.issubset(_columns(bind, "user_mcpservers")):
         return
-    ownership_known = {"mcpserver_id", "is_owner"}.issubset(
-        _columns(bind, "user_mcpservers")
-    )
     rows = (
         bind.execute(
             sa.select(
@@ -178,15 +178,14 @@ def _delete_catalog_servers_with_auth(
         ):
             continue
         server_id = int(row["id"])
-        if ownership_known:
-            owned = bind.execute(
-                sa.select(USER_MCPSERVERS.c.mcpserver_id).where(
-                    USER_MCPSERVERS.c.mcpserver_id == server_id,
-                    USER_MCPSERVERS.c.is_owner.is_(True),
-                )
-            ).first()
-            if owned is not None:
-                continue
+        owned = bind.execute(
+            sa.select(USER_MCPSERVERS.c.mcpserver_id).where(
+                USER_MCPSERVERS.c.mcpserver_id == server_id,
+                USER_MCPSERVERS.c.is_owner.is_(True),
+            )
+        ).first()
+        if owned is not None:
+            continue
         # Be explicit for SQLite deployments where migration connections may
         # not have foreign-key cascade enforcement enabled.
         for table_name, server_column in SERVER_CHILD_TABLES:
