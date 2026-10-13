@@ -531,3 +531,199 @@ async def test_runtime_diagnostic_names_the_scope_a_grant_had_to_cover(
     assert build.diagnostic is not None
     assert build.diagnostic["code"] == "insufficient_scope"
     assert build.diagnostic["scope"] == expected_scope
+
+
+# --- why a required_scope is invalid -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("auth", "reason"),
+    [
+        (
+            {"scope": "records.read", "required_scope": 7},
+            "must be a scope string or a list of scopes",
+        ),
+        (
+            {"scope": "records.read", "required_scope": True},
+            "must be a scope string or a list of scopes",
+        ),
+        (
+            {"scope": "records.read", "required_scope": {"records.read": True}},
+            "must be a scope string or a list of scopes",
+        ),
+        (
+            {"scope": "records.read", "required_scope": ""},
+            "must name at least one scope",
+        ),
+        (
+            {"scope": "records.read", "required_scope": "   "},
+            "must name at least one scope",
+        ),
+        (
+            {"scope": "records.read", "required_scope": []},
+            "must name at least one scope",
+        ),
+        ({"required_scope": "records.read"}, "needs an explicit scope"),
+        ({"scope": "", "required_scope": "records.read"}, "needs an explicit scope"),
+        ({"scope": [], "required_scope": "records.read"}, "needs an explicit scope"),
+        (
+            {"scope": "records.read", "required_scope": "records.read records.write"},
+            "must only name scopes that scope requests",
+        ),
+        (
+            {"scope": "records.read", "required_scope": "admin"},
+            "must only name scopes that scope requests",
+        ),
+    ],
+    ids=(
+        "number",
+        "boolean",
+        "object",
+        "empty-string",
+        "blank-string",
+        "empty-list",
+        "no-scope",
+        "empty-scope",
+        "empty-scope-list",
+        "not-a-subset",
+        "unrequested-scope",
+    ),
+)
+def test_an_invalid_required_scope_reports_why(auth, reason):
+    """Each check reports its own reason, so an administrator can tell which
+    part of the configuration to fix."""
+    with pytest.raises(MCPOAuthDiscoveryError) as exc_info:
+        mcp_oauth_required_scope({"type": "mcp_oauth", **auth})
+
+    assert exc_info.value.code == "invalid_configuration"
+    assert exc_info.value.message == f"MCP OAuth required_scope {reason}"
+
+
+# --- a scope the caller names ------------------------------------------------
+
+
+def _unexpired() -> datetime:
+    return datetime.now(timezone.utc) + timedelta(hours=1)
+
+
+def test_selection_holds_an_explicit_scope_instead_of_required_scope(db_session):
+    db, user = db_session
+    auth = _atlassian_auth()
+    server = _add_server(db, user, auth)
+    grant = _add_grant(db, server=server, user=user, scope=_scope_without("email"))
+
+    def select(scope: str) -> list:
+        return select_mcp_oauth_grants(
+            db,
+            server_id=server.id,
+            user_id=user.id,
+            auth_config=auth,
+            resource_owner_key=ACTOR_OWNER,
+            scope=scope,
+        )
+
+    # The grant lacks a basic identity scope, so required_scope rejects it ...
+    assert _select(db, server, user, auth) == []
+    # ... but a caller naming a scope is held to that scope only, both when it
+    # asks for less than required_scope and when it asks for more.
+    assert [selected.id for selected in select("read:me")] == [grant.id]
+    assert select(ATLASSIAN_MCP_OAUTH_SCOPE) == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_holds_an_explicit_scope_instead_of_required_scope(db_session):
+    """A caller that names the scope it needs is held to that scope, not to
+    the configured required_scope, as before required_scope existed."""
+    db, user = db_session
+    auth = _atlassian_auth()
+    server = _add_server(db, user, auth)
+    grant = _add_grant(
+        db,
+        server=server,
+        user=user,
+        scope=GRANTED_WITHOUT_BITBUCKET,
+        expires_at=_unexpired(),
+    )
+
+    # The grant covers required_scope ...
+    assert (await _resolve(db, server, user, auth)).grant_id == grant.id
+    # ... but not a caller's explicit request for the whole subset.
+    with pytest.raises(MCPOAuthRuntimeError) as exc_info:
+        await _resolve(db, server, user, auth, scope=ATLASSIAN_MCP_OAUTH_SCOPE)
+    assert exc_info.value.code == "insufficient_scope"
+
+
+@pytest.mark.asyncio
+async def test_runtime_accepts_an_explicit_scope_narrower_than_required_scope(
+    db_session,
+):
+    db, user = db_session
+    auth = _atlassian_auth()
+    server = _add_server(db, user, auth)
+    grant = _add_grant(
+        db,
+        server=server,
+        user=user,
+        scope=_scope_without("email"),
+        expires_at=_unexpired(),
+    )
+
+    with pytest.raises(MCPOAuthRuntimeError) as exc_info:
+        await _resolve(db, server, user, auth)
+    assert exc_info.value.code == "insufficient_scope"
+
+    runtime_auth = await _resolve(db, server, user, auth, scope="read:me")
+    assert runtime_auth.grant_id == grant.id
+    assert runtime_auth.access_token == "granted-access-token"
+
+
+@pytest.mark.asyncio
+async def test_runtime_connection_holds_a_selection_to_its_own_scope(db_session):
+    db, user = db_session
+    auth = _atlassian_auth()
+    server = _add_server(db, user, auth)
+    _add_grant(db, server=server, user=user, scope=GRANTED_WITHOUT_BITBUCKET)
+
+    build = await build_mcp_runtime_connection(
+        db,
+        server,
+        user_id=user.id,
+        mcp_auth_context={
+            str(server.id): {
+                "resource_owner_key": ACTOR_OWNER,
+                "scope": ATLASSIAN_MCP_OAUTH_SCOPE,
+            }
+        },
+    )
+
+    assert build.connection is None
+    assert build.diagnostic is not None
+    assert build.diagnostic["code"] == "insufficient_scope"
+    assert build.diagnostic["scope"] == ATLASSIAN_MCP_OAUTH_SCOPE
+
+
+@pytest.mark.asyncio
+async def test_runtime_diagnostic_names_the_requested_scope_when_required_scope_is_invalid(
+    db_session,
+):
+    db, user = db_session
+    auth = {**_atlassian_auth(), "required_scope": "read:me manage:jira-configuration"}
+    server = _add_server(db, user, auth)
+    _add_grant(db, server=server, user=user, scope=ATLASSIAN_MCP_OAUTH_SCOPE)
+
+    build = await build_mcp_runtime_connection(
+        db,
+        server,
+        user_id=user.id,
+        mcp_auth_context={str(server.id): {"resource_owner_key": ACTOR_OWNER}},
+    )
+
+    assert build.connection is None
+    assert build.diagnostic is not None
+    assert build.diagnostic["code"] == "invalid_configuration"
+    assert build.diagnostic["message"] == (
+        "MCP OAuth required_scope must only name scopes that scope requests"
+    )
+    # The required scope cannot be worked out, so the diagnostic names the
+    # scope the configuration requests.
+    assert build.diagnostic["scope"] == ATLASSIAN_MCP_OAUTH_SCOPE
