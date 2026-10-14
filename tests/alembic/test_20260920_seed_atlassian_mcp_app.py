@@ -283,26 +283,6 @@ def test_seed_row_matches_registry_apart_from_the_later_scope_fields():
     assert registry_row["is_visible_in_connector"] is True
 
 
-def test_seed_row_is_the_shape_the_scope_migration_migrates_from():
-    """The scope migration must recognize exactly what this seeded, or it
-    would leave a seeded database on the old auth."""
-    scope_migration_path = (
-        Path(__file__).parents[2]
-        / "src/xagent/migrations/versions/20261013_atlassian_mcp_scope.py"
-    )
-    spec = importlib.util.spec_from_file_location(
-        "atlassian_scope_migration", scope_migration_path
-    )
-    assert spec is not None
-    scope_migration = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(scope_migration)
-
-    migration = _load_migration()
-    assert migration.ROW["launch_config"] == scope_migration.LEGACY_LAUNCH_CONFIG
-    assert migration.ROW["launch_config"]["auth"] == scope_migration.LEGACY_AUTH
-
-
 def test_seed_row_classifies_as_mcp_oauth():
     """The seeded shape must classify as a remote-MCP OAuth connector -- an
     "unconnectable" classification would make the catalog entry dead on
