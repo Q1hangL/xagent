@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from datetime import timedelta
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -601,3 +602,28 @@ async def test_runtime_refreshing_a_replaced_grant_moves_to_the_new_grant(
     assert runtime_auth.grant_id == int(grant.id) != earlier_id
     assert runtime_auth.access_token == "issued-access-token"
     assert runtime_auth.refreshed is False
+
+
+@pytest.mark.parametrize(
+    ("auth", "selected_scope"),
+    (
+        pytest.param(AUTH, REQUIRED, id="required-scope"),
+        pytest.param(
+            {"type": "mcp_oauth", "scope": "records.write records.read"},
+            NARROW,
+            id="whole-scope",
+        ),
+        pytest.param(
+            {"type": "mcp_oauth", "scope": ["records.write", "records.read"]},
+            NARROW,
+            id="whole-scope-list",
+        ),
+        pytest.param({"type": "mcp_oauth"}, "", id="no-scope"),
+        pytest.param({"type": "oauth", "scope": FULL}, "", id="another-auth-type"),
+        pytest.param(None, "", id="no-auth"),
+    ),
+)
+def test_the_scope_a_new_grant_must_cover_to_replace_others(auth, selected_scope):
+    server = SimpleNamespace(auth=auth)
+
+    assert mcp_api._mcp_oauth_selected_scope(server) == selected_scope
