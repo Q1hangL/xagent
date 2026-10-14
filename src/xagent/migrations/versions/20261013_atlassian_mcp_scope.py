@@ -14,25 +14,26 @@ must include. Atlassian grants product scopes only for the products the
 consenting account's site has, so a grant is usable without, for example, the
 Bitbucket scopes.
 
-The shared ``atlassian`` server row the connect path created still carries the
-old auth, which the canonical-definition check rejects, so it is deleted
-together with its OAuth flow states, grants, client registrations and user
-links, as the HubSpot and Zendesk switches did. The next connect recreates the
-row from the catalog and registers a fresh client. Users who had connected
-Atlassian must connect again.
+The shared ``atlassian`` server row the connect path created still carries
+the old auth, which the canonical-definition check rejects, so the connector
+would stay unavailable there until someone connected again. Only the two
+scope keys change, so this migration sets that row's ``auth`` to the scoped
+value in place. The row keeps its id, its policy fields (headers, env,
+timeout, managed and the like), its user links, client registrations and
+grants. A grant that covers ``required_scope`` stays usable; a user whose
+grant does not must connect again, as after any scope change.
 
-- The row is deleted even when an administrator has since edited its policy
-  fields (headers, env, timeout, managed and the like); those edits go with
-  it. Under the old auth the actor projection rejects that row anyway, so
-  keeping it would keep the connector unavailable there, and a row whose
-  ``managed`` value was changed could never be repaired by a later connect.
-- Rows in other tables that reference the deleted server are not handled
-  here. PostgreSQL removes them through their ON DELETE CASCADE foreign keys.
-  On SQLite the startup migration runner turns foreign keys off and rejects
-  any new violation, so such rows must be removed before upgrading.
-- Downgrade is symmetric: it restores the previous catalog value and deletes
-  the server row recreated under the scoped auth, which disconnects users
-  who connected after the upgrade.
+- Only the row the catalog connect path writes is updated: named after the
+  app id, with the catalog transport and URL, ``auth`` exactly the previous
+  catalog value (an ``app_id`` key some rows carry is ignored and kept) and
+  no owning user link. A user-created server under the same name and a
+  server with other auth keys (a client id, another scope) are left alone,
+  and so is every row when the columns that tell them apart are missing.
+- A row an administrator edited keeps those edits. The canonical-definition
+  check still rejects one whose ``managed`` value was changed, as before.
+- Downgrade is symmetric: it restores the previous catalog value and sets
+  ``auth`` back on rows that carry exactly the scoped auth. Neither
+  direction deletes anything.
 """
 
 from typing import Any, Sequence, Union
@@ -100,13 +101,6 @@ USER_MCPSERVERS = sa.table(
     "user_mcpservers",
     sa.column("mcpserver_id", sa.Integer),
     sa.column("is_owner", sa.Boolean),
-)
-# Every table whose rows belong to one mcp_servers row.
-SERVER_CHILD_TABLES = (
-    ("mcp_oauth_flow_states", "mcp_server_id"),
-    ("mcp_oauth_grants", "mcp_server_id"),
-    ("mcp_oauth_clients", "mcp_server_id"),
-    ("user_mcpservers", "mcpserver_id"),
 )
 
 
@@ -189,31 +183,22 @@ def _has_owning_user(bind: sa.engine.Connection, server_id: int) -> bool:
     return owned is not None
 
 
-def _delete_server_and_dependents(bind: sa.engine.Connection, server_id: int) -> None:
-    # Be explicit for SQLite deployments where migration connections may
-    # not have foreign-key cascade enforcement enabled.
-    for table_name, server_column in SERVER_CHILD_TABLES:
-        if server_column not in _columns(bind, table_name):
-            continue
-        child = sa.table(table_name, sa.column(server_column, sa.Integer))
-        bind.execute(sa.delete(child).where(child.c[server_column] == server_id))
-    bind.execute(sa.delete(MCP_SERVERS).where(MCP_SERVERS.c.id == server_id))
-
-
-def _delete_catalog_servers_with_auth(
-    bind: sa.engine.Connection, auth: dict[str, Any]
+def _replace_catalog_server_auth(
+    bind: sa.engine.Connection,
+    old_auth: dict[str, Any],
+    new_auth: dict[str, Any],
 ) -> None:
-    """Delete the shared server row the catalog connect path created.
+    """Set ``auth`` to ``new_auth`` on the shared server row the catalog
+    connect path created under ``old_auth``.
 
     That row is named after the app id, uses the catalog transport and URL,
-    stores exactly the catalog auth (an ``app_id`` key some rows carry is
-    ignored, as the canonical-definition check ignores it) and has no owning
-    user link. A user-created server under the same name has an owner, and a
-    server with other auth keys (a client id, another scope) is a custom
+    stores exactly ``old_auth`` (an ``app_id`` key some rows carry is ignored,
+    as the canonical-definition check ignores it, and is kept) and has no
+    owning user link. A user-created server under the same name has an owner,
+    and a server with other auth keys (a client id, another scope) is a custom
     OAuth configuration; neither is touched. Without the columns that prove
-    either, nothing is deleted. Policy columns are deliberately not compared:
-    an administrator's edits to the catalog row are deleted with it (see the
-    module docstring).
+    either, nothing is updated. Only ``auth`` is written: the row id, policy
+    columns and every row that references the server stay as they are.
     """
     if not _has_identifying_columns(bind):
         return
@@ -230,23 +215,30 @@ def _delete_catalog_servers_with_auth(
         .all()
     )
     for row in rows:
-        if not _matches_catalog_definition(row, auth):
+        if not _matches_catalog_definition(row, old_auth):
             continue
         server_id = int(row["id"])
         if _has_owning_user(bind, server_id):
             continue
-        _delete_server_and_dependents(bind, server_id)
+        updated_auth = dict(new_auth)
+        if "app_id" in row["auth"]:
+            updated_auth["app_id"] = row["auth"]["app_id"]
+        bind.execute(
+            sa.update(MCP_SERVERS)
+            .where(MCP_SERVERS.c.id == server_id)
+            .values(auth=updated_auth)
+        )
 
 
 def upgrade() -> None:
     bind = op.get_bind()
     if not _set_owned_launch_config(bind, SCOPED_LAUNCH_CONFIG):
         return
-    _delete_catalog_servers_with_auth(bind, LEGACY_AUTH)
+    _replace_catalog_server_auth(bind, LEGACY_AUTH, SCOPED_AUTH)
 
 
 def downgrade() -> None:
     bind = op.get_bind()
     if not _set_owned_launch_config(bind, LEGACY_LAUNCH_CONFIG):
         return
-    _delete_catalog_servers_with_auth(bind, SCOPED_AUTH)
+    _replace_catalog_server_auth(bind, SCOPED_AUTH, LEGACY_AUTH)

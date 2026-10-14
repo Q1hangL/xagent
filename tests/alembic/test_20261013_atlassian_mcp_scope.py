@@ -693,3 +693,431 @@ def test_upgrade_deletes_dependents_only_where_a_table_links_the_server(tmp_path
                 select(func.count()).select_from(table)
             ).scalar_one()
             assert count == expected, table.name
+
+
+# --- the shared row's auth is updated in place --------------------------------
+
+
+def _server_auth(connection, servers, server_id):
+    return connection.execute(
+        select(servers.c.auth).where(servers.c.id == server_id)
+    ).scalar_one()
+
+
+def _row_counts(connection, metadata):
+    return {
+        name: connection.execute(select(func.count()).select_from(table)).scalar_one()
+        for name, table in metadata.tables.items()
+    }
+
+
+def test_upgrade_updates_the_shared_server_auth_in_place(tmp_path):
+    migration = _load_migration()
+    engine, metadata, apps, servers, links = _setup(tmp_path, migration)
+    with engine.begin() as connection:
+        _add_server(
+            connection,
+            metadata,
+            servers,
+            links,
+            server_id=1,
+            auth=migration.LEGACY_AUTH,
+        )
+        _add_server(
+            connection,
+            metadata,
+            servers,
+            links,
+            server_id=2,
+            name="unrelated",
+            url="https://mcp.example.com/mcp",
+            auth={"type": "mcp_oauth"},
+        )
+        counts_before = _row_counts(connection, metadata)
+
+        _run(connection, migration, "upgrade")
+
+        assert _launch_config(connection, apps) == migration.SCOPED_LAUNCH_CONFIG
+        # Same row, same id: only its auth changed, and nothing was deleted.
+        assert _server_ids(connection, servers) == {1, 2}
+        assert _server_auth(connection, servers, 1) == migration.SCOPED_AUTH
+        assert _server_auth(connection, servers, 2) == {"type": "mcp_oauth"}
+        assert _child_count(connection, metadata, 1) == 4
+        assert _row_counts(connection, metadata) == counts_before
+
+
+def test_upgrade_keeps_the_app_id_key_of_the_shared_server(tmp_path):
+    migration = _load_migration()
+    engine, metadata, _apps, servers, links = _setup(tmp_path, migration)
+    with engine.begin() as connection:
+        _add_server(
+            connection,
+            metadata,
+            servers,
+            links,
+            server_id=1,
+            transport="STREAMABLE_HTTP",
+            auth={**migration.LEGACY_AUTH, "app_id": "atlassian"},
+        )
+
+        _run(connection, migration, "upgrade")
+
+        assert _server_auth(connection, servers, 1) == {
+            **migration.SCOPED_AUTH,
+            "app_id": "atlassian",
+        }
+        assert _child_count(connection, metadata, 1) == 4
+
+
+def test_upgrade_with_an_older_provenance_version_updates_the_shared_server(
+    tmp_path,
+):
+    migration = _load_migration()
+    launch_config = dict(migration.LEGACY_LAUNCH_CONFIG)
+    launch_config["builtin_provenance"] = {
+        **migration.BUILTIN_PROVENANCE,
+        "version": 0,
+    }
+    engine, metadata, apps, servers, links = _setup(
+        tmp_path, migration, launch_config=launch_config
+    )
+    with engine.begin() as connection:
+        _add_server(
+            connection,
+            metadata,
+            servers,
+            links,
+            server_id=1,
+            auth=migration.LEGACY_AUTH,
+        )
+
+        _run(connection, migration, "upgrade")
+
+        assert _launch_config(connection, apps) == migration.SCOPED_LAUNCH_CONFIG
+        assert _server_auth(connection, servers, 1) == migration.SCOPED_AUTH
+
+
+def test_upgrade_leaves_the_auth_of_servers_that_are_not_the_catalog_row(
+    tmp_path,
+):
+    """Only the row the catalog connect path writes is updated: an owned row,
+    a custom OAuth configuration, another name, URL or transport keep their
+    auth."""
+    migration = _load_migration()
+    cases = (
+        ("owner", {"owner": True}, migration.LEGACY_AUTH),
+        ("client", {}, {**migration.LEGACY_AUTH, "client_id": "operator-client"}),
+        ("name", {"name": "Atlassian"}, migration.LEGACY_AUTH),
+        ("url", {"url": "https://evil.example/mcp"}, migration.LEGACY_AUTH),
+        ("transport", {"transport": "sse"}, migration.LEGACY_AUTH),
+    )
+    for case, server_kwargs, auth in cases:
+        case_path = tmp_path / case
+        case_path.mkdir()
+        engine, metadata, _apps, servers, links = _setup(case_path, migration)
+        with engine.begin() as connection:
+            _add_server(
+                connection,
+                metadata,
+                servers,
+                links,
+                server_id=1,
+                auth=auth,
+                **server_kwargs,
+            )
+
+            _run(connection, migration, "upgrade")
+
+            assert _server_auth(connection, servers, 1) == auth, case
+            assert _child_count(connection, metadata, 1) == 4, case
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"headers": {"X-Debug": "1"}},
+        {"timeout": 120},
+        {"env": {"HTTP_PROXY": "http://proxy.internal:3128"}},
+        {"managed": "internal"},
+    ],
+    ids=("headers", "timeout", "env", "managed"),
+)
+def test_upgrade_keeps_an_admin_edit_to_the_shared_server(tmp_path, policy):
+    migration = _load_migration()
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    metadata = MetaData()
+    apps, _servers, links = _schema(metadata)
+    metadata.remove(metadata.tables["mcp_servers"])
+    servers = Table(
+        "mcp_servers",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("name", String, unique=True),
+        Column("transport", String),
+        Column("url", String),
+        Column("auth", JSON),
+        Column("headers", JSON),
+        Column("env", JSON),
+        Column("timeout", Integer),
+        Column("managed", String),
+    )
+    metadata.create_all(engine)
+    row = {
+        "id": 1,
+        "name": "atlassian",
+        "transport": "streamable_http",
+        "url": migration.SERVER_URL,
+        "managed": "external",
+        **policy,
+    }
+    with engine.begin() as connection:
+        connection.execute(
+            apps.insert().values(
+                app_id="atlassian",
+                name="Atlassian (Jira, Confluence, Bitbucket)",
+                transport="streamable_http",
+                launch_config=migration.LEGACY_LAUNCH_CONFIG,
+            )
+        )
+        connection.execute(servers.insert().values(auth=migration.LEGACY_AUTH, **row))
+        connection.execute(
+            links.insert().values(user_id=7, mcpserver_id=1, is_owner=False)
+        )
+
+        _run(connection, migration, "upgrade")
+
+        stored = connection.execute(select(servers)).mappings().one()
+        assert stored["auth"] == migration.SCOPED_AUTH
+        assert {key: stored[key] for key in row} == row
+        assert _child_count(connection, metadata, 1) == 1
+
+
+def test_upgrade_updates_no_server_when_ownership_cannot_be_checked(tmp_path):
+    """Fail closed: without user_mcpservers.is_owner a user-owned server
+    cannot be told apart from the catalog row, so no auth is changed."""
+    migration = _load_migration()
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    metadata = MetaData()
+    apps = Table(
+        "public_mcp_apps",
+        metadata,
+        Column("app_id", String, primary_key=True),
+        Column("launch_config", JSON),
+    )
+    servers = Table(
+        "mcp_servers",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("name", String),
+        Column("transport", String),
+        Column("url", String),
+        Column("auth", JSON),
+    )
+    Table(
+        "user_mcpservers",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("mcpserver_id", Integer),
+    )
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            apps.insert().values(
+                app_id="atlassian", launch_config=migration.LEGACY_LAUNCH_CONFIG
+            )
+        )
+        connection.execute(
+            servers.insert().values(
+                id=1,
+                name="atlassian",
+                transport="streamable_http",
+                url=migration.SERVER_URL,
+                auth=migration.LEGACY_AUTH,
+            )
+        )
+
+        _run(connection, migration, "upgrade")
+
+        assert _launch_config(connection, apps) == migration.SCOPED_LAUNCH_CONFIG
+        assert _server_auth(connection, servers, 1) == migration.LEGACY_AUTH
+
+
+def test_upgrade_updates_the_shared_server_without_the_oauth_tables(tmp_path):
+    """The update touches only mcp_servers, so a database without the OAuth
+    tables is migrated the same way."""
+    migration = _load_migration()
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    metadata = MetaData()
+    apps, servers, links = _schema(metadata)
+    for table_name in CHILD_TABLES:
+        metadata.remove(metadata.tables[table_name])
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            apps.insert().values(
+                app_id="atlassian", launch_config=migration.LEGACY_LAUNCH_CONFIG
+            )
+        )
+        connection.execute(
+            servers.insert().values(
+                id=1,
+                name="atlassian",
+                transport="streamable_http",
+                url=migration.SERVER_URL,
+                auth=migration.LEGACY_AUTH,
+            )
+        )
+        connection.execute(
+            links.insert().values(user_id=7, mcpserver_id=1, is_owner=False)
+        )
+
+        _run(connection, migration, "upgrade")
+
+        assert _server_auth(connection, servers, 1) == migration.SCOPED_AUTH
+        assert (
+            connection.execute(select(func.count()).select_from(links)).scalar_one()
+            == 1
+        )
+
+
+def test_downgrade_sets_the_shared_server_auth_back_in_place(tmp_path):
+    migration = _load_migration()
+    engine, metadata, apps, servers, links = _setup(tmp_path, migration)
+    with engine.begin() as connection:
+        _run(connection, migration, "upgrade")
+        _add_server(
+            connection,
+            metadata,
+            servers,
+            links,
+            server_id=1,
+            auth=migration.SCOPED_AUTH,
+        )
+        _add_server(
+            connection,
+            metadata,
+            servers,
+            links,
+            server_id=2,
+            name="unrelated",
+            url="https://mcp.example.com/mcp",
+            auth=migration.SCOPED_AUTH,
+        )
+        counts_before = _row_counts(connection, metadata)
+
+        _run(connection, migration, "downgrade")
+
+        assert _launch_config(connection, apps) == migration.LEGACY_LAUNCH_CONFIG
+        assert _server_ids(connection, servers) == {1, 2}
+        assert _server_auth(connection, servers, 1) == migration.LEGACY_AUTH
+        assert _server_auth(connection, servers, 2) == migration.SCOPED_AUTH
+        assert _child_count(connection, metadata, 1) == 4
+        assert _row_counts(connection, metadata) == counts_before
+
+
+def test_downgrade_keeps_the_app_id_key_of_the_shared_server(tmp_path):
+    migration = _load_migration()
+    engine, metadata, _apps, servers, links = _setup(tmp_path, migration)
+    with engine.begin() as connection:
+        _run(connection, migration, "upgrade")
+        _add_server(
+            connection,
+            metadata,
+            servers,
+            links,
+            server_id=1,
+            auth={**migration.SCOPED_AUTH, "app_id": "atlassian"},
+        )
+
+        _run(connection, migration, "downgrade")
+
+        assert _server_auth(connection, servers, 1) == {
+            **migration.LEGACY_AUTH,
+            "app_id": "atlassian",
+        }
+
+
+@pytest.mark.parametrize(
+    ("server_kwargs", "auth_changes"),
+    [
+        ({"owner": True}, {}),
+        ({}, {"client_id": "operator-client"}),
+    ],
+    ids=("owner-linked", "extra-client-id"),
+)
+def test_downgrade_leaves_a_scoped_server_that_is_not_the_catalog_row(
+    tmp_path, server_kwargs, auth_changes
+):
+    """An owner-linked row and one with its own client id carry the scoped
+    auth too, but they are not the row the catalog connect path writes."""
+    migration = _load_migration()
+    engine, metadata, apps, servers, links = _setup(tmp_path, migration)
+    auth = {**migration.SCOPED_AUTH, **auth_changes}
+    with engine.begin() as connection:
+        _run(connection, migration, "upgrade")
+        _add_server(
+            connection,
+            metadata,
+            servers,
+            links,
+            server_id=1,
+            auth=auth,
+            **server_kwargs,
+        )
+
+        _run(connection, migration, "downgrade")
+
+        assert _launch_config(connection, apps) == migration.LEGACY_LAUNCH_CONFIG
+        assert _server_auth(connection, servers, 1) == auth
+        assert _child_count(connection, metadata, 1) == 4
+
+
+def test_downgrade_without_the_provenance_marker_changes_nothing(tmp_path):
+    """A catalog row without the built-in marker is an operator's own app:
+    neither it nor the server under its name is touched."""
+    migration = _load_migration()
+    operator_launch = {
+        "url": migration.SERVER_URL,
+        "auth": migration.SCOPED_AUTH,
+    }
+    engine, metadata, apps, servers, links = _setup(
+        tmp_path, migration, launch_config=operator_launch
+    )
+    with engine.begin() as connection:
+        _add_server(
+            connection,
+            metadata,
+            servers,
+            links,
+            server_id=1,
+            auth=migration.SCOPED_AUTH,
+        )
+
+        _run(connection, migration, "downgrade")
+
+        assert _launch_config(connection, apps) == operator_launch
+        assert _server_auth(connection, servers, 1) == migration.SCOPED_AUTH
+        assert _child_count(connection, metadata, 1) == 4
+
+
+def test_upgrade_then_downgrade_returns_the_shared_server_unchanged(tmp_path):
+    migration = _load_migration()
+    engine, metadata, apps, servers, links = _setup(tmp_path, migration)
+    original_auth = {**migration.LEGACY_AUTH, "app_id": "atlassian"}
+    with engine.begin() as connection:
+        _add_server(
+            connection,
+            metadata,
+            servers,
+            links,
+            server_id=1,
+            auth=original_auth,
+        )
+        counts_before = _row_counts(connection, metadata)
+
+        _run(connection, migration, "upgrade", "downgrade")
+
+        assert _launch_config(connection, apps) == migration.LEGACY_LAUNCH_CONFIG
+        assert _server_ids(connection, servers) == {1}
+        assert _server_auth(connection, servers, 1) == original_auth
+        assert _row_counts(connection, metadata) == counts_before
