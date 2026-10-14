@@ -25,6 +25,7 @@ from xagent.web.api import mcp as mcp_api
 from xagent.web.api.mcp import (
     MCPOAuthConnectRequest,
     connect_mcp_oauth,
+    get_mcp_oauth_status,
     mcp_oauth_callback,
 )
 from xagent.web.builtin_mcp_registry import (
@@ -532,3 +533,173 @@ def test_callback_ignores_blank_entries_beside_a_required_scope():
     )
 
     assert mcp_api._explicit_mcp_oauth_required_scope(server) == "read:me"
+
+
+# --- a blank required_scope is unset -----------------------------------------
+
+# A required_scope that names no scope is unset, as a blank scope is. The
+# callback then behaves exactly as for a server without required_scope.
+UNSET_REQUIRED_SCOPES = (
+    pytest.param("", id="empty-string"),
+    pytest.param("  ", id="blank-string"),
+    pytest.param([], id="empty-list"),
+    pytest.param([" "], id="blank-entry"),
+    pytest.param(["", " "], id="empty-and-blank-entries"),
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("required_scope", UNSET_REQUIRED_SCOPES)
+async def test_callback_with_a_blank_required_scope_stores_a_narrower_grant(
+    db_session, monkeypatch, required_scope
+):
+    db, user = db_session
+    auth = {**_atlassian_auth(), "required_scope": required_scope}
+    server = _add_flow(
+        db,
+        user,
+        auth,
+        state="state-blank-unset",
+        requested_scope=ATLASSIAN_MCP_OAUTH_SCOPE,
+    )
+    revoked = _token_response(
+        monkeypatch, {**ISSUED_TOKENS, "scope": GRANTED_WITHOUT_BITBUCKET}
+    )
+
+    response = await mcp_oauth_callback(_callback_request("state-blank-unset"), db)
+
+    assert _redirect_query(response) == {"mcp_oauth_success": ["1"]}
+    assert revoked == []
+    assert db.query(MCPOAuthGrant).one().scope == GRANTED_WITHOUT_BITBUCKET
+    assert mcp_api._explicit_mcp_oauth_required_scope(server) == ""
+    # As without required_scope, the whole request is required to be usable.
+    assert (
+        select_mcp_oauth_grants(
+            db,
+            server_id=server.id,
+            user_id=user.id,
+            auth_config=auth,
+            resource_owner_key=ACTOR_OWNER,
+        )
+        == []
+    )
+
+
+class _DiscoveryReached(Exception):
+    pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("required_scope", UNSET_REQUIRED_SCOPES)
+async def test_connect_accepts_a_blank_required_scope(
+    db_session, monkeypatch, required_scope
+):
+    db, user = db_session
+    server = _add_server(
+        db, user, {**_atlassian_auth(), "required_scope": required_scope}
+    )
+
+    async def discovery_reached(*_args, **_kwargs):
+        raise _DiscoveryReached
+
+    monkeypatch.setattr(mcp_api, "_discover_mcp_oauth_for_server", discovery_reached)
+
+    # The configuration check passes, so the connect goes on to discovery.
+    with pytest.raises(_DiscoveryReached):
+        await connect_mcp_oauth(
+            server.id,
+            MCPOAuthConnectRequest(redirect_after="/tools"),
+            user,
+            db,
+            "application/json",
+        )
+
+
+# --- /oauth/status reports a configuration error -----------------------------
+
+
+def _add_user_grant(db, server: MCPServer, user: User, *, scope: str):
+    client = MCPOAuthClient(
+        mcp_server_id=server.id,
+        issuer=ISSUER,
+        authorization_endpoint="https://auth.atlassian.com/authorize",
+        token_endpoint="https://auth.atlassian.com/oauth/token",
+        client_id="atlassian-dynamic-client",
+        token_endpoint_auth_method="none",
+        redirect_uri="https://api.xagent.test/api/mcp/oauth/callback",
+    )
+    db.add(client)
+    db.flush()
+    grant = MCPOAuthGrant(
+        mcp_server_id=server.id,
+        user_id=user.id,
+        mcp_oauth_client_id=client.id,
+        resource_owner_key=mcp_api._default_resource_owner_key(user.id),
+        issuer=ISSUER,
+        resource=MCP_URL,
+        scope=scope,
+        access_token=mcp_api.encrypt_value("status-access-token"),
+        status="active",
+    )
+    db.add(grant)
+    db.commit()
+    db.refresh(grant)
+    return grant
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("auth_changes", "message"),
+    [
+        (
+            {"required_scope": "read:me manage:jira-configuration"},
+            "MCP OAuth required_scope must only name scopes that scope requests",
+        ),
+        (
+            {"required_scope": 7},
+            "MCP OAuth required_scope must be a scope string or a list of scopes",
+        ),
+        (
+            {"scope": "", "required_scope": "read:me"},
+            "MCP OAuth required_scope needs an explicit scope",
+        ),
+    ],
+    ids=("unrequested-scope", "number", "no-scope"),
+)
+async def test_status_reports_why_no_grant_is_usable(db_session, auth_changes, message):
+    """Grant selection matches nothing under an invalid required_scope;
+    status says why instead of only listing no grant."""
+    db, user = db_session
+    server = _add_server(db, user, {**_atlassian_auth(), **auth_changes})
+    _add_user_grant(db, server, user, scope=ATLASSIAN_MCP_OAUTH_SCOPE)
+
+    status_response = await get_mcp_oauth_status(server.id, user, db)
+
+    assert status_response.grants == []
+    assert status_response.configuration_error is not None
+    assert status_response.configuration_error.model_dump() == {
+        "code": "invalid_configuration",
+        "message": message,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "required_scope",
+    ["email offline_access read:account read:me", None, "", [" "]],
+    ids=("atlassian", "null", "empty-string", "blank-entry"),
+)
+async def test_status_has_no_configuration_error_for_a_usable_configuration(
+    db_session, required_scope
+):
+    db, user = db_session
+    server = _add_server(
+        db, user, {**_atlassian_auth(), "required_scope": required_scope}
+    )
+    grant = _add_user_grant(db, server, user, scope=ATLASSIAN_MCP_OAUTH_SCOPE)
+
+    status_response = await get_mcp_oauth_status(server.id, user, db)
+
+    assert [listed.id for listed in status_response.grants] == [grant.id]
+    assert status_response.configuration_error is None
+    assert status_response.model_dump()["configuration_error"] is None

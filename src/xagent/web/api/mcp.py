@@ -97,6 +97,7 @@ from ..services.mcp_oauth import (
     create_mcp_oauth_http_client,
     discover_mcp_oauth_metadata,
     mcp_oauth_required_scope,
+    mcp_oauth_required_scope_is_set,
     normalize_mcp_oauth_scope,
     oauth_error_log_payload,
     oauth_error_message,
@@ -496,8 +497,21 @@ class MCPOAuthGrantResponse(BaseModel):
     revoked_at: Optional[str]
 
 
+class MCPOAuthConfigurationError(BaseModel):
+    """A server configuration error that keeps every grant from being usable."""
+
+    code: str
+    message: str
+
+
 class MCPOAuthStatusResponse(BaseModel):
-    """MCP OAuth connection status for the current user."""
+    """MCP OAuth connection status for the current user.
+
+    ``configuration_error`` is set when the server's OAuth configuration
+    cannot say which scope a grant must cover (an invalid ``required_scope``).
+    No grant is listed then, and connecting again does not help until the
+    configuration is fixed.
+    """
 
     server_id: int
     auth_type: Optional[str]
@@ -505,6 +519,7 @@ class MCPOAuthStatusResponse(BaseModel):
     issuer: Optional[str]
     scope: Optional[str]
     grants: list[MCPOAuthGrantResponse]
+    configuration_error: Optional[MCPOAuthConfigurationError] = None
 
 
 # Create router
@@ -838,13 +853,14 @@ def _explicit_mcp_oauth_required_scope(server: MCPServer) -> str:
 
     Only an explicitly configured ``required_scope`` is enforced when a grant
     is stored. Without one, a grant narrower than the requested scope is still
-    stored as before; it just does not count as usable.
+    stored as before; it just does not count as usable. A blank
+    ``required_scope`` counts as none (``mcp_oauth_required_scope_is_set``).
     """
     auth_config = cast(Any, server).auth
     if (
         not isinstance(auth_config, dict)
         or auth_config.get("type") != "mcp_oauth"
-        or auth_config.get("required_scope") is None
+        or not mcp_oauth_required_scope_is_set(auth_config)
     ):
         return ""
     return str(_validated_mcp_oauth_required_scope(auth_config))
@@ -6420,7 +6436,25 @@ async def get_mcp_oauth_status(
         issuer=auth_config.get("issuer") if isinstance(auth_config, dict) else None,
         scope=auth_config.get("scope") if isinstance(auth_config, dict) else None,
         grants=[_mcp_oauth_grant_response(grant) for grant in grants],
+        configuration_error=_mcp_oauth_configuration_error(
+            auth_config if isinstance(auth_config, dict) else {}
+        ),
     )
+
+
+def _mcp_oauth_configuration_error(
+    auth_config: dict[str, Any],
+) -> MCPOAuthConfigurationError | None:
+    """The error that makes grant selection match nothing, if there is one.
+
+    The grant selector has no side effects and returns no grant for such a
+    configuration; status reports why instead of only "not connected".
+    """
+    try:
+        mcp_oauth_required_scope(auth_config)
+    except MCPOAuthDiscoveryError as exc:
+        return MCPOAuthConfigurationError(code=exc.code, message=exc.message)
+    return None
 
 
 async def revoke_mcp_oauth_grants_for_owner(

@@ -34,6 +34,7 @@ from xagent.web.services.mcp_oauth import (
     MCPOAuthDiscoveryError,
     MCPOAuthRuntimeError,
     mcp_oauth_required_scope,
+    mcp_oauth_required_scope_is_set,
     resolve_mcp_oauth_runtime_auth,
     select_mcp_oauth_grants,
     select_mcp_oauth_owner,
@@ -865,3 +866,101 @@ def test_a_valid_required_scope_is_returned_as_before(required_scope, expected):
     auth = {**_atlassian_auth(), "required_scope": required_scope}
 
     assert mcp_oauth_required_scope(auth) == expected
+
+
+# --- a blank required_scope is unset -----------------------------------------
+
+# A required_scope that names no scope is unset, as a blank scope is: the
+# whole requested scope stays required, exactly as without the key. This is
+# stricter than any required_scope that names a scope, never looser.
+UNSET_REQUIRED_SCOPES = (
+    pytest.param(None, id="null"),
+    pytest.param("", id="empty-string"),
+    pytest.param("  ", id="blank-string"),
+    pytest.param([], id="empty-list"),
+    pytest.param([" "], id="blank-entry"),
+    pytest.param(["", " "], id="empty-and-blank-entries"),
+    pytest.param(["\t", " \n "], id="whitespace-entries"),
+    pytest.param((" ",), id="blank-tuple-entry"),
+)
+
+
+@pytest.mark.parametrize("required_scope", UNSET_REQUIRED_SCOPES)
+def test_a_blank_required_scope_is_unset(required_scope):
+    auth = {**_atlassian_auth(), "required_scope": required_scope}
+    without_required_scope = {"type": "mcp_oauth", "scope": auth["scope"]}
+
+    assert mcp_oauth_required_scope_is_set(auth) is False
+    # The requested scope comes back untouched, as without required_scope.
+    assert mcp_oauth_required_scope(auth) is auth["scope"]
+    assert mcp_oauth_required_scope(auth) == mcp_oauth_required_scope(
+        without_required_scope
+    )
+
+
+@pytest.mark.parametrize("required_scope", UNSET_REQUIRED_SCOPES)
+def test_a_blank_required_scope_needs_no_explicit_scope(required_scope):
+    """Unset means no new requirement at all, so the "needs an explicit
+    scope" rule for a set required_scope does not apply either."""
+    for auth in (
+        {"type": "mcp_oauth", "required_scope": required_scope},
+        {"type": "mcp_oauth", "scope": "", "required_scope": required_scope},
+    ):
+        assert mcp_oauth_required_scope(auth) == auth.get("scope")
+
+
+@pytest.mark.parametrize(
+    "required_scope",
+    ["read:me", ["read:me", " "], 7, {"read:me": True}, False],
+    ids=("string", "list-with-a-blank-entry", "number", "object", "boolean"),
+)
+def test_a_required_scope_that_is_not_blank_is_set(required_scope):
+    """Only a value that names no scope is unset. A value of another type
+    stays set, so it is still reported as an invalid configuration."""
+    auth = {**_atlassian_auth(), "required_scope": required_scope}
+
+    assert mcp_oauth_required_scope_is_set(auth) is True
+
+
+@pytest.mark.parametrize("required_scope", UNSET_REQUIRED_SCOPES)
+def test_with_a_blank_required_scope_a_grant_must_cover_the_whole_scope(
+    db_session, required_scope
+):
+    db, user = db_session
+    auth = {**_atlassian_auth(), "required_scope": required_scope}
+    server = _add_server(db, user, auth)
+    _add_grant(db, server=server, user=user, scope=GRANTED_WITHOUT_BITBUCKET)
+
+    # Without Bitbucket the grant misses part of the request, so it is not
+    # usable; with the whole request it is.
+    assert _select(db, server, user, auth) == []
+    whole = _add_grant(
+        db,
+        server=server,
+        user=user,
+        scope=ATLASSIAN_MCP_OAUTH_SCOPE,
+        access_token="whole-scope-access-token",
+    )
+    assert [selected.id for selected in _select(db, server, user, auth)] == [whole.id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("required_scope", UNSET_REQUIRED_SCOPES)
+async def test_runtime_holds_a_blank_required_scope_to_the_whole_scope(
+    db_session, required_scope
+):
+    db, user = db_session
+    auth = {**_atlassian_auth(), "required_scope": required_scope}
+    server = _add_server(db, user, auth)
+    _add_grant(
+        db,
+        server=server,
+        user=user,
+        scope=GRANTED_WITHOUT_BITBUCKET,
+        expires_at=_unexpired(),
+    )
+
+    with pytest.raises(MCPOAuthRuntimeError) as exc_info:
+        await _resolve(db, server, user, auth)
+
+    assert exc_info.value.code == "insufficient_scope"
