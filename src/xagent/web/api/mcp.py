@@ -742,6 +742,10 @@ def _mcp_oauth_callback_error_redirect_for_path(
         ),
     )
     if provider_error is not None:
+        # Part of the redirect contract for pages that embed the connect flow
+        # through redirect_after: they read this sanitized code to explain a
+        # provider's refusal without parsing mcp_oauth_error_message. The web
+        # UI only strips it.
         params += (("mcp_oauth_provider_error", provider_error),)
     redirect_path = _redirect_after_with_params(raw_redirect_after, params)
     response = RedirectResponse(_mcp_oauth_redirect_after_url(redirect_path))
