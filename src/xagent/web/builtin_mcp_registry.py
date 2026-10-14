@@ -45,8 +45,11 @@ ZOOM_MEETING_WRITE_DESCRIPTION = (
 # authorization page opens. This subset covers Jira and Confluence read,
 # write and search, Bitbucket read and write, Rovo search, and the basic
 # identity scopes; it leaves out delete/manage and the other products.
-# Changing it needs a migration like 20261013_atlassian_mcp_scope, and
-# existing users must authorize again to get the new scopes.
+# A change here reaches the shared server row when someone next connects
+# (_ensure_catalog_mcp_oauth_server syncs its auth to the catalog); until
+# then the actor projection rejects that row. A migration that updates the
+# row's auth in place, like 20261013_atlassian_mcp_scope, closes that gap.
+# Existing users must authorize again to get scopes their grant lacks.
 ATLASSIAN_MCP_OAUTH_SCOPES: tuple[str, ...] = (
     "email",
     "offline_access",
@@ -71,9 +74,8 @@ ATLASSIAN_MCP_OAUTH_SCOPE = " ".join(sorted(ATLASSIAN_MCP_OAUTH_SCOPES))
 # the basic identity scopes and offline_access for refresh. Atlassian grants
 # product scopes only for the products the consenting account's site has
 # (a site without Bitbucket gets no Bitbucket scopes), so requiring the whole
-# request would leave such accounts unable to connect. Changing this value
-# also needs a migration, because the shared server row must keep the
-# catalog's auth exactly.
+# request would leave such accounts unable to connect. The shared server row
+# picks up a change to this value the same way as a change to the scope.
 ATLASSIAN_MCP_OAUTH_REQUIRED_SCOPES: tuple[str, ...] = (
     "email",
     "offline_access",
