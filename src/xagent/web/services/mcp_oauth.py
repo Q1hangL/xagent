@@ -635,7 +635,9 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
     if normalized_resource:
         normalized_resource = _canonical_resource(normalized_resource)
     try:
-        selected_scope = _scope_a_grant_must_cover(scope, auth_config)
+        selected_scope = (
+            scope if scope is not None else mcp_oauth_required_scope(auth_config)
+        )
         normalized_scope = (
             normalize_mcp_oauth_scope(selected_scope) if selected_scope else None
         )
@@ -923,7 +925,9 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
     if normalized_issuer:
         normalized_issuer = _canonical_issuer(normalized_issuer)
     try:
-        selected_scope = _scope_a_grant_must_cover(scope, auth_config)
+        selected_scope = (
+            scope if scope is not None else mcp_oauth_required_scope(auth_config)
+        )
     except MCPOAuthDiscoveryError:
         # No grant is usable under a configuration that cannot say what it
         # requires. Connect, runtime and the callback fail with the
@@ -1364,7 +1368,8 @@ def mcp_oauth_required_scope(auth_config: dict[str, Any]) -> Any:
     optional ``required_scope`` names the part of ``scope`` a grant must still
     include to count as usable: when the connector is listed as connected, at
     runtime and after a token refresh. Authorization requests and client
-    registration keep using ``scope``.
+    registration keep using ``scope``. Grant selection and runtime use this
+    unless their caller names a scope, which replaces it as it always has.
 
     Without ``required_scope`` the whole ``scope`` is required, and this
     returns ``scope`` exactly as configured, so callers normalize it as they
@@ -1397,19 +1402,6 @@ def _invalid_required_scope(reason: str) -> MCPOAuthDiscoveryError:
         "invalid_configuration",
         f"MCP OAuth required_scope {reason}",
     )
-
-
-def _scope_a_grant_must_cover(scope: Any, auth_config: dict[str, Any]) -> Any:
-    """Return the scope a grant must cover for grant selection and runtime.
-
-    A scope the caller passes explicitly replaces the configured requirement,
-    as it always has. Otherwise a grant must cover ``mcp_oauth_required_scope``,
-    which is the whole requested scope unless ``required_scope`` narrows it.
-    Raises ``MCPOAuthDiscoveryError`` like ``mcp_oauth_required_scope``.
-    """
-    if scope is not None:
-        return scope
-    return mcp_oauth_required_scope(auth_config)
 
 
 def validate_mcp_oauth_persisted_value(
