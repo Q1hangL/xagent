@@ -295,8 +295,9 @@ async def test_without_the_pinned_scope_discovery_selects_the_whole_list(
 
 def test_a_server_row_with_the_previous_catalog_auth_is_not_canonical(db_session):
     """A shared row created before the catalog pinned the scope no longer
-    matches the catalog, so the actor projection rejects it until the
-    migration removes it (20261013_atlassian_mcp_scope)."""
+    matches the catalog, so the actor projection rejects it until its auth is
+    brought up to date: by the migration (20261013_atlassian_mcp_scope) or by
+    the next connect, which syncs the row's auth in place."""
     db, _user = db_session
     app = _add_atlassian_catalog_row(db)
     db.add(
