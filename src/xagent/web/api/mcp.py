@@ -866,6 +866,18 @@ def _explicit_mcp_oauth_required_scope(server: MCPServer) -> str:
     return str(_validated_mcp_oauth_required_scope(auth_config))
 
 
+def _mcp_oauth_selected_scope(server: MCPServer) -> str:
+    """The scope grant selection requires of a grant for ``server``, or ``""``.
+
+    It is ``required_scope`` when set and otherwise the whole ``scope``, as
+    ``mcp_oauth_required_scope`` gives it to grant selection and the runtime.
+    """
+    auth_config = cast(Any, server).auth
+    if not isinstance(auth_config, dict) or auth_config.get("type") != "mcp_oauth":
+        return ""
+    return _scope_string(_validated_mcp_oauth_required_scope(auth_config) or "")
+
+
 def _bounded_mcp_oauth_value(
     value: str,
     *,
@@ -1861,12 +1873,63 @@ def _trusted_mcp_oauth_owner_key(resource_owner_key: str, *, user_id: int) -> st
     return owner_key
 
 
+def _delete_superseded_mcp_oauth_grants(
+    db: Session,
+    *,
+    flow_state: MCPOAuthFlowState,
+    granted_scope: str,
+    selected_scope: str,
+) -> None:
+    """Delete the owner's other active grants that a new grant replaces.
+
+    The grant lookup hash includes the granted scope, so an authorization that
+    grants a different scope stores a new row next to the earlier one, and
+    both can stay usable. When the new grant covers ``selected_scope``, the
+    scope grant selection requires, the owner's other active grants for the
+    same server, client, issuer and resource are deleted; the row with the
+    granted scope is the one this authorization updates. A new grant that
+    selection would not use replaces nothing, so a grant still in use is kept.
+    The deletion runs in the callback transaction, so a callback that fails
+    afterwards rolls it back.
+
+    The rows are deleted rather than marked revoked, as when a user removes the
+    server: a revoked row is never swept, and it would keep its lookup hash,
+    which a later refresh of the new grant could collide with. Their tokens
+    are not revoked at the provider: they were issued to the same client for
+    the same account, and a provider may revoke that whole authorization,
+    including the tokens just stored.
+    """
+    if not set(selected_scope.split()).issubset(granted_scope.split()):
+        return
+    deleted = (
+        db.query(MCPOAuthGrant)
+        .filter(
+            MCPOAuthGrant.mcp_server_id == flow_state.mcp_server_id,
+            MCPOAuthGrant.user_id == flow_state.user_id,
+            MCPOAuthGrant.resource_owner_key == flow_state.resource_owner_key,
+            MCPOAuthGrant.mcp_oauth_client_id == flow_state.mcp_oauth_client_id,
+            MCPOAuthGrant.issuer == flow_state.issuer,
+            MCPOAuthGrant.resource == flow_state.resource,
+            MCPOAuthGrant.status == "active",
+            MCPOAuthGrant.scope != granted_scope,
+        )
+        .delete(synchronize_session="fetch")
+    )
+    if deleted:
+        logger.info(
+            "MCP OAuth callback replaced earlier grants: server_id=%s count=%s",
+            flow_state.mcp_server_id,
+            deleted,
+        )
+
+
 def _upsert_mcp_oauth_grant(
     db: Session,
     *,
     flow_state: MCPOAuthFlowState,
     token_data: dict[str, Any],
     required_scope: str = "",
+    selected_scope: str = "",
 ) -> MCPOAuthGrant:
     """Store the granted scope as the provider returned it.
 
@@ -1874,7 +1937,10 @@ def _upsert_mcp_oauth_grant(
     6749 section 5.1). When ``required_scope`` is given and the granted scope
     does not cover it, nothing is stored: such a grant could never be used, so
     the authorization fails with ``insufficient_scope`` instead of reporting a
-    connection that is not usable.
+    connection that is not usable, and the owner's existing grants stay as
+    they are. A stored grant that covers ``selected_scope``, the scope grant
+    selection requires, replaces the owner's other active grants for the same
+    client, issuer and resource (``_delete_superseded_mcp_oauth_grants``).
     """
     scope = _scope_string(str(token_data.get("scope") or flow_state.scope))
     missing_scopes = set(required_scope.split()) - set(scope.split())
@@ -1902,6 +1968,12 @@ def _upsert_mcp_oauth_grant(
         flow_state.issuer,
         flow_state.resource,
         scope,
+    )
+    _delete_superseded_mcp_oauth_grants(
+        db,
+        flow_state=flow_state,
+        granted_scope=scope,
+        selected_scope=selected_scope,
     )
     existing = (
         db.query(MCPOAuthGrant)
@@ -6155,6 +6227,7 @@ async def mcp_oauth_callback(
             flow_state=locked_flow_state,
             token_data=token_data,
             required_scope=_explicit_mcp_oauth_required_scope(lifecycle[0]),
+            selected_scope=_mcp_oauth_selected_scope(lifecycle[0]),
         )
         failure_stage = "commit_grant"
         db.commit()
