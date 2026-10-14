@@ -2,8 +2,9 @@
 
 The grant lookup hash includes the granted scope, so reconnecting with a
 different granted scope stores a new row. Once that grant is one grant
-selection would use, the callback deletes the owner's other active grants for
-the same server, client, issuer and resource, so one usable grant is left.
+selection would use and it can be refreshed or does not expire, the callback
+deletes the owner's other active grants for the same server, client, issuer
+and resource, so one usable grant is left.
 Grants of other owners, users, clients, issuers, resources and servers are
 not touched, a callback that fails keeps the earlier grant, and the runtime
 refresh path keeps working with the grant that is left.
@@ -434,6 +435,86 @@ async def test_new_grant_that_selection_would_not_use_replaces_nothing(
         (NARROW, "active"),
     ]
     assert _selected_ids(db, server, user, auth) == [usable_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "expires_in", (120, 3600), ids=("expires-within-minutes", "expires-in-an-hour")
+)
+async def test_new_grant_that_cannot_be_refreshed_replaces_nothing(
+    db_session, monkeypatch, provider, expires_in
+):
+    """A new grant without a refresh token stops working when its access token
+    expires, so the earlier grant that can be refreshed stays, and runtime
+    uses it once the new access token is due for refresh."""
+    db, user = db_session
+    server = _add_server(db, user, AUTH)
+    client = _add_client(db, server)
+    earlier_id = _add_grant(db, server=server, user=user, client=client, scope=FULL)
+    _add_flow(db, server=server, user=user, client=client, state="state-no-refresh")
+    _token_response(
+        monkeypatch,
+        {
+            "access_token": "issued-access-token",
+            "token_type": "Bearer",
+            "scope": NARROW,
+            "expires_in": expires_in,
+        },
+    )
+
+    response = await mcp_oauth_callback(_callback_request("state-no-refresh"), db)
+
+    assert _redirect_query(response) == {"mcp_oauth_success": ["1"]}
+    earlier, new = _owner_grants(db, server)
+    assert (int(earlier.id), earlier.scope, earlier.status) == (
+        earlier_id,
+        FULL,
+        "active",
+    )
+    assert decrypt_value(str(earlier.refresh_token)) == "earlier-refresh-token"
+    assert (new.scope, new.status, new.refresh_token) == (NARROW, "active", None)
+    new.expires_at = mcp_api._utc_now() + timedelta(minutes=2)
+    db.commit()
+
+    runtime_auth = await resolve_mcp_oauth_runtime_auth(
+        db,
+        server_id=server.id,
+        user_id=user.id,
+        auth_config=AUTH,
+        resource_owner_key=OWNER,
+    )
+
+    assert runtime_auth.grant_id == earlier_id
+    assert runtime_auth.access_token == "earlier-access-token"
+    assert provider == {"issued": [], "grants": []}
+
+
+@pytest.mark.asyncio
+async def test_new_grant_whose_access_token_does_not_expire_replaces_others(
+    db_session, monkeypatch, provider
+):
+    """Without ``expires_in`` the new access token does not expire, so the new
+    grant needs no refresh token to replace the earlier grant."""
+    db, user = db_session
+    server = _add_server(db, user, AUTH)
+    client = _add_client(db, server)
+    _add_grant(db, server=server, user=user, client=client, scope=FULL)
+    _add_flow(db, server=server, user=user, client=client, state="state-no-expiry")
+    _token_response(
+        monkeypatch,
+        {
+            "access_token": "issued-access-token",
+            "token_type": "Bearer",
+            "scope": NARROW,
+        },
+    )
+
+    response = await mcp_oauth_callback(_callback_request("state-no-expiry"), db)
+
+    assert _redirect_query(response) == {"mcp_oauth_success": ["1"]}
+    [grant] = _owner_grants(db, server)
+    assert (grant.scope, grant.refresh_token, grant.expires_at) == (NARROW, None, None)
+    assert _selected_ids(db, server, user, AUTH) == [int(grant.id)]
 
 
 @pytest.mark.asyncio

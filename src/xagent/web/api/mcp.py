@@ -1881,6 +1881,7 @@ def _delete_superseded_mcp_oauth_grants(
     db: Session,
     *,
     flow_state: MCPOAuthFlowState,
+    token_data: dict[str, Any],
     granted_scope: str,
     selected_scope: str,
 ) -> None:
@@ -1893,6 +1894,10 @@ def _delete_superseded_mcp_oauth_grants(
     same server, client, issuer and resource are deleted; the row with the
     granted scope is the one this authorization updates. A new grant that
     selection would not use replaces nothing, so a grant still in use is kept.
+    Nor does a new grant that cannot be refreshed: when ``token_data`` has no
+    refresh token and its access token expires, the new grant stops working
+    at that expiry, while an earlier grant may still be refreshed. So a grant
+    that cannot be refreshed does not replace one that can.
     The deletion runs in the callback transaction, so a callback that fails
     afterwards rolls it back.
 
@@ -1904,6 +1909,11 @@ def _delete_superseded_mcp_oauth_grants(
     including the tokens just stored.
     """
     if not set(selected_scope.split()).issubset(granted_scope.split()):
+        return
+    if (
+        not token_data.get("refresh_token")
+        and oauth_token_expires_at(token_data) is not None
+    ):
         return
     deleted = (
         db.query(MCPOAuthGrant)
@@ -1944,7 +1954,9 @@ def _upsert_mcp_oauth_grant(
     connection that is not usable, and the owner's existing grants stay as
     they are. A stored grant that covers ``selected_scope``, the scope grant
     selection requires, replaces the owner's other active grants for the same
-    client, issuer and resource (``_delete_superseded_mcp_oauth_grants``).
+    client, issuer and resource when the token response has a refresh token
+    or an access token that does not expire
+    (``_delete_superseded_mcp_oauth_grants``).
     """
     scope = _scope_string(str(token_data.get("scope") or flow_state.scope))
     missing_scopes = set(required_scope.split()) - set(scope.split())
@@ -1976,6 +1988,7 @@ def _upsert_mcp_oauth_grant(
     _delete_superseded_mcp_oauth_grants(
         db,
         flow_state=flow_state,
+        token_data=token_data,
         granted_scope=scope,
         selected_scope=selected_scope,
     )
