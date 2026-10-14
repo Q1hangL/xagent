@@ -934,7 +934,6 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
         # configuration error and /oauth/status returns it; this
         # side-effect-free selector just matches nothing.
         return []
-    normalized_scope = _normalize_scope(selected_scope) if selected_scope else None
     configured_client_id = _runtime_config_value(None, auth_config, "client_id")
 
     query = (
@@ -957,7 +956,7 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
         query = query.filter(MCPOAuthClient.client_id == configured_client_id)
 
     grants = query.order_by(MCPOAuthGrant.updated_at.desc()).all()
-    required_scopes = _scope_set(normalized_scope) if normalized_scope else set()
+    required_scopes = _scope_set(selected_scope)
     if not required_scopes:
         return list(grants)
     return [
