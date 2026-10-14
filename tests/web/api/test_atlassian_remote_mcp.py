@@ -235,50 +235,6 @@ def test_catalog_scope_is_a_short_canonical_subset_of_the_advertised_scopes():
 
 
 @pytest.mark.asyncio
-async def test_trusted_connect_requests_the_catalog_scope_and_stays_canonical(
-    db_session, vendor_requests
-):
-    db, user = db_session
-    _add_atlassian_catalog_row(db)
-
-    response = await mcp_api.connect_mcp_oauth_app_for_owner(
-        "atlassian",
-        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
-        user,
-        db,
-        resource_owner_key="actor:workspace:alice",
-        accept="application/json",
-    )
-
-    assert response.status_code == 200
-    authorization_url = json.loads(response.body)["authorization_url"]
-    query = parse_qs(urlparse(authorization_url).query)
-    assert query["scope"] == [ATLASSIAN_MCP_OAUTH_SCOPE]
-    assert query["client_id"] == ["atlassian-dynamic-client"]
-    assert query["resource"] == [MCP_URL]
-    assert [(r.method, str(r.url)) for r in vendor_requests] == [
-        ("GET", MCP_URL),
-        ("GET", PRM_URL),
-        ("GET", AS_METADATA_URL),
-        ("POST", REGISTRATION_URL),
-    ]
-    assert db.query(MCPOAuthFlowState).one().scope == ATLASSIAN_MCP_OAUTH_SCOPE
-
-    # The shared row the connect created matches the catalog, required_scope
-    # included, so the actor projection keeps listing the app instead of
-    # rejecting its definition.
-    server = db.query(MCPServer).filter(MCPServer.name == "atlassian").one()
-    assert server.auth == {
-        "type": "mcp_oauth",
-        "scope": ATLASSIAN_MCP_OAUTH_SCOPE,
-        "required_scope": REQUIRED_SCOPE,
-    }
-    app_info = classify_actor_remote_oauth_server(db, server)
-    assert app_info is not None
-    assert app_info["id"] == "atlassian"
-
-
-@pytest.mark.asyncio
 async def test_without_the_pinned_scope_discovery_selects_the_whole_list(
     vendor_requests,
 ):
@@ -342,10 +298,19 @@ async def test_connect_requests_the_subset_and_keeps_the_required_scope_on_the_r
         accept="application/json",
     )
 
+    assert response.status_code == 200
     authorization_url = json.loads(response.body)["authorization_url"]
     query = parse_qs(urlparse(authorization_url).query)
     assert query["scope"] == [ATLASSIAN_MCP_OAUTH_SCOPE]
     assert "required_scope" not in query
+    assert query["client_id"] == ["atlassian-dynamic-client"]
+    assert query["resource"] == [MCP_URL]
+    assert [(r.method, str(r.url)) for r in vendor_requests] == [
+        ("GET", MCP_URL),
+        ("GET", PRM_URL),
+        ("GET", AS_METADATA_URL),
+        ("POST", REGISTRATION_URL),
+    ]
     registration = next(r for r in vendor_requests if r.method == "POST")
     registration_body = json.loads(registration.content)
     assert "scope" not in registration_body
