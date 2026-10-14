@@ -199,6 +199,11 @@ def _client_ids(connection, metadata):
     return set(connection.execute(select(table.c.id)).scalars())
 
 
+def _flow_client_ids(connection, metadata):
+    table = metadata.tables["mcp_oauth_flow_states"]
+    return sorted(connection.execute(select(table.c.mcp_oauth_client_id)).scalars())
+
+
 def _row_counts(connection, metadata):
     return {
         name: connection.execute(select(func.count()).select_from(table)).scalar_one()
@@ -357,8 +362,8 @@ def test_upgrade_keeps_an_admin_edit_to_the_shared_server(tmp_path, policy):
 
 
 def test_upgrade_updates_the_shared_server_without_the_oauth_tables(tmp_path):
-    """The update touches only mcp_servers, so a database without the OAuth
-    tables is migrated the same way."""
+    """A database without the OAuth tables has no registration to clean up;
+    the row is updated the same way."""
     migration = _load_migration()
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     metadata = MetaData()
@@ -399,6 +404,160 @@ def test_upgrade_without_a_server_row_only_updates_the_catalog(tmp_path):
         assert _launch_config(connection, apps) == migration.SCOPED_LAUNCH_CONFIG
         assert _server_ids(connection, servers) == set()
         assert _client_ids(connection, metadata) == {1}
+
+
+# --- upgrade: registrations no grant references are deleted -------------------
+
+
+def test_upgrade_deletes_the_registrations_no_grant_references(tmp_path):
+    """The connect path reuses a stored registration and cannot register again
+    if the provider rejects it, so the updated row's registrations that never
+    produced a grant go, with their flow states. A registration that any grant
+    references stays, whatever the grant's status, and no grant is deleted."""
+    migration = _load_migration()
+    engine, metadata, _apps, servers, links = _setup(tmp_path, migration)
+    with engine.begin() as connection:
+        in_use = _add_server(
+            connection,
+            metadata,
+            servers,
+            links,
+            server_id=1,
+            auth=migration.LEGACY_AUTH,
+        )
+        revoked_only = _add_registration(
+            connection, metadata, server_id=1, grant_statuses=("revoked",), flows=1
+        )
+        _add_registration(connection, metadata, server_id=1, flows=2)
+        _add_registration(connection, metadata, server_id=1)
+        other_in_use = _add_server(
+            connection,
+            metadata,
+            servers,
+            links,
+            server_id=2,
+            name="unrelated",
+            url="https://mcp.example.com/mcp",
+            auth={"type": "mcp_oauth"},
+        )
+        other_unused = _add_registration(connection, metadata, server_id=2, flows=1)
+        counts_before = _row_counts(connection, metadata)
+
+        _run(connection, migration, "upgrade")
+
+        assert _server_auth(connection, servers, 1) == migration.SCOPED_AUTH
+        assert _client_ids(connection, metadata) == {
+            in_use,
+            revoked_only,
+            other_in_use,
+            other_unused,
+        }
+        assert _flow_client_ids(connection, metadata) == sorted(
+            [in_use, revoked_only, other_in_use, other_unused]
+        )
+        assert _row_counts(connection, metadata) == {
+            **counts_before,
+            "mcp_oauth_clients": counts_before["mcp_oauth_clients"] - 2,
+            "mcp_oauth_flow_states": counts_before["mcp_oauth_flow_states"] - 2,
+        }
+
+
+@pytest.mark.parametrize("grants", ["without-client-column", "missing"])
+def test_upgrade_keeps_registrations_when_grants_cannot_be_linked_to_them(
+    tmp_path, grants
+):
+    """Fail closed: without the column that links a grant to its registration,
+    a registration in use cannot be told apart, so none is deleted. The row's
+    auth is still updated."""
+    migration = _load_migration()
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    metadata = MetaData()
+    apps, servers, links = _schema(metadata)
+    metadata.remove(metadata.tables["mcp_oauth_grants"])
+    if grants == "without-client-column":
+        Table(
+            "mcp_oauth_grants",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("mcp_server_id", Integer),
+        )
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        _insert_catalog_row(connection, apps, migration.LEGACY_LAUNCH_CONFIG)
+        connection.execute(
+            servers.insert().values(
+                id=1,
+                name="atlassian",
+                transport="streamable_http",
+                url=migration.SERVER_URL,
+                auth=migration.LEGACY_AUTH,
+            )
+        )
+        connection.execute(
+            links.insert().values(user_id=7, mcpserver_id=1, is_owner=False)
+        )
+        _add_registration(connection, metadata, server_id=1, flows=1)
+        counts_before = _row_counts(connection, metadata)
+
+        _run(connection, migration, "upgrade")
+
+        assert _server_auth(connection, servers, 1) == migration.SCOPED_AUTH
+        assert _row_counts(connection, metadata) == counts_before
+
+
+def test_upgrade_deletes_an_unused_registration_without_the_flow_table(tmp_path):
+    migration = _load_migration()
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    metadata = MetaData()
+    apps, servers, links = _schema(metadata)
+    metadata.remove(metadata.tables["mcp_oauth_flow_states"])
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        _insert_catalog_row(connection, apps, migration.LEGACY_LAUNCH_CONFIG)
+        connection.execute(
+            servers.insert().values(
+                id=1,
+                name="atlassian",
+                transport="streamable_http",
+                url=migration.SERVER_URL,
+                auth=migration.LEGACY_AUTH,
+            )
+        )
+        in_use = _add_registration(
+            connection, metadata, server_id=1, grant_statuses=("active",)
+        )
+        _add_registration(connection, metadata, server_id=1)
+
+        _run(connection, migration, "upgrade")
+
+        assert _server_auth(connection, servers, 1) == migration.SCOPED_AUTH
+        assert _client_ids(connection, metadata) == {in_use}
+
+
+def test_upgrade_run_twice_deletes_nothing_more(tmp_path):
+    """A second run finds no row on the previous auth, so a registration added
+    after the first run (one a connect has not used yet) is kept."""
+    migration = _load_migration()
+    engine, metadata, apps, servers, links = _setup(tmp_path, migration)
+    with engine.begin() as connection:
+        _add_server(
+            connection,
+            metadata,
+            servers,
+            links,
+            server_id=1,
+            auth=migration.LEGACY_AUTH,
+        )
+        _add_registration(connection, metadata, server_id=1, flows=1)
+        _run(connection, migration, "upgrade")
+        _add_registration(connection, metadata, server_id=1, flows=1)
+        counts_before = _row_counts(connection, metadata)
+
+        _run(connection, migration, "upgrade")
+
+        assert _launch_config(connection, apps) == migration.SCOPED_LAUNCH_CONFIG
+        assert _server_auth(connection, servers, 1) == migration.SCOPED_AUTH
+        assert _row_counts(connection, metadata) == counts_before
 
 
 # --- upgrade: rows that are not the catalog row are left alone ----------------
@@ -747,12 +906,14 @@ def test_downgrade_without_the_provenance_marker_changes_nothing(tmp_path):
         assert _row_counts(connection, metadata) == counts_before
 
 
-def test_upgrade_then_downgrade_returns_the_shared_server_unchanged(tmp_path):
+def test_upgrade_then_downgrade_keeps_the_shared_server_and_its_grants(tmp_path):
+    """A round trip returns the row's auth and keeps everything a grant uses;
+    a registration no grant used is gone and is not restored."""
     migration = _load_migration()
     engine, metadata, apps, servers, links = _setup(tmp_path, migration)
     original_auth = {**migration.LEGACY_AUTH, "app_id": "atlassian"}
     with engine.begin() as connection:
-        _add_server(
+        in_use = _add_server(
             connection,
             metadata,
             servers,
@@ -768,7 +929,12 @@ def test_upgrade_then_downgrade_returns_the_shared_server_unchanged(tmp_path):
         assert _launch_config(connection, apps) == migration.LEGACY_LAUNCH_CONFIG
         assert _server_ids(connection, servers) == {1}
         assert _server_auth(connection, servers, 1) == original_auth
-        assert _row_counts(connection, metadata) == counts_before
+        assert _client_ids(connection, metadata) == {in_use}
+        assert _row_counts(connection, metadata) == {
+            **counts_before,
+            "mcp_oauth_clients": counts_before["mcp_oauth_clients"] - 1,
+            "mcp_oauth_flow_states": counts_before["mcp_oauth_flow_states"] - 1,
+        }
 
 
 # --- the frozen catalog values ------------------------------------------------

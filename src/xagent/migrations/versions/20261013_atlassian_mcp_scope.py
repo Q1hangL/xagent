@@ -19,21 +19,37 @@ the old auth, which the canonical-definition check rejects, so the connector
 would stay unavailable there until someone connected again. Only the two
 scope keys change, so this migration sets that row's ``auth`` to the scoped
 value in place. The row keeps its id, its policy fields (headers, env,
-timeout, managed and the like), its user links, client registrations and
-grants. A grant that covers ``required_scope`` stays usable; a user whose
-grant does not must connect again, as after any scope change.
+timeout, managed and the like), its user links and its grants. A grant that
+covers ``required_scope`` stays usable; a user whose grant does not must
+connect again, as after any scope change.
 
-- Only the row the catalog connect path writes is updated: named after the
+The row's client registrations that no grant references are deleted, with
+the OAuth flow states that point at them. The connect path reuses a stored
+registration for the same server, issuer and redirect URI and has no way to
+register again if the provider rejects that client. A registration no grant
+references holds nothing a user depends on, so it is dropped rather than
+kept at the risk of having gone stale at the provider; the next connect
+registers a fresh client. A registration that a grant references is kept,
+whatever the grant's status, and no grant is deleted.
+
+- Only the row the catalog connect path writes is changed: named after the
   app id, with the catalog transport and URL, ``auth`` exactly the previous
   catalog value (an ``app_id`` key some rows carry is ignored and kept) and
   no owning user link. A user-created server under the same name and a
   server with other auth keys (a client id, another scope) are left alone,
   and so is every row when the columns that tell them apart are missing.
+  Nothing is changed unless the catalog row carries the built-in provenance
+  marker.
 - A row an administrator edited keeps those edits. The canonical-definition
   check still rejects one whose ``managed`` value was changed, as before.
-- Downgrade is symmetric: it restores the previous catalog value and sets
-  ``auth`` back on rows that carry exactly the scoped auth. Neither
-  direction deletes anything.
+- Flow states are deleted before their registration. PostgreSQL would
+  cascade them, but on SQLite the migration runner turns foreign keys off
+  and rejects any new violation. Without the column that links grants to a
+  registration, no registration is deleted.
+- Downgrade sets ``auth`` back on rows that carry exactly the scoped auth,
+  under the same conditions, and restores the previous catalog value. It
+  deletes nothing, and a registration deleted on upgrade is not restored:
+  the next connect registers a new one.
 """
 
 from typing import Any, Sequence, Union
@@ -101,6 +117,19 @@ USER_MCPSERVERS = sa.table(
     "user_mcpservers",
     sa.column("mcpserver_id", sa.Integer),
     sa.column("is_owner", sa.Boolean),
+)
+MCP_OAUTH_CLIENTS = sa.table(
+    "mcp_oauth_clients",
+    sa.column("id", sa.Integer),
+    sa.column("mcp_server_id", sa.Integer),
+)
+MCP_OAUTH_GRANTS = sa.table(
+    "mcp_oauth_grants",
+    sa.column("mcp_oauth_client_id", sa.Integer),
+)
+MCP_OAUTH_FLOW_STATES = sa.table(
+    "mcp_oauth_flow_states",
+    sa.column("mcp_oauth_client_id", sa.Integer),
 )
 
 
@@ -187,9 +216,9 @@ def _replace_catalog_server_auth(
     bind: sa.engine.Connection,
     old_auth: dict[str, Any],
     new_auth: dict[str, Any],
-) -> None:
+) -> list[int]:
     """Set ``auth`` to ``new_auth`` on the shared server row the catalog
-    connect path created under ``old_auth``.
+    connect path created under ``old_auth``, and return the updated row ids.
 
     That row is named after the app id, uses the catalog transport and URL,
     stores exactly ``old_auth`` (an ``app_id`` key some rows carry is ignored,
@@ -201,7 +230,7 @@ def _replace_catalog_server_auth(
     columns and every row that references the server stay as they are.
     """
     if not _has_identifying_columns(bind):
-        return
+        return []
     rows = (
         bind.execute(
             sa.select(
@@ -214,6 +243,7 @@ def _replace_catalog_server_auth(
         .mappings()
         .all()
     )
+    updated_ids: list[int] = []
     for row in rows:
         if not _matches_catalog_definition(row, old_auth):
             continue
@@ -228,13 +258,56 @@ def _replace_catalog_server_auth(
             .where(MCP_SERVERS.c.id == server_id)
             .values(auth=updated_auth)
         )
+        updated_ids.append(server_id)
+    return updated_ids
+
+
+def _delete_unused_client_registrations(
+    bind: sa.engine.Connection, server_ids: list[int]
+) -> None:
+    """Delete the client registrations of ``server_ids`` that no grant
+    references, with the flow states that point at them.
+
+    A grant of any status keeps its registration, so no grant is deleted or
+    left pointing at a missing registration. Flow states are deleted first
+    because the SQLite migration runner turns foreign keys off (PostgreSQL
+    would cascade them). Without the column that links grants to a
+    registration, a registration in use cannot be told apart and nothing is
+    deleted.
+    """
+    if not {"id", "mcp_server_id"}.issubset(_columns(bind, "mcp_oauth_clients")):
+        return
+    if "mcp_oauth_client_id" not in _columns(bind, "mcp_oauth_grants"):
+        return
+    referenced = sa.exists().where(
+        MCP_OAUTH_GRANTS.c.mcp_oauth_client_id == MCP_OAUTH_CLIENTS.c.id
+    )
+    unused_ids = list(
+        bind.execute(
+            sa.select(MCP_OAUTH_CLIENTS.c.id).where(
+                MCP_OAUTH_CLIENTS.c.mcp_server_id.in_(server_ids), ~referenced
+            )
+        ).scalars()
+    )
+    if not unused_ids:
+        return
+    if "mcp_oauth_client_id" in _columns(bind, "mcp_oauth_flow_states"):
+        bind.execute(
+            sa.delete(MCP_OAUTH_FLOW_STATES).where(
+                MCP_OAUTH_FLOW_STATES.c.mcp_oauth_client_id.in_(unused_ids)
+            )
+        )
+    bind.execute(
+        sa.delete(MCP_OAUTH_CLIENTS).where(MCP_OAUTH_CLIENTS.c.id.in_(unused_ids))
+    )
 
 
 def upgrade() -> None:
     bind = op.get_bind()
     if not _set_owned_launch_config(bind, SCOPED_LAUNCH_CONFIG):
         return
-    _replace_catalog_server_auth(bind, LEGACY_AUTH, SCOPED_AUTH)
+    updated_ids = _replace_catalog_server_auth(bind, LEGACY_AUTH, SCOPED_AUTH)
+    _delete_unused_client_registrations(bind, updated_ids)
 
 
 def downgrade() -> None:
