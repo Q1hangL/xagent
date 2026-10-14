@@ -238,8 +238,6 @@ def test_required_scope_is_normalized_like_scope(required_scope):
         {"scope": "records.read", "required_scope": "admin"},
         {"required_scope": "records.read"},
         {"scope": "", "required_scope": "records.read"},
-        {"scope": "records.read", "required_scope": ""},
-        {"scope": "records.read", "required_scope": []},
         {"scope": "records.read", "required_scope": 7},
         {"scope": "records.read", "required_scope": {"records.read": True}},
     ],
@@ -248,8 +246,6 @@ def test_required_scope_is_normalized_like_scope(required_scope):
         "unrequested-scope",
         "no-scope",
         "empty-scope",
-        "empty-string",
-        "empty-list",
         "number",
         "object",
     ),
@@ -552,18 +548,6 @@ async def test_runtime_diagnostic_names_the_scope_a_grant_had_to_cover(
             {"scope": "records.read", "required_scope": {"records.read": True}},
             "must be a scope string or a list of scopes",
         ),
-        (
-            {"scope": "records.read", "required_scope": ""},
-            "must name at least one scope",
-        ),
-        (
-            {"scope": "records.read", "required_scope": "   "},
-            "must name at least one scope",
-        ),
-        (
-            {"scope": "records.read", "required_scope": []},
-            "must name at least one scope",
-        ),
         ({"required_scope": "records.read"}, "needs an explicit scope"),
         ({"scope": "", "required_scope": "records.read"}, "needs an explicit scope"),
         ({"scope": [], "required_scope": "records.read"}, "needs an explicit scope"),
@@ -580,9 +564,6 @@ async def test_runtime_diagnostic_names_the_scope_a_grant_had_to_cover(
         "number",
         "boolean",
         "object",
-        "empty-string",
-        "blank-string",
-        "empty-list",
         "no-scope",
         "empty-scope",
         "empty-scope-list",
@@ -732,66 +713,9 @@ async def test_runtime_diagnostic_names_the_requested_scope_when_required_scope_
 
 # --- blank entries in required_scope -----------------------------------------
 
-# Whitespace and empty entries name no scope, in a list as in a string. A
-# required_scope made only of them would require nothing, so it is rejected
-# like an empty one. JSON values only: each one is stored on a server row.
-BLANK_REQUIRED_SCOPES = (
-    pytest.param([" "], id="blank-entry"),
-    pytest.param(["", " "], id="empty-and-blank-entries"),
-    pytest.param(["\t", " \n "], id="whitespace-entries"),
-    pytest.param("  ", id="blank-string"),
-)
-
-
-@pytest.mark.parametrize(
-    "required_scope",
-    [*BLANK_REQUIRED_SCOPES, pytest.param((" ",), id="blank-tuple-entry")],
-)
-def test_a_required_scope_of_only_blank_entries_names_no_scope(required_scope):
-    auth = {
-        "type": "mcp_oauth",
-        "scope": "records.read",
-        "required_scope": required_scope,
-    }
-
-    with pytest.raises(MCPOAuthDiscoveryError) as exc_info:
-        mcp_oauth_required_scope(auth)
-
-    assert exc_info.value.code == "invalid_configuration"
-    assert exc_info.value.message == (
-        "MCP OAuth required_scope must name at least one scope"
-    )
-
-
-@pytest.mark.parametrize("required_scope", BLANK_REQUIRED_SCOPES)
-def test_a_required_scope_of_only_blank_entries_makes_no_grant_usable(
-    db_session, required_scope
-):
-    db, user = db_session
-    auth = {**_atlassian_auth(), "required_scope": required_scope}
-    server = _add_server(db, user, auth)
-    _add_grant(db, server=server, user=user, scope="unrelated")
-
-    assert _select(db, server, user, auth) == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("required_scope", BLANK_REQUIRED_SCOPES)
-async def test_runtime_reports_a_required_scope_of_only_blank_entries(
-    db_session, required_scope
-):
-    db, user = db_session
-    auth = {**_atlassian_auth(), "required_scope": required_scope}
-    server = _add_server(db, user, auth)
-    _add_grant(db, server=server, user=user, scope="unrelated")
-
-    with pytest.raises(MCPOAuthRuntimeError) as exc_info:
-        await _resolve(db, server, user, auth)
-
-    assert exc_info.value.code == "invalid_configuration"
-    assert exc_info.value.message == (
-        "MCP OAuth required_scope must name at least one scope"
-    )
+# Whitespace and empty entries name no scope, in a list as in a string. Next to
+# real scopes they are dropped; a required_scope made only of them is unset
+# (see below).
 
 
 @pytest.mark.parametrize(
