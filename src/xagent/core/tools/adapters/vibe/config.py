@@ -85,6 +85,7 @@ _PUBLIC_MCP_UNAVAILABLE_REASONS = frozenset(
         "initialize",
         "insufficient_scope",
         "invalid_config",
+        "invalid_configuration",
         "invalid_launch_config",
         "list_tools",
         "loader_failed",
