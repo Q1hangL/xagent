@@ -323,7 +323,39 @@ class TestOpenAILLM:
             "stop",
         )
 
-    def test_parse_stream_chunk_ignores_empty_idless_tool_call_placeholder(self, llm):
+    def test_parse_stream_chunks_mixed_final_delta_reuses_reasoning_raw(self, llm):
+        mixed = _stream_chunk(
+            [_tool_call_delta(0, "call_a", "search", '{"q":"x"}')],
+            finish_reason="tool_calls",
+        )
+        mixed.choices[0].delta.content = "Checking"
+        mixed.model_dump = MagicMock(return_value={"id": "mixed-final"})
+
+        chunks = llm._parse_stream_chunks(
+            mixed, {}, "Checking the source", has_reasoning_content=True
+        )
+
+        assert [(chunk.type, chunk.finish_reason) for chunk in chunks] == [
+            (ChunkType.TOKEN, ""),
+            (ChunkType.TOOL_CALL, "tool_calls"),
+        ]
+        assert chunks[0].delta == "Checking"
+        assert chunks[1].tool_calls[0]["function"]["arguments"] == '{"q":"x"}'
+        mixed.model_dump.assert_called_once_with()
+        assert chunks[0].raw is chunks[1].raw
+        assert chunks[0].raw["reasoning_content"] == "Checking the source"
+
+        empty = _stream_chunk()
+        empty.model_dump = MagicMock()
+        assert (
+            llm._parse_stream_chunks(
+                empty, {}, "Checking the source", has_reasoning_content=True
+            )
+            == []
+        )
+        empty.model_dump.assert_not_called()
+
+    def test_parse_stream_chunks_ignores_empty_idless_tool_call_placeholder(self, llm):
         """Some OpenAI-compatible providers emit empty id-less tool-call slots."""
 
         accumulated_tool_calls = {}
@@ -1571,7 +1603,7 @@ class TestOpenAILLM:
         ("empty_arguments", "expected"),
         [("", ""), ("   ", "   "), (None, "")],
     )
-    def test_parse_stream_chunk_passes_empty_tool_arguments_through(
+    def test_parse_stream_chunks_passes_empty_tool_arguments_through(
         self, llm, empty_arguments, expected
     ):
         """Same on the streaming finish-reason path; `None` accumulates as `""`."""
@@ -2709,7 +2741,7 @@ class TestFinishReasonOnResponse:
         assert [c.finish_reason for c in tokens] == ["", "length"]
 
     @pytest.mark.asyncio
-    async def test_parse_stream_chunk_tool_call_delta_carries_finish_reason(
+    async def test_parse_stream_chunks_tool_call_delta_carries_finish_reason(
         self, openai_llm_config
     ):
         """A tool-call delta chunk that also carries ``finish_reason`` (some

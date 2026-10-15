@@ -1908,15 +1908,20 @@ class OpenAICompatibleLLM(BaseLLM):
             # Return current accumulated tool calls
             tool_calls_list = list(accumulated_tool_calls.values())
             if tool_calls_list:
+                raw = (
+                    chunks[0].raw
+                    if chunks
+                    else self._attach_reasoning_content_to_raw(
+                        raw_chunk,
+                        accumulated_reasoning_content,
+                        has_reasoning_content=has_reasoning_content,
+                    )
+                )
                 chunks.append(
                     StreamChunk(
                         type=ChunkType.TOOL_CALL,
                         tool_calls=tool_calls_list,
-                        raw=self._attach_reasoning_content_to_raw(
-                            raw_chunk,
-                            accumulated_reasoning_content,
-                            has_reasoning_content=has_reasoning_content,
-                        ),
+                        raw=raw,
                     )
                 )
 
@@ -1926,7 +1931,7 @@ class OpenAICompatibleLLM(BaseLLM):
                 # The marker rides on this delta's last payload chunk, so a
                 # mixed final delta ends on its TOOL_CALL, not its TOKEN.
                 chunks[-1].finish_reason = finish_reason
-            # If there are tool calls, return complete tool calls
+            # No payload on this delta: emit the final tool-call snapshot.
             elif accumulated_tool_calls:
                 tool_calls_list = list(accumulated_tool_calls.values())
 
