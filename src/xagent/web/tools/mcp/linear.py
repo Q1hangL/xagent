@@ -312,8 +312,26 @@ def _resolve_team_uuid(team_id: str) -> str:
     return str(teams[0]["id"])
 
 
+def _filter_argument(
+    filter_type: str, filter_value: dict[str, Any] | None, variables: dict[str, Any]
+) -> tuple[str, str]:
+    """The variable declaration and field argument for an optional
+    `filter`, passed as one typed GraphQL variable (as Linear's own SDK
+    documents pass it). With no filter both are empty and `variables` is
+    left alone, so an unfiltered request stays exactly as it was."""
+    if not filter_value:
+        return "", ""
+    variables["filter"] = filter_value
+    return f", $filter: {filter_type}!", ", filter: $filter"
+
+
 def _team_scoped_list(
-    team_id: str, field_name: str, first: int, selection: str
+    team_id: str,
+    field_name: str,
+    first: int,
+    selection: str,
+    filter_type: str = "",
+    filter_value: dict[str, Any] | None = None,
 ) -> tuple[list[Any], bool, list[Any]]:
     """Shared skeleton behind every `team(id: ...) { <field_name> { ... } }`
     tool below (workflow states, labels, and the team-scoped half of
@@ -321,13 +339,19 @@ def _team_scoped_list(
     exists → extract nodes/truncated. Raises ValueError with the same
     "Team '...' not found" message each call site returned directly before
     this was extracted, so the caller's existing `except Exception` handling
-    needs no change."""
+    needs no change. A `filter_value`, when given, becomes the field's
+    `filter` argument, typed as `filter_type` (e.g. "ProjectFilter")."""
     resolved_team_id = _resolve_team_uuid(team_id)
+    variables: dict[str, Any] = {"teamId": resolved_team_id, "first": first}
+    filter_signature, filter_arg = _filter_argument(
+        filter_type, filter_value, variables
+    )
     data, errors = _graphql(
-        f"query($teamId: String!, $first: Int!) {{ team(id: $teamId) {{"
-        f" {field_name}(first: $first) {{ nodes {{ {selection} }}"
+        f"query($teamId: String!, $first: Int!{filter_signature}) {{"
+        f" team(id: $teamId) {{"
+        f" {field_name}(first: $first{filter_arg}) {{ nodes {{ {selection} }}"
         " pageInfo { hasNextPage } } } }",
-        {"teamId": resolved_team_id, "first": first},
+        variables,
     )
     team = data.get("team")
     if not team or not isinstance(team, dict):
@@ -597,9 +621,10 @@ def linear_create_issue(
     priority: 0 (no priority), 1 (urgent), 2 (high), 3 (normal), 4 (low);
     omit to let Linear apply its own default.
     label_ids: optional label ids from linear_list_labels.
-    project_id: optional project id from linear_list_projects (list them
-    with the same team_id), to create the issue in that project — pass the
-    id, not the project name.
+    project_id: optional project id. If the user names a project or gives
+    its link, find it first with linear_list_projects(query=...) without
+    team_id, pass its id here, and set team_id to one of that project's
+    teams.
     """
     try:
         if err := _validate_title(title):
@@ -673,10 +698,10 @@ def linear_update_issue(
     affecting labels not listed here.
     remove_label_ids: label ids from linear_list_labels to remove, without
     affecting labels not listed here.
-    project_id: a project id from linear_list_projects (list them with the
-    issue's team_id), to move the issue into that project — an empty string
-    is treated the same as leaving it unset. This tool cannot remove an
-    issue from a project.
+    project_id: a project id to move the issue into. If the user names a
+    project or gives its link, find it with linear_list_projects(query=...)
+    without team_id and pass its id. An empty string is treated the same as
+    leaving it unset. This tool cannot remove an issue from a project.
     """
     try:
         if err := _validate_title(title):
@@ -798,27 +823,72 @@ def linear_add_comment(issue_id: str, body: str) -> str:
         return _error(str(e))
 
 
+def _project_filter(query: str) -> dict[str, Any] | None:
+    """The ProjectFilter behind linear_list_projects' query: a
+    case-insensitive part of the project name, or the exact slug id from a
+    project link (https://linear.app/<workspace>/project/<name>-<slugId>).
+    ProjectFilter.name and .slugId are StringComparators, and both
+    Query.projects and Team.projects take `filter: ProjectFilter` --
+    confirmed against Linear's own GraphQL schema
+    (github.com/linear/linear packages/sdk/src/schema.graphql). The slug id
+    is matched exactly, not as a substring, so a short name fragment can't
+    also match unrelated projects through their slug ids. Surrounding
+    whitespace is stripped and a blank query means no filter, like
+    linear_search_users' query."""
+    needle = query.strip()
+    if not needle:
+        return None
+    return {
+        "or": [
+            {"name": {"containsIgnoreCase": needle}},
+            {"slugId": {"eq": needle}},
+        ]
+    }
+
+
 @mcp.tool()
-def linear_list_projects(team_id: str = "", limit: int = 50) -> str:
+def linear_list_projects(team_id: str = "", limit: int = 50, query: str = "") -> str:
     """
-    List projects, optionally scoped to one team — id, name, status, and
-    progress. Resolve a project name to an id here before passing
-    project_id to linear_create_issue or linear_update_issue.
+    List projects — id, name, status, progress, url, and the teams each
+    project belongs to.
+    When the user names a project or gives its link, call this with query
+    and without team_id, take the project's id for project_id, and pick
+    the issue's team_id from that project's teams. Don't pick a team first
+    and list only its projects.
     team_id: optional team id/key from linear_list_teams; omit to list
     across every team this account can see.
+    query: optional; a case-insensitive part of the project name, or the
+    slug id at the end of a project link (for
+    https://linear.app/acme/project/website-redesign-0a1b2c3d4e5f pass
+    "0a1b2c3d4e5f"). Matched server-side; leave empty to list all projects.
     """
     try:
         max_results = _clamp_limit(limit)
-        project_selection = "id name status { id name type } progress url"
+        project_selection = (
+            "id name status { id name type } progress url"
+            " teams { nodes { id key name } }"
+        )
+        project_filter = _project_filter(query)
         if team_id:
             projects, truncated, errors = _team_scoped_list(
-                team_id, "projects", max_results, project_selection
+                team_id,
+                "projects",
+                max_results,
+                project_selection,
+                filter_type="ProjectFilter",
+                filter_value=project_filter,
             )
         else:
+            variables: dict[str, Any] = {"first": max_results}
+            filter_signature, filter_arg = _filter_argument(
+                "ProjectFilter", project_filter, variables
+            )
             data, errors = _graphql(
-                f"query($first: Int!) {{ projects(first: $first) {{ nodes {{ {project_selection} }}"
+                f"query($first: Int!{filter_signature}) {{"
+                f" projects(first: $first{filter_arg}) {{"
+                f" nodes {{ {project_selection} }}"
                 " pageInfo { hasNextPage } } }",
-                {"first": max_results},
+                variables,
             )
             projects_data = data.get("projects") or {}
             projects = projects_data.get("nodes") or []
