@@ -9,6 +9,7 @@ from mcp.server.fastmcp import FastMCP
 
 from ....core.utils import public_requests as requests
 from ...utils.graphql_errors import graphql_errors_message, truncate_error_text
+from .utils import require_clean_identifier
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("linear-mcp")
@@ -52,6 +53,20 @@ def _validate_title(title: str | None) -> str | None:
     and always passes; a provided title must be non-blank."""
     if title is not None and not title.strip():
         return "title must not be empty"
+    return None
+
+
+def _validate_project_id(project_id: str | None) -> str | None:
+    """None or "" means "no project given" and always passes (on
+    linear_update_issue that leaves the issue's project unchanged); a
+    provided id must be a clean identifier. Whether the project exists is
+    left to Linear, whose own error reaches the caller."""
+    if not project_id:
+        return None
+    try:
+        require_clean_identifier(project_id, "project_id")
+    except ValueError as exc:
+        return str(exc)
     return None
 
 
@@ -447,7 +462,7 @@ def linear_search_users(query: str = "", limit: int = 20) -> str:
 _ISSUE_SUMMARY_FIELDS = (
     "id identifier title priority url createdAt updatedAt"
     " state { id name type } assignee { id name email }"
-    " team { id key name } labels { nodes { id name } }"
+    " team { id key name } project { id name } labels { nodes { id name } }"
 )
 # Used for single-issue fetches and mutation results, where the caller
 # asked about (or just created/updated) exactly one issue and the full
@@ -545,7 +560,8 @@ def linear_search_issues(
 @mcp.tool()
 def linear_get_issue(issue_id: str) -> str:
     """
-    Get one issue's full details, including labels, assignee, and state.
+    Get one issue's full details, including labels, assignee, state, and
+    project.
     issue_id: an issue UUID or its human-readable identifier (e.g. "ENG-123").
     """
     try:
@@ -570,6 +586,7 @@ def linear_create_issue(
     assignee_id: str = "",
     priority: int | None = None,
     label_ids: list[str] | None = None,
+    project_id: str = "",
 ) -> str:
     """
     Create a new issue.
@@ -580,11 +597,16 @@ def linear_create_issue(
     priority: 0 (no priority), 1 (urgent), 2 (high), 3 (normal), 4 (low);
     omit to let Linear apply its own default.
     label_ids: optional label ids from linear_list_labels.
+    project_id: optional project id from linear_list_projects (list them
+    with the same team_id), to create the issue in that project — pass the
+    id, not the project name.
     """
     try:
         if err := _validate_title(title):
             return _error(err)
         if err := _validate_priority(priority):
+            return _error(err)
+        if err := _validate_project_id(project_id):
             return _error(err)
         issue_input: dict[str, Any] = {
             "teamId": _resolve_team_uuid(team_id),
@@ -598,6 +620,8 @@ def linear_create_issue(
             issue_input["priority"] = priority
         if label_ids is not None:
             issue_input["labelIds"] = label_ids
+        if project_id:
+            issue_input["projectId"] = project_id
 
         data, errors = _graphql(
             "mutation($input: IssueCreateInput!) { issueCreate(input: $input)"
@@ -628,6 +652,7 @@ def linear_update_issue(
     label_ids: list[str] | None = None,
     add_label_ids: list[str] | None = None,
     remove_label_ids: list[str] | None = None,
+    project_id: str | None = None,
 ) -> str:
     """
     Update an existing issue. Only the fields explicitly provided are
@@ -648,11 +673,17 @@ def linear_update_issue(
     affecting labels not listed here.
     remove_label_ids: label ids from linear_list_labels to remove, without
     affecting labels not listed here.
+    project_id: a project id from linear_list_projects (list them with the
+    issue's team_id), to move the issue into that project — an empty string
+    is treated the same as leaving it unset. This tool cannot remove an
+    issue from a project.
     """
     try:
         if err := _validate_title(title):
             return _error(err)
         if err := _validate_priority(priority):
+            return _error(err)
+        if err := _validate_project_id(project_id):
             return _error(err)
         if label_ids is not None and (
             add_label_ids is not None or remove_label_ids is not None
@@ -688,6 +719,11 @@ def linear_update_issue(
             issue_input["addedLabelIds"] = add_label_ids
         if remove_label_ids is not None:
             issue_input["removedLabelIds"] = remove_label_ids
+        if project_id:
+            # Truthiness, like state_id: "" means "leave unchanged" and is
+            # never sent as projectId: null, so this tool cannot detach an
+            # issue from its project by accident.
+            issue_input["projectId"] = project_id
         if not issue_input:
             return _error("No fields provided to update")
 
@@ -766,7 +802,8 @@ def linear_add_comment(issue_id: str, body: str) -> str:
 def linear_list_projects(team_id: str = "", limit: int = 50) -> str:
     """
     List projects, optionally scoped to one team — id, name, status, and
-    progress.
+    progress. Resolve a project name to an id here before passing
+    project_id to linear_create_issue or linear_update_issue.
     team_id: optional team id/key from linear_list_teams; omit to list
     across every team this account can see.
     """

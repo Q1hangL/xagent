@@ -1270,6 +1270,26 @@ def test_search_issues_query_omits_description_field(monkeypatch):
     assert "description" not in query_text
 
 
+def test_issue_queries_select_the_issue_project(monkeypatch):
+    """Every issue result -- search rows as well as single-issue fetches --
+    names the project the issue is on (a small bounded sub-object, like
+    team), so an agent can check project placement without another call."""
+    mock_post = Mock(
+        side_effect=[
+            MockResponse(json_data={"data": {"issues": {"nodes": []}}}),
+            MockResponse(json_data={"data": {"issue": {"id": "i1"}}}),
+        ]
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    linear.linear_search_issues()
+    linear.linear_get_issue("ENG-1")
+
+    search_call, get_call = mock_post.call_args_list
+    assert "project { id name }" in search_call.kwargs["json"]["query"]
+    assert "project { id name }" in get_call.kwargs["json"]["query"]
+
+
 def test_get_issue_query_includes_description_field(monkeypatch):
     """A single-issue fetch is exactly the case where the full body is the
     point, unlike the bulk list/search path."""
@@ -1734,6 +1754,116 @@ def test_create_issue_folds_graphql_error_detail_into_failure_message(monkeypatc
     assert "You do not have access to this team" in result["message"]
 
 
+_PROJECT = {"id": "p1", "name": "Website Redesign"}
+
+
+def test_create_issue_sends_project_id(monkeypatch):
+    """project_id is passed straight through as IssueCreateInput.projectId,
+    and the created issue is returned with its project selected, so the
+    caller can see the project actually set."""
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {
+                    "issueCreate": {
+                        "success": True,
+                        "issue": {
+                            "id": "i1",
+                            "identifier": "ENG-1",
+                            "project": _PROJECT,
+                        },
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(
+        linear.linear_create_issue(team_id=_TEAM_UUID, title="New bug", project_id="p1")
+    )
+
+    assert result["status"] == "success"
+    assert result["issue"]["project"] == _PROJECT
+    sent = mock_post.call_args.kwargs["json"]
+    assert sent["variables"]["input"] == {
+        "teamId": _TEAM_UUID,
+        "title": "New bug",
+        "projectId": "p1",
+    }
+    assert "project { id name }" in sent["query"]
+
+
+def test_create_issue_omits_project_id_when_empty(monkeypatch):
+    """project_id defaults to "" (like assignee_id), and an empty value
+    means "no project" -- it must be left out of the input rather than sent
+    as an empty projectId."""
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {"issueCreate": {"success": True, "issue": {"id": "i1"}}}
+            }
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    linear.linear_create_issue(team_id=_TEAM_UUID, title="New bug", project_id="")
+
+    sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
+    assert sent_input == {"teamId": _TEAM_UUID, "title": "New bug"}
+
+
+@pytest.mark.parametrize("project_id", [" p1", "p1 ", "   "])
+def test_create_issue_rejects_padded_project_id_before_any_request(
+    monkeypatch, caplog, project_id
+):
+    """A whitespace-padded project id is a caller bug, not a value to
+    repair: it is rejected before any request -- including the team-key
+    lookup that team_id="ENG" would otherwise trigger -- and returned as a
+    routine validation error rather than logged as a connector failure."""
+    mock_post = Mock()
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    with caplog.at_level("ERROR", logger="linear-mcp"):
+        result = json.loads(
+            linear.linear_create_issue(
+                team_id="ENG", title="New bug", project_id=project_id
+            )
+        )
+
+    assert result["status"] == "error"
+    assert "project_id" in result["message"]
+    mock_post.assert_not_called()
+    assert caplog.records == []
+
+
+def test_create_issue_surfaces_linear_error_for_unknown_project(monkeypatch):
+    """An unknown or inaccessible project id is not checked locally (only
+    Linear knows which projects exist) -- Linear's own error must reach the
+    caller. The message text here is illustrative; the shape is HTTP 200
+    with a null issueCreate and a top-level errors array."""
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {"issueCreate": None},
+                "errors": [{"message": "Entity not found: Project"}],
+            }
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(
+        linear.linear_create_issue(
+            team_id=_TEAM_UUID, title="New bug", project_id="no-such-project"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "Entity not found: Project" in result["message"]
+    sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
+    assert sent_input["projectId"] == "no-such-project"
+
+
 def test_update_issue_requires_at_least_one_field(monkeypatch):
     mock_post = Mock()
     monkeypatch.setattr(linear.requests, "post", mock_post)
@@ -2097,6 +2227,143 @@ def test_update_issue_allows_title_left_unset(monkeypatch):
     result = json.loads(linear.linear_update_issue("ENG-1", state_id="s1"))
 
     assert result["status"] == "success"
+
+
+def test_update_issue_moves_issue_to_project(monkeypatch):
+    """project_id is passed straight through as IssueUpdateInput.projectId,
+    and the updated issue is returned with its project selected."""
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {
+                    "issueUpdate": {
+                        "success": True,
+                        "issue": {
+                            "id": "i1",
+                            "identifier": "ENG-1",
+                            "project": _PROJECT,
+                        },
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_update_issue("ENG-1", project_id="p1"))
+
+    assert result["status"] == "success"
+    assert result["issue"]["project"] == _PROJECT
+    sent = mock_post.call_args.kwargs["json"]
+    assert sent["variables"] == {"id": "ENG-1", "input": {"projectId": "p1"}}
+    assert "project { id name }" in sent["query"]
+
+
+def test_update_issue_leaves_project_untouched_when_project_id_is_none(
+    monkeypatch,
+):
+    """project_id=None (the default) leaves the issue's project as it is:
+    projectId is omitted from the input, never sent as null -- an explicit
+    null is a different instruction from an absent field in GraphQL."""
+    mock_post = Mock(return_value=_ISSUE_UPDATE_SUCCESS)
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    linear.linear_update_issue("ENG-1", title="Renamed", project_id=None)
+
+    sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
+    assert sent_input == {"title": "Renamed"}
+
+
+def test_update_issue_treats_empty_project_id_as_unset(monkeypatch):
+    """Unlike assignee_id, an empty project_id does not clear the field: it
+    is treated the same as leaving project_id unset (like state_id), so this
+    tool never removes an issue from its project."""
+    mock_post = Mock(return_value=_ISSUE_UPDATE_SUCCESS)
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    linear.linear_update_issue("ENG-1", title="Renamed", project_id="")
+
+    sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
+    assert sent_input == {"title": "Renamed"}
+
+
+def test_update_issue_with_only_empty_project_id_has_nothing_to_update(
+    monkeypatch,
+):
+    mock_post = Mock()
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_update_issue("ENG-1", project_id=""))
+
+    assert result["status"] == "error"
+    assert "No fields" in result["message"]
+    mock_post.assert_not_called()
+
+
+@pytest.mark.parametrize("project_id", [" p1", "p1 ", "   "])
+def test_update_issue_rejects_padded_project_id_before_any_request(
+    monkeypatch, caplog, project_id
+):
+    mock_post = Mock()
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    with caplog.at_level("ERROR", logger="linear-mcp"):
+        result = json.loads(
+            linear.linear_update_issue("ENG-1", title="Renamed", project_id=project_id)
+        )
+
+    assert result["status"] == "error"
+    assert "project_id" in result["message"]
+    mock_post.assert_not_called()
+    assert caplog.records == []
+
+
+def test_update_issue_surfaces_linear_error_for_unknown_project(monkeypatch):
+    """Same contract as on create, through the other error shape Linear
+    uses -- HTTP 400 with a top-level errors array. The message text is
+    illustrative."""
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={"errors": [{"message": "Argument Validation Error"}]},
+            status_code=400,
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(
+        linear.linear_update_issue("ENG-1", project_id="no-such-project")
+    )
+
+    assert result["status"] == "error"
+    assert "status 400" in result["message"]
+    assert "Argument Validation Error" in result["message"]
+    sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
+    assert sent_input == {"projectId": "no-such-project"}
+
+
+async def test_issue_tools_register_project_id_and_point_to_list_projects():
+    """project_id is optional on both tools, and the tool descriptions tell
+    the agent where a project id comes from and what an empty value does on
+    update."""
+    tools = {tool.name: tool for tool in await linear.mcp.list_tools()}
+
+    create = tools["linear_create_issue"]
+    update = tools["linear_update_issue"]
+    assert create.inputSchema["properties"]["project_id"]["default"] == ""
+    assert "project_id" not in create.inputSchema["required"]
+    assert update.inputSchema["properties"]["project_id"]["default"] is None
+    assert "project_id" not in update.inputSchema["required"]
+
+    create_doc = " ".join(create.description.split())
+    update_doc = " ".join(update.description.split())
+    list_doc = " ".join(tools["linear_list_projects"].description.split())
+    assert "project_id: optional project id from linear_list_projects" in create_doc
+    assert "project_id: a project id from linear_list_projects" in update_doc
+    assert "cannot remove an issue from a project" in update_doc
+    assert (
+        "before passing project_id to linear_create_issue or linear_update_issue"
+        in list_doc
+    )
 
 
 def test_list_comments_returns_nodes(monkeypatch):
