@@ -8675,9 +8675,12 @@ def test_respond_to_event_writes_a_given_comment(monkeypatch):
 
 
 @pytest.mark.parametrize("comment", ["", "   ", None])
-def test_respond_to_event_keeps_an_existing_comment_when_none_is_given(
+def test_respond_to_event_clears_an_existing_comment_when_the_response_changes(
     monkeypatch, comment
 ):
+    """An old note (for example the reason for a previous decline) must not
+    stay attached to a different reply, and passing no comment is the only way
+    to ask for that, so the patch clears it explicitly."""
     own_entry = {**_RSVP_ME, "comment": "Original note"}
     existing_event = {
         **_RSVP_INVITE,
@@ -8691,7 +8694,28 @@ def test_respond_to_event_keeps_an_existing_comment_when_none_is_given(
     )
 
     entry = service.events.return_value.patch.call_args.kwargs["body"]["attendees"][0]
-    assert entry == {**own_entry, "responseStatus": "accepted"}
+    assert entry == {**own_entry, "responseStatus": "accepted", "comment": ""}
+
+
+def test_respond_to_event_writes_a_new_comment_when_the_response_changes(monkeypatch):
+    own_entry = {**_RSVP_ME, "comment": "Original note"}
+    existing_event = {
+        **_RSVP_INVITE,
+        "attendees": [_RSVP_ALICE, own_entry, _RSVP_BOB],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_respond_to_event(
+        event_id="evt1", response="declined", comment="  Another time  "
+    )
+
+    entry = service.events.return_value.patch.call_args.kwargs["body"]["attendees"][0]
+    assert entry == {
+        **own_entry,
+        "responseStatus": "declined",
+        "comment": "Another time",
+    }
 
 
 def test_respond_to_event_preserves_the_other_fields_of_the_own_entry(monkeypatch):
@@ -8794,49 +8818,94 @@ def test_respond_to_event_rejects_a_caller_who_is_not_an_attendee(
 
 
 @pytest.mark.parametrize(
-    "existing_event",
+    ("existing_event", "notify_organizer"),
     [
-        {
-            "id": "evt1",
-            "status": "confirmed",
-            "organizer": {"email": "me@example.com", "self": True},
-        },
-        {
-            "id": "evt1",
-            "status": "confirmed",
-            "organizer": {"email": "me@example.com", "self": True},
-            "attendees": [{**_RSVP_ME, "organizer": True}],
-        },
+        # organizer.self on the event object; no attendee list at all.
+        (
+            {
+                "id": "evt1",
+                "status": "confirmed",
+                "organizer": {"email": "me@example.com", "self": True},
+            },
+            True,
+        ),
+        # organizer.self; only the organizer's own attendee entry.
+        (
+            {
+                "id": "evt1",
+                "status": "confirmed",
+                "organizer": {"email": "me@example.com", "self": True},
+                "attendees": [{**_RSVP_ME, "organizer": True}],
+            },
+            True,
+        ),
+        # organizer.self; the organizer's own entry and another guest.
+        (
+            {
+                "id": "evt1",
+                "status": "confirmed",
+                "organizer": {"email": "me@example.com", "self": True},
+                "attendees": [{**_RSVP_ME, "organizer": True}, _RSVP_BOB],
+            },
+            True,
+        ),
+        (
+            {
+                "id": "evt1",
+                "status": "confirmed",
+                "organizer": {"email": "me@example.com", "self": True},
+                "attendees": [{**_RSVP_ME, "organizer": True}, _RSVP_BOB],
+            },
+            False,
+        ),
+        # organizer.self; other guests and no own attendee entry.
+        (
+            {
+                "id": "evt1",
+                "status": "confirmed",
+                "organizer": {"email": "me@example.com", "self": True},
+                "attendees": [_RSVP_ALICE, _RSVP_BOB],
+            },
+            True,
+        ),
+        # No organizer.self; only the own attendee entry says organizer: True.
+        (
+            {
+                "id": "evt1",
+                "status": "confirmed",
+                "organizer": {"email": "me@example.com"},
+                "attendees": [{**_RSVP_ME, "organizer": True}, _RSVP_BOB],
+            },
+            True,
+        ),
+        (
+            {
+                "id": "evt1",
+                "status": "confirmed",
+                "organizer": {"email": "me@example.com"},
+                "attendees": [{**_RSVP_ME, "organizer": True}, _RSVP_BOB],
+            },
+            False,
+        ),
+        # No organizer.self; the own entry is the only attendee.
+        (
+            {
+                "id": "evt1",
+                "status": "confirmed",
+                "organizer": {"email": "me@example.com"},
+                "attendees": [{**_RSVP_ME, "organizer": True}],
+            },
+            True,
+        ),
     ],
 )
-def test_respond_to_event_rejects_the_own_event_without_other_attendees(
-    monkeypatch, existing_event
+def test_respond_to_event_rejects_the_organizer(
+    monkeypatch, existing_event, notify_organizer
 ):
-    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
-    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
-
-    result = json.loads(
-        calendar.google_calendar_respond_to_event(event_id="evt1", response="accepted")
-    )
-
-    assert result["status"] == "error"
-    assert "own event" in result["message"]
-    assert "no other attendees" in result["message"]
-    assert "not an attendee" not in result["message"]
-    _assert_respond_wrote_nothing(service)
-
-
-@pytest.mark.parametrize("notify_organizer", [True, False])
-def test_respond_to_event_allows_the_organizer_when_other_attendees_exist(
-    monkeypatch, notify_organizer
-):
-    own_entry = {**_RSVP_ME, "organizer": True}
-    existing_event = {
-        "id": "evt1",
-        "status": "confirmed",
-        "organizer": {"email": "me@example.com", "self": True},
-        "attendees": [own_entry, _RSVP_BOB],
-    }
+    """A reply only applies to an invitation someone else organized: the
+    organizer cannot accept, decline or tentatively accept their own meeting
+    through this tool, whether the signal is organizer.self or the own attendee
+    entry's organizer flag."""
     service = _fake_service({"id": "evt1"}, existing_event=existing_event)
     monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
 
@@ -8848,37 +8917,10 @@ def test_respond_to_event_allows_the_organizer_when_other_attendees_exist(
         )
     )
 
-    assert result["status"] == "success"
-    service.events.return_value.patch.assert_called_once_with(
-        calendarId="primary",
-        eventId="evt1",
-        body={
-            "attendees": [{**own_entry, "responseStatus": "accepted"}],
-            "attendeesOmitted": True,
-        },
-        sendUpdates="none",
-    )
-
-
-def test_respond_to_event_rejects_the_organizer_without_a_self_attendee_entry(
-    monkeypatch,
-):
-    existing_event = {
-        "id": "evt1",
-        "status": "confirmed",
-        "organizer": {"email": "me@example.com", "self": True},
-        "attendees": [_RSVP_ALICE, _RSVP_BOB],
-    }
-    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
-    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
-
-    result = json.loads(
-        calendar.google_calendar_respond_to_event(event_id="evt1", response="accepted")
-    )
-
     assert result["status"] == "error"
-    assert "no entry" in result["message"]
-    assert "never adds the user as an attendee" in result["message"]
+    assert "organizer" in result["message"]
+    assert "google_calendar_delete_events" in result["message"]
+    assert "not an attendee" not in result["message"]
     _assert_respond_wrote_nothing(service)
 
 
@@ -8899,6 +8941,95 @@ def test_respond_to_event_reports_an_unknown_event_id(monkeypatch, status):
     assert "evt1" in result["message"]
     assert "not found" in result["message"].lower()
     _assert_respond_wrote_nothing(service)
+
+
+@pytest.mark.parametrize("status", [403, 500])
+def test_respond_to_event_reports_a_non_not_found_http_error_from_get(
+    monkeypatch, status
+):
+    """Only 404/410 get the friendly "not found" message; every other read
+    failure still becomes an error result and never reaches the patch."""
+    service = _fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
+    content = f'{{"error":{{"code":{status},"message":"Request failed"}}}}'.encode()
+    service.events.return_value.get.return_value.execute.side_effect = HttpError(
+        _HttpResponse(status), content
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(event_id="evt1", response="accepted")
+    )
+
+    assert result["status"] == "error"
+    assert result["message"]
+    service.events.return_value.get.assert_called_once()
+    _assert_respond_wrote_nothing(service)
+
+
+def test_respond_to_event_skips_a_duplicate_reply(monkeypatch):
+    """Retrying the same reply must not patch again, or every retry sends the
+    organizer another RSVP notification."""
+    own_entry = {**_RSVP_ME, "responseStatus": "accepted"}
+    existing_event = {
+        **_RSVP_INVITE,
+        "attendees": [_RSVP_ALICE, own_entry, _RSVP_BOB],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+    fetched_event = service.events.return_value.get.return_value.execute.return_value
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(event_id="evt1", response="accepted")
+    )
+
+    assert result["status"] == "success"
+    assert result["changed"] is False
+    assert "No reply was sent" in result["message"]
+    assert result["event"] == fetched_event
+    _assert_respond_wrote_nothing(service)
+
+
+def test_respond_to_event_skips_a_duplicate_reply_with_the_same_comment(monkeypatch):
+    own_entry = {**_RSVP_ME, "responseStatus": "accepted", "comment": "Sounds good"}
+    existing_event = {
+        **_RSVP_INVITE,
+        "attendees": [_RSVP_ALICE, own_entry, _RSVP_BOB],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(
+            event_id="evt1", response="accepted", comment="Sounds good"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["changed"] is False
+    _assert_respond_wrote_nothing(service)
+
+
+def test_respond_to_event_writes_a_new_comment_without_changing_the_response(
+    monkeypatch,
+):
+    own_entry = {**_RSVP_ME, "responseStatus": "accepted"}
+    existing_event = {
+        **_RSVP_INVITE,
+        "attendees": [_RSVP_ALICE, own_entry, _RSVP_BOB],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_respond_to_event(
+        event_id="evt1", response="accepted", comment="Bringing slides"
+    )
+
+    entry = service.events.return_value.patch.call_args.kwargs["body"]["attendees"][0]
+    assert entry == {
+        **own_entry,
+        "responseStatus": "accepted",
+        "comment": "Bringing slides",
+    }
 
 
 def test_respond_to_event_rejects_a_cancelled_event(monkeypatch):
@@ -9006,67 +9137,6 @@ def test_respond_to_event_description_covers_the_rules_the_model_must_follow():
     assert "not the same as deleting the event" in description
     assert "recurringEventId" in description
     assert "primary calendar" in description
-
-
-@pytest.mark.parametrize("notify_organizer", [True, False])
-def test_respond_to_event_uses_the_attendee_organizer_flag(
-    monkeypatch, notify_organizer
-):
-    """The own attendee's organizer=True is the second organizer signal, for
-    events whose top-level organizer object has no self field: an organizer
-    whose own entry carries the flag is still the organizer, so no
-    notification goes out even though notify_organizer is true."""
-    own_entry = {**_RSVP_ME, "organizer": True}
-    existing_event = {
-        "id": "evt1",
-        "status": "confirmed",
-        "organizer": {"email": "me@example.com"},
-        "attendees": [own_entry, _RSVP_BOB],
-    }
-    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
-    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
-
-    result = json.loads(
-        calendar.google_calendar_respond_to_event(
-            event_id="evt1",
-            response="accepted",
-            notify_organizer=notify_organizer,
-        )
-    )
-
-    assert result["status"] == "success"
-    service.events.return_value.patch.assert_called_once_with(
-        calendarId="primary",
-        eventId="evt1",
-        body={
-            "attendees": [{**own_entry, "responseStatus": "accepted"}],
-            "attendeesOmitted": True,
-        },
-        sendUpdates="none",
-    )
-
-
-def test_respond_to_event_attendee_organizer_flag_rejects_own_event_without_others(
-    monkeypatch,
-):
-    """Without the attendee.organizer fallback, this event would look like a
-    normal invitation from someone else and the tool would write a reply for
-    the caller's own event that has no other attendees."""
-    own_entry = {**_RSVP_ME, "organizer": True}
-    existing_event = {
-        "id": "evt1",
-        "status": "confirmed",
-        "organizer": {"email": "me@example.com"},
-        "attendees": [own_entry],
-    }
-    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
-    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
-
-    result = json.loads(
-        calendar.google_calendar_respond_to_event(event_id="evt1", response="accepted")
-    )
-
-    assert result["status"] == "error"
-    assert "own event" in result["message"]
-    assert "no other attendees" in result["message"]
-    _assert_respond_wrote_nothing(service)
+    assert "google_calendar_delete_events" in description
+    assert '"changed": false' in description
+    assert "duplicate reply" in description
