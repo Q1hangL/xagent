@@ -19,9 +19,10 @@ class _HttpResponse:
 
 def _fake_service(execute_result: dict, existing_event: dict | None = None):
     """A stand-in for the googleapiclient Calendar service that records the
-    kwargs passed to events().insert()/update() and returns execute_result.
-    existing_event is what events().get() returns, simulating an event that
-    already has state (attendees, conferenceData) before this call.
+    kwargs passed to events().insert()/update()/patch() and returns
+    execute_result. existing_event is what events().get() returns, simulating
+    an event that already has state (attendees, conferenceData) before this
+    call.
 
     A deep copy is handed to the code under test (rather than the caller's
     own existing_event object): calendar.py mutates the dict it gets back
@@ -36,6 +37,7 @@ def _fake_service(execute_result: dict, existing_event: dict | None = None):
     request.execute.return_value = execute_result
     events.insert = Mock(return_value=request)
     events.update = Mock(return_value=request)
+    events.patch = Mock(return_value=request)
     # These Meet-focused tests do not exercise scheduling-conflict discovery.
     # Return empty availability data so they continue to isolate event writes.
     fetched_event = {
@@ -8563,3 +8565,444 @@ def test_kind_conversion_validates_retained_rule_when_midnight_values_compare_eq
     assert "UNTIL" in result["message"]
     service.events.return_value.list.assert_not_called()
     service.events.return_value.update.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# google_calendar_respond_to_event (accept / decline / tentative an invite)
+# ---------------------------------------------------------------------------
+
+_RSVP_ME = {
+    "email": "me@example.com",
+    "self": True,
+    "responseStatus": "needsAction",
+    "displayName": "Me",
+}
+_RSVP_ALICE = {
+    "email": "alice@example.com",
+    "organizer": True,
+    "responseStatus": "accepted",
+    "comment": "See you",
+}
+_RSVP_BOB = {
+    "email": "bob@example.com",
+    "responseStatus": "tentative",
+    "optional": True,
+}
+_RSVP_INVITE = {
+    "id": "evt1",
+    "status": "confirmed",
+    "organizer": {"email": "alice@example.com"},
+    "attendees": [_RSVP_ALICE, _RSVP_ME, _RSVP_BOB],
+}
+
+
+def _assert_respond_wrote_nothing(service: Mock) -> None:
+    events = service.events.return_value
+    events.patch.assert_not_called()
+    events.update.assert_not_called()
+    events.insert.assert_not_called()
+    events.delete.assert_not_called()
+
+
+@pytest.mark.parametrize("response", ["accepted", "declined", "tentative"])
+def test_respond_to_event_normal_invitee_patches_only_own_entry(monkeypatch, response):
+    execute_result = {"id": "evt1", "status": "confirmed"}
+    service = _fake_service(execute_result, existing_event=_RSVP_INVITE)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(event_id="evt1", response=response)
+    )
+
+    assert result["status"] == "success"
+    assert result["event"] == execute_result
+    events = service.events.return_value
+    events.get.assert_called_once_with(calendarId="primary", eventId="evt1")
+    events.patch.assert_called_once_with(
+        calendarId="primary",
+        eventId="evt1",
+        body={
+            "attendees": [{**_RSVP_ME, "responseStatus": response}],
+            "attendeesOmitted": True,
+        },
+        sendUpdates="all",
+    )
+    events.update.assert_not_called()
+    events.insert.assert_not_called()
+    events.delete.assert_not_called()
+
+
+def test_respond_to_event_notify_organizer_false_sends_no_updates(monkeypatch):
+    service = _fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_respond_to_event(
+        event_id="evt1", response="accepted", notify_organizer=False
+    )
+
+    _, kwargs = service.events.return_value.patch.call_args
+    assert kwargs["sendUpdates"] == "none"
+    assert kwargs["body"] == {
+        "attendees": [{**_RSVP_ME, "responseStatus": "accepted"}],
+        "attendeesOmitted": True,
+    }
+
+
+def test_respond_to_event_normalizes_response_case_and_whitespace(monkeypatch):
+    service = _fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_respond_to_event(event_id="evt1", response=" Declined ")
+
+    body = service.events.return_value.patch.call_args.kwargs["body"]
+    assert body["attendees"] == [{**_RSVP_ME, "responseStatus": "declined"}]
+
+
+def test_respond_to_event_writes_a_given_comment(monkeypatch):
+    service = _fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_respond_to_event(
+        event_id="evt1", response="tentative", comment="  Please send an agenda  "
+    )
+
+    entry = service.events.return_value.patch.call_args.kwargs["body"]["attendees"][0]
+    assert entry == {
+        **_RSVP_ME,
+        "responseStatus": "tentative",
+        "comment": "Please send an agenda",
+    }
+
+
+@pytest.mark.parametrize("comment", ["", "   ", None])
+def test_respond_to_event_keeps_an_existing_comment_when_none_is_given(
+    monkeypatch, comment
+):
+    own_entry = {**_RSVP_ME, "comment": "Original note"}
+    existing_event = {
+        **_RSVP_INVITE,
+        "attendees": [_RSVP_ALICE, own_entry, _RSVP_BOB],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_respond_to_event(
+        event_id="evt1", response="accepted", comment=comment
+    )
+
+    entry = service.events.return_value.patch.call_args.kwargs["body"]["attendees"][0]
+    assert entry == {**own_entry, "responseStatus": "accepted"}
+
+
+def test_respond_to_event_preserves_the_other_fields_of_the_own_entry(monkeypatch):
+    own_entry = {
+        "email": "me@example.com",
+        "self": True,
+        "responseStatus": "needsAction",
+        "displayName": "Me",
+        "optional": True,
+        "additionalGuests": 2,
+    }
+    existing_event = {
+        **_RSVP_INVITE,
+        "attendees": [_RSVP_ALICE, own_entry, _RSVP_BOB],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+    fetched_event = service.events.return_value.get.return_value.execute.return_value
+    fetched_before = copy.deepcopy(fetched_event)
+
+    calendar.google_calendar_respond_to_event(event_id="evt1", response="accepted")
+
+    body = service.events.return_value.patch.call_args.kwargs["body"]
+    assert body["attendees"] == [{**own_entry, "responseStatus": "accepted"}]
+    assert fetched_event == fetched_before
+
+
+@pytest.mark.parametrize(
+    "response", ["maybe", "needsAction", "accept", "", "   ", None]
+)
+def test_respond_to_event_rejects_an_invalid_response_before_any_api_call(
+    monkeypatch, response
+):
+    get_service = Mock(
+        return_value=_fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", get_service)
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(event_id="evt1", response=response)
+    )
+
+    assert result["status"] == "error"
+    assert "response must be one of accepted, declined, tentative" in result["message"]
+    get_service.assert_not_called()
+
+
+@pytest.mark.parametrize("event_id", ["", "   "])
+def test_respond_to_event_rejects_an_empty_event_id_before_any_api_call(
+    monkeypatch, event_id
+):
+    get_service = Mock(
+        return_value=_fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", get_service)
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(
+            event_id=event_id, response="accepted"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "event_id" in result["message"]
+    get_service.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "existing_event",
+    [
+        {
+            "id": "evt1",
+            "status": "confirmed",
+            "organizer": {"email": "alice@example.com"},
+            "attendees": [_RSVP_ALICE, _RSVP_BOB],
+        },
+        {
+            "id": "evt1",
+            "status": "confirmed",
+            "organizer": {"email": "alice@example.com"},
+            "attendees": [],
+        },
+    ],
+)
+def test_respond_to_event_rejects_a_caller_who_is_not_an_attendee(
+    monkeypatch, existing_event
+):
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(event_id="evt1", response="accepted")
+    )
+
+    assert result["status"] == "error"
+    assert "not an attendee" in result["message"]
+    assert "Google Calendar" in result["message"]
+    assert "never adds the user as an attendee" in result["message"]
+    _assert_respond_wrote_nothing(service)
+
+
+@pytest.mark.parametrize(
+    "existing_event",
+    [
+        {
+            "id": "evt1",
+            "status": "confirmed",
+            "organizer": {"email": "me@example.com", "self": True},
+        },
+        {
+            "id": "evt1",
+            "status": "confirmed",
+            "organizer": {"email": "me@example.com", "self": True},
+            "attendees": [{**_RSVP_ME, "organizer": True}],
+        },
+    ],
+)
+def test_respond_to_event_rejects_the_own_event_without_other_attendees(
+    monkeypatch, existing_event
+):
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(event_id="evt1", response="accepted")
+    )
+
+    assert result["status"] == "error"
+    assert "own event" in result["message"]
+    assert "no other attendees" in result["message"]
+    assert "not an attendee" not in result["message"]
+    _assert_respond_wrote_nothing(service)
+
+
+@pytest.mark.parametrize("notify_organizer", [True, False])
+def test_respond_to_event_allows_the_organizer_when_other_attendees_exist(
+    monkeypatch, notify_organizer
+):
+    own_entry = {**_RSVP_ME, "organizer": True}
+    existing_event = {
+        "id": "evt1",
+        "status": "confirmed",
+        "organizer": {"email": "me@example.com", "self": True},
+        "attendees": [own_entry, _RSVP_BOB],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(
+            event_id="evt1",
+            response="accepted",
+            notify_organizer=notify_organizer,
+        )
+    )
+
+    assert result["status"] == "success"
+    service.events.return_value.patch.assert_called_once_with(
+        calendarId="primary",
+        eventId="evt1",
+        body={
+            "attendees": [{**own_entry, "responseStatus": "accepted"}],
+            "attendeesOmitted": True,
+        },
+        sendUpdates="none",
+    )
+
+
+def test_respond_to_event_rejects_the_organizer_without_a_self_attendee_entry(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "evt1",
+        "status": "confirmed",
+        "organizer": {"email": "me@example.com", "self": True},
+        "attendees": [_RSVP_ALICE, _RSVP_BOB],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(event_id="evt1", response="accepted")
+    )
+
+    assert result["status"] == "error"
+    assert "no entry" in result["message"]
+    assert "never adds the user as an attendee" in result["message"]
+    _assert_respond_wrote_nothing(service)
+
+
+@pytest.mark.parametrize("status", [404, 410])
+def test_respond_to_event_reports_an_unknown_event_id(monkeypatch, status):
+    service = _fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
+    content = f'{{"error":{{"code":{status},"message":"Not Found"}}}}'.encode()
+    service.events.return_value.get.return_value.execute.side_effect = HttpError(
+        _HttpResponse(status), content
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(event_id="evt1", response="accepted")
+    )
+
+    assert result["status"] == "error"
+    assert "evt1" in result["message"]
+    assert "not found" in result["message"].lower()
+    _assert_respond_wrote_nothing(service)
+
+
+def test_respond_to_event_rejects_a_cancelled_event(monkeypatch):
+    existing_event = {**_RSVP_INVITE, "status": "cancelled"}
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(event_id="evt1", response="accepted")
+    )
+
+    assert result["status"] == "error"
+    assert "cancelled" in result["message"]
+    _assert_respond_wrote_nothing(service)
+
+
+@pytest.mark.parametrize(
+    ("event_id", "existing_event"),
+    [
+        (
+            "abc_20261021T070000Z",
+            {
+                "id": "abc_20261021T070000Z",
+                "status": "confirmed",
+                "recurringEventId": "abc",
+                "organizer": {"email": "alice@example.com"},
+                "attendees": [_RSVP_ALICE, _RSVP_ME, _RSVP_BOB],
+            },
+        ),
+        (
+            "abc",
+            {
+                "id": "abc",
+                "status": "confirmed",
+                "recurrence": ["RRULE:FREQ=WEEKLY;COUNT=3"],
+                "organizer": {"email": "alice@example.com"},
+                "attendees": [_RSVP_ALICE, _RSVP_ME, _RSVP_BOB],
+            },
+        ),
+    ],
+)
+def test_respond_to_event_uses_the_given_id_for_an_occurrence_or_a_series(
+    monkeypatch, event_id, existing_event
+):
+    service = _fake_service({"id": event_id}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(
+            event_id=event_id, response="accepted"
+        )
+    )
+
+    assert result["status"] == "success"
+    events = service.events.return_value
+    events.get.assert_called_once_with(calendarId="primary", eventId=event_id)
+    events.patch.assert_called_once_with(
+        calendarId="primary",
+        eventId=event_id,
+        body={
+            "attendees": [{**_RSVP_ME, "responseStatus": "accepted"}],
+            "attendeesOmitted": True,
+        },
+        sendUpdates="all",
+    )
+    events.instances.assert_not_called()
+
+
+def test_respond_to_event_returns_an_error_when_the_patch_fails(monkeypatch):
+    service = _fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
+    service.events.return_value.patch.return_value.execute.side_effect = HttpError(
+        _HttpResponse(403), b'{"error":{"code":403,"message":"Forbidden"}}'
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(event_id="evt1", response="accepted")
+    )
+
+    assert result["status"] == "error"
+    assert "Forbidden" in result["message"]
+    service.events.return_value.patch.assert_called_once()
+
+
+def test_respond_to_event_is_registered_with_the_documented_parameters():
+    tool = calendar.mcp._tool_manager.get_tool("google_calendar_respond_to_event")
+
+    assert tool is not None
+    properties = tool.parameters["properties"]
+    assert set(properties) == {"event_id", "response", "comment", "notify_organizer"}
+    assert tool.parameters["required"] == ["event_id", "response"]
+    assert properties["comment"]["default"] == ""
+    assert properties["notify_organizer"]["default"] is True
+
+
+def test_respond_to_event_description_covers_the_rules_the_model_must_follow():
+    tool = calendar.mcp._tool_manager.get_tool("google_calendar_respond_to_event")
+    description = " ".join(tool.description.split())
+
+    assert "explicitly asked" in description
+    assert "accepted" in description
+    assert "declined" in description
+    assert "tentative" in description
+    assert "never adds the user as an attendee" in description
+    assert "not the same as deleting the event" in description
+    assert "recurringEventId" in description
+    assert "primary calendar" in description
