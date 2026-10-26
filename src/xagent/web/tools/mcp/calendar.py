@@ -4,7 +4,7 @@ import logging
 import os
 import urllib.parse
 import uuid
-from datetime import date
+from datetime import date, datetime
 from functools import cache
 from importlib import resources
 from pathlib import Path
@@ -952,6 +952,100 @@ def get_calendar_service() -> Any:
     return build("calendar", "v3", credentials=credentials)
 
 
+def _event_boundary_key(field: Any, tz_name: str) -> datetime | None:
+    """Resolve one side of an event (start, end, or originalStartTime) to the
+    instant it denotes.
+
+    Reuses `_event_boundary` so the existing resolution rules stay in one
+    place: a `dateTime` that carries its own offset keeps it (even when the
+    same object's `timeZone` names a different, organizer-owned zone), an
+    offsetless `dateTime` is read in its sibling `timeZone`, and only when that
+    sibling is absent does it fall back to the searched calendar's `tz_name`.
+    An all-day `date` is widened to its own midnight in `tz_name`, which makes
+    two all-day boundaries compare by calendar date.
+    `datetime_key_for_comparison` then treats equivalent spellings ("Z" vs
+    "+00:00", differing offsets, fractional seconds) as the same instant.
+    Returns None, rather than a guessed instant, when the value cannot be
+    resolved - malformed data, an unknown zone, or a wall time skipped by a
+    daylight-saving transition - so callers never report a rescheduling from a
+    value they could not read.
+    """
+    try:
+        boundary = _event_boundary(field, tz_name)
+    except (TypeError, ValueError):
+        return None
+    if boundary is None:
+        return None
+    key = _datetime_key_for_comparison(boundary)
+    return key if isinstance(key, datetime) else None
+
+
+def _search_event_local_time(field: Any, tz_name: str) -> str | None:
+    """Render one event boundary as the wall-clock time a person in the
+    searched calendar's `tz_name` would read: an ISO 8601 string with that
+    zone's offset for a timed boundary, or the untouched YYYY-MM-DD date for an
+    all-day one (which has no clock time to convert). None when the boundary
+    cannot be resolved instead of an invented time.
+    """
+    if not isinstance(field, dict):
+        return None
+    date_time = field.get("dateTime")
+    if isinstance(date_time, str) and date_time:
+        point = _event_boundary_key(field, tz_name)
+        if point is None:
+            return None
+        try:
+            zone = resolve_zoneinfo(tz_name)
+        except ValueError:
+            return None
+        return point.astimezone(zone).isoformat()
+    date_value = field.get("date")
+    if isinstance(date_value, str) and date_value:
+        return date_value if is_bare_date(date_value) else None
+    return None
+
+
+def _search_event_was_rescheduled(event: dict[str, Any], tz_name: str) -> bool:
+    """Whether a recurring instance's current start differs from the start it
+    was originally scheduled for.
+
+    Google adds `originalStartTime` only to a recurring series' instances, so
+    an event without it has nothing to compare and is not treated as moved.
+    Both sides are compared as the instants they denote via
+    `_event_boundary_key` (never as raw strings; all-day instances compare by
+    calendar date). A side that cannot be resolved keeps this False instead of
+    turning into a guessed reschedule.
+    """
+    original_start = event.get("originalStartTime")
+    if not isinstance(original_start, dict) or not original_start:
+        return False
+    original_key = _event_boundary_key(original_start, tz_name)
+    current_key = _event_boundary_key(event.get("start"), tz_name)
+    if original_key is None or current_key is None:
+        return False
+    return original_key != current_key
+
+
+def _normalize_search_event(event: Any, tz_name: str) -> Any:
+    """Return one events.list item with four small fields added and every
+    original field/value kept exactly as Google sent it.
+
+    `local_start`/`local_end` are wall-clock renderings in `tz_name` (the
+    searched calendar's configured zone), `local_timezone` is that zone, and
+    `rescheduled` is whether this recurring instance actually moved. The copy
+    is shallow and per event, so no full event is duplicated and the provider
+    response is not mutated in place.
+    """
+    if not isinstance(event, dict):
+        return event
+    normalized = dict(event)
+    normalized["local_start"] = _search_event_local_time(event.get("start"), tz_name)
+    normalized["local_end"] = _search_event_local_time(event.get("end"), tz_name)
+    normalized["local_timezone"] = tz_name
+    normalized["rescheduled"] = _search_event_was_rescheduled(event, tz_name)
+    return normalized
+
+
 @mcp.tool()
 def google_calendar_search_events(
     query: str | None = None,
@@ -962,14 +1056,30 @@ def google_calendar_search_events(
     """
     Search and list Google Calendar events with optional query and label filters.
     Optionally filter by time_min and time_max (RFC3339 formatted, e.g., '2024-01-01T00:00:00Z').
+    Every returned event keeps Google's original fields and adds local_start,
+    local_end, local_timezone and rescheduled. local_start/local_end are the
+    event's start and end as wall-clock times in local_timezone, the time zone
+    configured on the searched calendar: timed events use an ISO 8601 string
+    with its offset, all-day events keep their YYYY-MM-DD date. Report event
+    times to the user in local_timezone.
+    rescheduled is true only when a recurring instance's original start differs
+    from its current start; describe an occurrence as moved or rescheduled only
+    when rescheduled is true.
+    An event is cancelled only when its status is "cancelled"; rescheduled being
+    true does not mean the occurrence was cancelled.
     """
     try:
         service = get_calendar_service()
+        # Search only ever lists the primary calendar, so only its configured
+        # time zone is needed here; the id returned by the same call is used by
+        # the write tools that compare organizer identity.
+        calendar_timezone = _primary_calendar_info(service)[1]
         kwargs = {
             "calendarId": "primary",
             "maxResults": max_results,
             "singleEvents": True,
             "orderBy": "startTime",
+            "timeZone": calendar_timezone,
         }
 
         if time_min:
@@ -980,7 +1090,10 @@ def google_calendar_search_events(
             kwargs["q"] = query
 
         events_result = service.events().list(**kwargs).execute()
-        events = events_result.get("items", [])
+        events = [
+            _normalize_search_event(event, calendar_timezone)
+            for event in events_result.get("items", [])
+        ]
 
         return json.dumps({"status": "success", "events": events})
 
