@@ -9617,6 +9617,22 @@ def test_search_events_handles_an_unresolvable_calendar_time_zone(monkeypatch):
             "end": {"date": "2026-10-24"},
             "originalStartTime": {"date": "2026-10-22"},
         },
+        {
+            "id": "moved-timed",
+            "status": "confirmed",
+            "recurringEventId": "series-2",
+            "start": {"dateTime": "2026-10-23T06:15:00+08:00"},
+            "end": {"dateTime": "2026-10-23T06:45:00+08:00"},
+            "originalStartTime": {"dateTime": "2026-10-22T06:15:00+08:00"},
+        },
+        {
+            "id": "unmoved-timed",
+            "status": "confirmed",
+            "recurringEventId": "series-3",
+            "start": {"dateTime": "2026-10-23T06:15:00Z"},
+            "end": {"dateTime": "2026-10-23T06:45:00Z"},
+            "originalStartTime": {"dateTime": "2026-10-23T14:15:00+08:00"},
+        },
     ]
     service = _search_service(events, response_timezone="Not/AZone")
 
@@ -9631,6 +9647,11 @@ def test_search_events_handles_an_unresolvable_calendar_time_zone(monkeypatch):
     assert by_id["all-day"]["local_start"] == "2026-10-23"
     assert by_id["all-day"]["local_end"] == "2026-10-24"
     assert by_id["moved-all-day"]["rescheduled"] is True
+    # Offset-bearing timed starts compare as instants even when the calendar
+    # zone itself cannot be resolved and the local wall time is null.
+    assert by_id["moved-timed"]["local_start"] is None
+    assert by_id["moved-timed"]["rescheduled"] is True
+    assert by_id["unmoved-timed"]["rescheduled"] is False
     service.calendars.return_value.get.assert_not_called()
 
 
@@ -9940,6 +9961,24 @@ def test_search_events_still_returns_events_when_the_metadata_permission_is_miss
         singleEvents=True,
         orderBy="startTime",
     )
+
+    # The same denied metadata call with no events is still a success envelope,
+    # not an error and not a fabricated event.
+    empty_service = _search_service([])
+    empty_service.calendars.return_value.get.return_value.execute.side_effect = (
+        HttpError(
+            _HttpResponse(403),
+            (
+                b'{"error":{"code":403,"message":"Insufficient Permission",'
+                b'"errors":[{"reason":"insufficientPermissions"}]}}'
+            ),
+        )
+    )
+
+    empty_result = _search_result(monkeypatch, empty_service)
+
+    assert empty_result == {"status": "success", "events": []}
+    empty_service.calendars.return_value.get.assert_not_called()
 
 
 @pytest.mark.parametrize("status", [403, 500])
