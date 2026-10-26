@@ -9144,9 +9144,10 @@ def test_respond_to_event_description_covers_the_rules_the_model_must_follow():
 
 # --- google_calendar_search_events: local time zone and rescheduled instances ---
 #
-# The searched calendar's configured time zone (calendars().get("primary")
-# .timeZone) is the only source the normalized fields below may use. Nested
-# fixtures deliberately pair a different organizer timeZone with it, and the
+# The searched calendar's time zone must come from the events.list response
+# itself: search must not call calendars().get(), because that endpoint needs a
+# metadata permission older grants may not have. Nested fixtures deliberately
+# pair a different organizer timeZone with the response zone, and the
 # search-service helpers are local to these tests so the shared _fake_service
 # (built for event writes) keeps its existing behavior.
 
@@ -9156,25 +9157,27 @@ _SEARCH_FIELDS = ("local_start", "local_end", "local_timezone", "rescheduled")
 def _search_service(
     events: list[dict],
     *,
-    calendar_id: str = "member@example.com",
-    calendar_timezone: str | None = "Asia/Manila",
+    response_timezone: str | None = "Asia/Manila",
 ) -> Mock:
     """A stand-in Calendar service for google_calendar_search_events.
 
-    events().list().execute() returns `events`. calendars().get() returns the
-    searched calendar's own identity/time zone; passing calendar_timezone=None
-    omits the timeZone key (the metadata-missing case). The default calendar
-    zone is not UTC so a hardcoded UTC cannot pass by accident.
+    events().list().execute() returns the `events` items plus the calendar's
+    top-level `timeZone`, which is where search reads the searched calendar's
+    zone from; response_timezone=None omits it (the zone-missing case). The
+    default zone is not UTC so a hardcoded UTC cannot pass by accident, and the
+    calendars().get() mock returns an obviously different zone so a regression
+    that calls it cannot match the expected local fields. The tests also assert
+    calendars().get() was never called.
     """
     service = Mock()
+    response: dict = {"items": events}
+    if response_timezone is not None:
+        response["timeZone"] = response_timezone
     service.events.return_value.list.return_value = Mock(
-        execute=Mock(return_value={"items": events})
+        execute=Mock(return_value=response)
     )
-    calendar_resource = {"id": calendar_id}
-    if calendar_timezone is not None:
-        calendar_resource["timeZone"] = calendar_timezone
     service.calendars.return_value.get.return_value = Mock(
-        execute=Mock(return_value=calendar_resource)
+        execute=Mock(return_value={"id": "member@example.com", "timeZone": "UTC"})
     )
     return service
 
@@ -9395,7 +9398,7 @@ def test_search_events_uses_the_searched_calendar_time_zone(
         "start": {"dateTime": start, "timeZone": "Asia/Tokyo"},
         "end": {"dateTime": end, "timeZone": "Asia/Tokyo"},
     }
-    service = _search_service([event], calendar_timezone=calendar_timezone)
+    service = _search_service([event], response_timezone=calendar_timezone)
 
     result = _search_result(monkeypatch, service)
 
@@ -9404,8 +9407,8 @@ def test_search_events_uses_the_searched_calendar_time_zone(
     assert normalized["local_start"] == expected_start
     assert normalized["local_end"] == expected_end
     assert normalized["rescheduled"] is False
-    structure = service.events.return_value.list.call_args.kwargs
-    assert structure["timeZone"] == calendar_timezone
+    assert "timeZone" not in service.events.return_value.list.call_args.kwargs
+    service.calendars.return_value.get.assert_not_called()
 
 
 def test_search_events_keeps_all_day_dates_and_flags_only_date_moves(monkeypatch):
@@ -9459,6 +9462,178 @@ def test_search_events_keeps_all_day_dates_and_flags_only_date_moves(monkeypatch
         _assert_original_fields_kept(event, original)
 
 
+def test_search_events_compares_all_day_instances_by_date_not_midnight(monkeypatch):
+    """Pacific/Apia skipped 2011-12-30, so the local midnights of 30 Dec and
+    31 Dec are the same instant; the calendar dates are still different."""
+    event = {
+        "id": "instance-1",
+        "status": "confirmed",
+        "recurringEventId": "series-1",
+        "start": {"date": "2011-12-31"},
+        "end": {"date": "2012-01-01"},
+        "originalStartTime": {"date": "2011-12-30"},
+    }
+    service = _search_service([event], response_timezone="Pacific/Apia")
+
+    result = _search_result(monkeypatch, service)
+
+    normalized = result["events"][0]
+    assert normalized["local_start"] == "2011-12-31"
+    assert normalized["local_end"] == "2012-01-01"
+    assert normalized["local_timezone"] == "Pacific/Apia"
+    assert normalized["rescheduled"] is True
+
+
+@pytest.mark.parametrize(
+    ("event", "expected_local_start"),
+    [
+        (
+            {
+                "id": "instance-1",
+                "status": "confirmed",
+                "recurringEventId": "series-1",
+                "start": {"dateTime": "2026-10-23T00:00:00+08:00"},
+                "end": {"dateTime": "2026-10-23T01:00:00+08:00"},
+                "originalStartTime": {"date": "2026-10-23"},
+            },
+            "2026-10-23T00:00:00+08:00",
+        ),
+        (
+            {
+                "id": "instance-2",
+                "status": "confirmed",
+                "recurringEventId": "series-2",
+                "start": {"date": "2026-10-23"},
+                "end": {"date": "2026-10-24"},
+                "originalStartTime": {"dateTime": "2026-10-23T00:00:00+08:00"},
+            },
+            "2026-10-23",
+        ),
+    ],
+)
+def test_search_events_treats_all_day_and_timed_kind_changes_as_rescheduled(
+    monkeypatch, event, expected_local_start
+):
+    _, result = _search_events(monkeypatch, [event])
+
+    normalized = result["events"][0]
+    assert normalized["local_start"] == expected_local_start
+    assert normalized["rescheduled"] is True
+
+
+def test_search_events_does_not_compare_an_original_start_without_a_current_start(
+    monkeypatch,
+):
+    event = {
+        "id": "instance-1",
+        "status": "confirmed",
+        "recurringEventId": "series-1",
+        "end": {"dateTime": "2026-10-23T07:15:00+08:00"},
+        "originalStartTime": {"dateTime": "2026-10-23T06:15:00+08:00"},
+    }
+
+    _, result = _search_events(monkeypatch, [event])
+
+    normalized = result["events"][0]
+    assert normalized["local_start"] is None
+    assert normalized["rescheduled"] is False
+
+
+@pytest.mark.parametrize(
+    "original_start",
+    [
+        None,
+        {},
+        "2026-10-23T06:15:00+08:00",
+        {"dateTime": "not-a-time"},
+        {"date": "2026-02-30"},
+    ],
+)
+def test_search_events_does_not_treat_unusable_original_starts_as_moves(
+    monkeypatch, original_start
+):
+    event = {
+        "id": "instance-1",
+        "status": "confirmed",
+        "recurringEventId": "series-1",
+        "start": {"dateTime": "2026-10-23T06:15:00+08:00"},
+        "end": {"dateTime": "2026-10-23T07:15:00+08:00"},
+        "originalStartTime": original_start,
+    }
+
+    _, result = _search_events(monkeypatch, [event])
+
+    assert result["events"][0]["rescheduled"] is False
+
+
+def test_search_events_does_not_treat_an_invalid_all_day_date_as_a_move(monkeypatch):
+    events = [
+        {
+            "id": "invalid-original-date",
+            "status": "confirmed",
+            "recurringEventId": "series-1",
+            "start": {"date": "2026-10-23"},
+            "end": {"date": "2026-10-24"},
+            "originalStartTime": {"date": "2026-02-30"},
+        },
+        {
+            "id": "invalid-current-date",
+            "status": "confirmed",
+            "recurringEventId": "series-2",
+            "start": {"date": "2026-02-30"},
+            "end": {"date": "2026-03-01"},
+            "originalStartTime": {"date": "2026-10-23"},
+        },
+    ]
+
+    _, result = _search_events(monkeypatch, events)
+
+    by_id = _events_by_id(result)
+    assert by_id["invalid-original-date"]["local_start"] == "2026-10-23"
+    assert by_id["invalid-original-date"]["rescheduled"] is False
+    assert by_id["invalid-current-date"]["local_start"] is None
+    assert by_id["invalid-current-date"]["rescheduled"] is False
+
+
+def test_search_events_handles_an_unresolvable_calendar_time_zone(monkeypatch):
+    events = [
+        {
+            "id": "timed",
+            "status": "confirmed",
+            "start": {"dateTime": "2026-10-23T06:15:00+08:00"},
+            "end": {"dateTime": "2026-10-23T06:45:00+08:00"},
+        },
+        {
+            "id": "all-day",
+            "status": "confirmed",
+            "start": {"date": "2026-10-23"},
+            "end": {"date": "2026-10-24"},
+        },
+        {
+            "id": "moved-all-day",
+            "status": "confirmed",
+            "recurringEventId": "series-1",
+            "start": {"date": "2026-10-23"},
+            "end": {"date": "2026-10-24"},
+            "originalStartTime": {"date": "2026-10-22"},
+        },
+    ]
+    service = _search_service(events, response_timezone="Not/AZone")
+
+    result = _search_result(monkeypatch, service)
+
+    assert result["status"] == "success"
+    by_id = _events_by_id(result)
+    assert by_id["timed"]["local_timezone"] == "Not/AZone"
+    assert by_id["timed"]["local_start"] is None
+    assert by_id["timed"]["local_end"] is None
+    assert by_id["timed"]["rescheduled"] is False
+    assert by_id["all-day"]["local_start"] == "2026-10-23"
+    assert by_id["all-day"]["local_end"] == "2026-10-24"
+    assert by_id["moved-all-day"]["rescheduled"] is True
+    service.calendars.return_value.get.assert_not_called()
+
+
 def test_search_events_does_not_infer_rescheduled_from_series_or_time(monkeypatch):
     events = [
         {
@@ -9506,7 +9681,7 @@ def test_search_events_does_not_infer_rescheduled_from_series_or_time(monkeypatc
     assert _events_by_id(result)["tentative"]["status"] == "tentative"
 
 
-def test_search_events_requests_the_searched_calendar_time_zone(monkeypatch):
+def test_search_events_returns_an_empty_list_unchanged(monkeypatch):
     service = _search_service([])
 
     result = _search_result(monkeypatch, service)
@@ -9517,9 +9692,24 @@ def test_search_events_requests_the_searched_calendar_time_zone(monkeypatch):
         maxResults=10,
         singleEvents=True,
         orderBy="startTime",
-        timeZone="Asia/Manila",
     )
-    service.calendars.return_value.get.assert_called_once_with(calendarId="primary")
+    service.calendars.return_value.get.assert_not_called()
+
+
+def test_search_events_reads_the_calendar_time_zone_from_the_list_response(
+    monkeypatch,
+):
+    event = {
+        "id": "evt-1",
+        "start": {"date": "2026-10-23"},
+        "end": {"date": "2026-10-24"},
+    }
+    service = _search_service([event])
+
+    result = _search_result(monkeypatch, service)
+
+    assert result["events"][0]["local_timezone"] == "Asia/Manila"
+    service.calendars.return_value.get.assert_not_called()
 
 
 def test_search_events_passes_query_window_and_max_results(monkeypatch):
@@ -9542,9 +9732,8 @@ def test_search_events_passes_query_window_and_max_results(monkeypatch):
         q="standup",
         timeMin="2026-10-22T13:00:00Z",
         timeMax="2026-10-23T13:00:00Z",
-        timeZone="Asia/Manila",
     )
-    service.calendars.return_value.get.assert_called_once_with(calendarId="primary")
+    service.calendars.return_value.get.assert_not_called()
 
 
 def test_search_events_preserves_every_original_field(monkeypatch):
@@ -9620,6 +9809,8 @@ def test_search_events_description_documents_time_zone_and_state_rules():
     description = " ".join(tool.description.split())
     assert "local_timezone" in description
     assert "wall-clock times in local_timezone" in description
+    assert "local field is null" in description
+    assert "fall back to the event's own start or end" in description
     assert "moved or rescheduled only when rescheduled is true" in description
     assert 'status is "cancelled"' in description
     assert "does not mean the occurrence was cancelled" in description
@@ -9686,7 +9877,7 @@ def test_search_events_falls_back_to_utc_when_the_calendar_has_no_time_zone(
         "start": {"dateTime": "2026-10-23T06:15:00+08:00"},
         "end": {"dateTime": "2026-10-23T06:45:00+08:00"},
     }
-    service = _search_service([event], calendar_timezone=None)
+    service = _search_service([event], response_timezone=None)
 
     result = _search_result(monkeypatch, service)
 
@@ -9699,14 +9890,33 @@ def test_search_events_falls_back_to_utc_when_the_calendar_has_no_time_zone(
         maxResults=10,
         singleEvents=True,
         orderBy="startTime",
-        timeZone="UTC",
     )
+    service.calendars.return_value.get.assert_not_called()
 
 
-def test_search_events_returns_an_error_when_the_calendar_permission_is_missing(
+def test_search_events_still_returns_events_when_the_metadata_permission_is_missing(
     monkeypatch,
 ):
-    service = _search_service([])
+    """A grant that can list events but cannot read calendar metadata keeps
+    working: search must not call calendars.get at all, and it reads the
+    calendar's zone from the list response instead."""
+    events = [
+        {
+            "id": "instance-1",
+            "status": "confirmed",
+            "recurringEventId": "series-1",
+            "start": {"dateTime": "2026-10-23T06:15:00+08:00"},
+            "end": {"dateTime": "2026-10-23T06:45:00+08:00"},
+            "originalStartTime": {"dateTime": "2026-10-23T06:15:00+08:00"},
+        },
+        {
+            "id": "plain",
+            "status": "confirmed",
+            "start": {"dateTime": "2026-10-23T09:00:00+08:00"},
+            "end": {"dateTime": "2026-10-23T10:00:00+08:00"},
+        },
+    ]
+    service = _search_service(events)
     service.calendars.return_value.get.return_value.execute.side_effect = HttpError(
         _HttpResponse(403),
         (
@@ -9717,32 +9927,27 @@ def test_search_events_returns_an_error_when_the_calendar_permission_is_missing(
 
     result = _search_result(monkeypatch, service)
 
-    assert result["status"] == "error"
-    assert "events" not in result
-    assert "permission" in result["message"].lower()
-    service.events.return_value.list.assert_not_called()
-
-
-def test_search_events_returns_an_error_when_the_calendar_lookup_fails(
-    monkeypatch,
-):
-    service = _search_service([])
-    service.calendars.return_value.get.return_value.execute.side_effect = HttpError(
-        _HttpResponse(500), b'{"error":{"code":500,"message":"Backend Error"}}'
+    assert result["status"] == "success"
+    assert [event["id"] for event in result["events"]] == ["instance-1", "plain"]
+    normalized = result["events"][0]
+    assert normalized["local_start"] == "2026-10-23T06:15:00+08:00"
+    assert normalized["local_timezone"] == "Asia/Manila"
+    assert normalized["rescheduled"] is False
+    service.calendars.return_value.get.assert_not_called()
+    service.events.return_value.list.assert_called_once_with(
+        calendarId="primary",
+        maxResults=10,
+        singleEvents=True,
+        orderBy="startTime",
     )
 
-    result = _search_result(monkeypatch, service)
 
-    assert result["status"] == "error"
-    assert "events" not in result
-    assert result["message"]
-    service.events.return_value.list.assert_not_called()
-
-
-def test_search_events_returns_an_error_when_listing_fails(monkeypatch):
+@pytest.mark.parametrize("status", [403, 500])
+def test_search_events_returns_an_error_when_listing_fails(monkeypatch, status):
     service = _search_service([])
+    content = f'{{"error":{{"code":{status},"message":"Request failed"}}}}'.encode()
     service.events.return_value.list.return_value.execute.side_effect = HttpError(
-        _HttpResponse(500), b'{"error":{"code":500,"message":"Backend Error"}}'
+        _HttpResponse(status), content
     )
 
     result = _search_result(monkeypatch, service)
@@ -9767,6 +9972,12 @@ def test_search_events_handles_unusable_event_times_without_guessing(monkeypatch
             "status": "confirmed",
             "start": {"date": "2026-13-40"},
             "end": {"date": "2026-13-41"},
+        },
+        {
+            "id": "bad-sibling-zone",
+            "status": "confirmed",
+            "start": {"dateTime": "2026-10-23T06:15:00", "timeZone": "Not/AZone"},
+            "end": {"dateTime": "2026-10-23T07:15:00", "timeZone": "Not/AZone"},
         },
     ]
     fixture = copy.deepcopy(events)
@@ -9793,7 +10004,7 @@ def test_search_events_does_not_guess_from_an_impossible_local_time(monkeypatch)
         "end": {"dateTime": "2026-03-08T03:30:00"},
         "originalStartTime": {"dateTime": "2026-03-08T02:30:00"},
     }
-    service = _search_service([event], calendar_timezone="America/New_York")
+    service = _search_service([event], response_timezone="America/New_York")
 
     result = _search_result(monkeypatch, service)
 
@@ -9817,7 +10028,7 @@ def test_search_events_uses_each_event_date_offset_for_conversion(monkeypatch):
             "end": {"dateTime": "2026-11-05T15:00:00Z"},
         },
     ]
-    service = _search_service(events, calendar_timezone="America/New_York")
+    service = _search_service(events, response_timezone="America/New_York")
 
     result = _search_result(monkeypatch, service)
 
@@ -9844,7 +10055,7 @@ def test_search_events_adds_only_four_small_fields_to_large_events(monkeypatch):
         for index in range(3)
     ]
     baseline_text = json.dumps({"status": "success", "events": copy.deepcopy(events)})
-    service = _search_service(events, calendar_timezone="America/New_York")
+    service = _search_service(events, response_timezone="America/New_York")
     monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
 
     result_text = calendar.google_calendar_search_events(max_results=3)
@@ -9860,9 +10071,8 @@ def test_search_events_adds_only_four_small_fields_to_large_events(monkeypatch):
         maxResults=3,
         singleEvents=True,
         orderBy="startTime",
-        timeZone="America/New_York",
     )
-    service.calendars.return_value.get.assert_called_once_with(calendarId="primary")
+    service.calendars.return_value.get.assert_not_called()
     events_api = service.events.return_value
     events_api.get.assert_not_called()
     events_api.insert.assert_not_called()
