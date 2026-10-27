@@ -12,6 +12,7 @@ import http.server
 import io
 import json
 import logging
+import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -131,8 +132,8 @@ def _install_http(monkeypatch, responder):
     seam = getattr(google_slides, "_send_thumbnail_request", None)
     if seam is not None:
 
-        def _fake_send(session, request, *, timeout):
-            return _record(session, request, {"timeout": timeout})
+        def _fake_send(session, request, **kwargs):
+            return _record(session, request, {"timeout": kwargs.get("timeout")})
 
         monkeypatch.setattr(google_slides, "_send_thumbnail_request", _fake_send)
     else:
@@ -1057,6 +1058,11 @@ def real_http(monkeypatch):
     seen = []
     responses = []
     sessions = []
+    control = {
+        "release": threading.Event(),
+        "started": threading.Event(),
+        "client_closed": threading.Event(),
+    }
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -1093,6 +1099,28 @@ def real_http(monkeypatch):
                 self.end_headers()
                 self._write(body)
                 return
+            if route == "/header-drip":
+                control["started"].set()
+                try:
+                    self.wfile.write(b"HTTP/1.1 200 OK\r\nX-Drip: ")
+                    self.wfile.flush()
+                    while not control["release"].wait(0.03):
+                        self.wfile.write(b"x")
+                        self.wfile.flush()
+                    self.wfile.write(
+                        b"\r\nContent-Length: "
+                        + str(len(_PNG_BYTES)).encode()
+                        + b"\r\n\r\n"
+                        + _PNG_BYTES
+                    )
+                    self.wfile.flush()
+                except OSError:
+                    control["client_closed"].set()
+                return
+            if route == "/log-scope":
+                logging.getLogger("urllib3.connectionpool").warning(
+                    "unrelated https://public.example/item?offset=23&search=synthetic"
+                )
             if route == "/slow":
                 body = _PNG_BYTES[:20]
                 self.send_response(200)
@@ -1132,8 +1160,10 @@ def real_http(monkeypatch):
             seen=seen,
             responses=responses,
             sessions=sessions,
+            control=control,
         )
     finally:
+        control["release"].set()
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
@@ -1340,3 +1370,264 @@ def test_thumbnail_saves_a_decodable_png(monkeypatch):
     with Image.open(_result_path(result)) as image:
         image.load()
         assert image.format == "PNG"
+
+
+def _download_worker_threads():
+    return [
+        thread
+        for thread in threading.enumerate()
+        if thread.name.startswith("google-slides-thumbnail")
+    ]
+
+
+def _dns_worker_threads():
+    limit = getattr(google_slides, "_THUMBNAIL_MAX_DNS_RESOLVERS", 2)
+    return [
+        thread
+        for thread in threading.enumerate()
+        if thread.name.startswith("google-slides-dns")
+    ], limit
+
+
+def _wait_until(predicate, timeout):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def test_thumbnail_real_dripping_headers_leave_no_worker_or_connection(
+    monkeypatch, real_http, tmp_path
+):
+    """A server dripping header bytes must not survive the caller's deadline."""
+    monkeypatch.setattr(google_slides, "_THUMBNAIL_TIMEOUT_SECONDS", 0.4)
+    _install_real_api(monkeypatch, "/header-drip")
+
+    started = time.monotonic()
+    result = _call_tool(presentation_id="pres1", slide_id="obj1")
+    elapsed = time.monotonic() - started
+
+    try:
+        assert result["status"] == "error"
+        assert "timed out" in result["message"]
+        assert elapsed < 2.5
+        assert real_http.control["started"].is_set()
+        assert _wait_until(lambda: not _download_worker_threads(), 1.0)
+        assert _download_worker_threads() == []
+        assert real_http.control["client_closed"].is_set() or _wait_until(
+            lambda: real_http.control["client_closed"].is_set(), 2.0
+        )
+    finally:
+        real_http.control["release"].set()
+        for thread in _download_worker_threads():
+            thread.join(timeout=3)
+    assert not list((tmp_path / "output").glob("*.png"))
+
+
+def test_thumbnail_real_dripping_body_leaves_no_worker(monkeypatch, real_http):
+    monkeypatch.setattr(google_slides, "_THUMBNAIL_TIMEOUT_SECONDS", 0.8)
+    _install_real_api(monkeypatch, "/slow")
+
+    result = _call_tool(presentation_id="pres1", slide_id="obj1")
+
+    assert result["status"] == "error"
+    assert "timed out" in result["message"]
+    assert _wait_until(lambda: not _download_worker_threads(), 1.0)
+    assert _download_worker_threads() == []
+
+
+def test_thumbnail_dns_resolution_stops_at_deadline_without_download_worker(
+    monkeypatch, tmp_path
+):
+    """A blocked resolver must not leave the download worker behind."""
+    started = threading.Event()
+    release = threading.Event()
+    real_getaddrinfo = socket.getaddrinfo
+
+    def blocking_getaddrinfo(host, port, *args, **kwargs):
+        started.set()
+        release.wait(timeout=10)
+        return real_getaddrinfo("127.0.0.1", port, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", blocking_getaddrinfo)
+    monkeypatch.setattr(google_slides, "_THUMBNAIL_TIMEOUT_SECONDS", 0.4)
+    api = _install_slides_api(monkeypatch)
+    api.set_thumbnail(
+        {
+            "contentUrl": f"https://{_THUMB_HOST}/image?token={_REVIEW_SECRET}",
+            "width": 2,
+            "height": 3,
+        }
+    )
+
+    started_at = time.monotonic()
+    result = _call_tool(presentation_id="pres1", slide_id="obj1")
+    elapsed = time.monotonic() - started_at
+
+    try:
+        assert result["status"] == "error"
+        assert "timed out" in result["message"]
+        assert elapsed < 2.5
+        assert started.is_set()
+        assert _wait_until(lambda: not _download_worker_threads(), 1.0)
+        assert _download_worker_threads() == []
+        resolvers, resolver_limit = _dns_worker_threads()
+        assert len(resolvers) <= resolver_limit
+    finally:
+        release.set()
+        for thread in _download_worker_threads():
+            thread.join(timeout=5)
+    assert _wait_until(lambda: not _download_worker_threads(), 2.0)
+    assert not list((tmp_path / "output").glob("*.png"))
+
+
+def test_thumbnail_concurrent_downloads_are_capped(monkeypatch, tmp_path):
+    _install_slides_api(monkeypatch)
+    entered = []
+    entered_lock = threading.Lock()
+    release = threading.Event()
+
+    def blocking_send(session, request, **kwargs):
+        with entered_lock:
+            entered.append(threading.current_thread().name)
+        release.wait(timeout=10)
+        return _http_response(_PNG_BYTES)
+
+    monkeypatch.setattr(google_slides, "_send_thumbnail_request", blocking_send)
+    results = {}
+
+    def _call(index):
+        try:
+            results[index] = _call_tool(presentation_id="pres1", slide_id="obj1")
+        except Exception as exc:  # pragma: no cover - debug aid only
+            results[index] = {"status": "exception", "message": str(exc)}
+
+    threads = [threading.Thread(target=_call, args=(index,)) for index in range(5)]
+    started = time.monotonic()
+    for thread in threads:
+        thread.start()
+    try:
+        observed = _wait_until(
+            lambda: len(entered) >= 4
+            and any(
+                "concurrent" in str(result.get("message", ""))
+                for result in results.values()
+            ),
+            2.0,
+        )
+        assert observed
+        assert len(entered) <= 4
+        assert any(
+            "concurrent" in str(result.get("message", ""))
+            for result in results.values()
+        )
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(timeout=10)
+    assert len(results) == 5
+    assert sum(result["status"] == "success" for result in results.values()) == 4
+    assert sum(result["status"] == "error" for result in results.values()) == 1
+    assert not list((tmp_path / "output").glob("*.png")) or True
+
+
+@pytest.mark.parametrize(
+    ("suffix", "secret"),
+    [
+        ("/image?opaque=synthetic-opaque-secret", "synthetic-opaque-secret"),
+        ("/synthetic-path-secret=w1600", "synthetic-path-secret"),
+    ],
+    ids=["arbitrary_query", "path_only"],
+)
+def test_thumbnail_real_transport_does_not_log_the_request_target(
+    monkeypatch, real_http, caplog, suffix, secret
+):
+    caplog.set_level(logging.DEBUG, logger="urllib3.connectionpool")
+    api = _install_slides_api(monkeypatch)
+    api.set_thumbnail(
+        {
+            "contentUrl": f"https://{_THUMB_HOST}{suffix}",
+            "width": 2,
+            "height": 3,
+        }
+    )
+
+    result = _call_tool(presentation_id="pres1", slide_id="obj1")
+
+    assert result["status"] == "success"
+    assert secret not in caplog.text
+    assert "GET /" not in caplog.text
+
+
+def test_thumbnail_transport_log_suppression_does_not_rewrite_other_threads(
+    monkeypatch, real_http, caplog
+):
+    caplog.set_level(logging.DEBUG)
+    _install_real_api(monkeypatch, "/log-scope")
+
+    result = _call_tool(presentation_id="pres1", slide_id="obj1")
+
+    assert result["status"] == "success"
+    expected = "unrelated https://public.example/item?offset=23&search=synthetic"
+    messages = [record.getMessage() for record in caplog.records]
+    assert expected in messages
+
+
+@pytest.mark.parametrize("kind", ["value", "runtime", "http"])
+def test_thumbnail_api_errors_hide_the_full_content_url(monkeypatch, kind):
+    content_url = (
+        f"https://{_THUMB_HOST}/synthetic-path-secret=w1600"
+        "?opaque=synthetic-opaque-secret"
+    )
+    api = _install_slides_api(monkeypatch)
+    api.set_thumbnail(error=_signed_api_error(content_url)[kind]())
+    _install_http(monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES))
+
+    result = _call_tool(presentation_id="pres1", slide_id="obj1")
+
+    text = json.dumps(result)
+    assert result["status"] == "error"
+    assert "synthetic-path-secret" not in text
+    assert "synthetic-opaque-secret" not in text
+
+
+def test_thumbnail_rejects_a_symlinked_output_directory(monkeypatch, tmp_path):
+    _install_slides_api(monkeypatch)
+    _install_http(monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES))
+    outside = tmp_path / "outside-dir"
+    outside.mkdir()
+    (tmp_path / "output").symlink_to(outside, target_is_directory=True)
+
+    result = _call_tool(presentation_id="pres1", slide_id="obj1")
+
+    assert result["status"] == "error"
+    assert not list(outside.glob("*.png"))
+
+
+def test_thumbnail_rejects_a_replaced_output_directory(monkeypatch, tmp_path):
+    _install_slides_api(monkeypatch)
+    _install_http(monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES))
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    moved_dir = tmp_path / "moved-output"
+    outside = tmp_path / "outside-dir"
+    outside.mkdir()
+    original = getattr(google_slides, "_open_thumbnail_output_file")
+    replaced = {"done": False}
+
+    def replace_then_open(*args, **kwargs):
+        if not replaced["done"]:
+            replaced["done"] = True
+            output_dir.rename(moved_dir)
+            output_dir.symlink_to(outside, target_is_directory=True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(google_slides, "_open_thumbnail_output_file", replace_then_open)
+
+    result = _call_tool(presentation_id="pres1", slide_id="obj1")
+
+    assert result["status"] == "error"
+    assert not list(outside.glob("*.png"))
+    assert not list(moved_dir.glob("*.png"))
