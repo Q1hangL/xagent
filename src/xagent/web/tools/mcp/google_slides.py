@@ -1798,6 +1798,7 @@ def google_slides_get_slide_thumbnail(
         pres_id = _resolve_presentation_id(presentation_id)
         service = get_slides_service()
 
+        target_slide_id: str
         if page_number is not None:
             presentation = (
                 service.presentations()
@@ -1808,8 +1809,8 @@ def google_slides_get_slide_thumbnail(
             slides = (
                 presentation.get("slides", []) if isinstance(presentation, dict) else []
             )
-            object_ids = [
-                slide.get("objectId")
+            object_ids: list[str] = [
+                str(slide.get("objectId"))
                 for slide in slides
                 if isinstance(slide, dict)
                 and isinstance(slide.get("objectId"), str)
@@ -1823,8 +1824,13 @@ def google_slides_get_slide_thumbnail(
                     f"presentation has {len(object_ids)} slides."
                 )
             target_slide_id = object_ids[page_number - 1]
-        else:
+        elif slide_id is not None:
             target_slide_id = slide_id
+        else:
+            return _error(
+                "Provide exactly one of slide_id (a slide object id) or "
+                "page_number (1-based); neither was given."
+            )
 
         thumbnail = (
             service.presentations()
