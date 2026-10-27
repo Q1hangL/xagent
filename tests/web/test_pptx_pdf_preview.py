@@ -123,7 +123,7 @@ async def test_preview_cache_hit_never_starts_libreoffice(tmp_path, monkeypatch)
     monkeypatch.setenv("XAGENT_STORAGE_ROOT", str(tmp_path / "storage"))
     pptx = _write_pptx(tmp_path)
     cache_path = files._pptx_pdf_cache_path(pptx)
-    cache_path.parent.mkdir(parents=True)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_bytes(b"%PDF-1.4 cached")
 
     async def unexpected_subprocess(*_args, **_kwargs):
@@ -225,7 +225,7 @@ async def test_preview_returns_none_when_libreoffice_is_missing(tmp_path, monkey
 async def test_preview_returns_none_when_conversion_times_out(tmp_path, monkeypatch):
     monkeypatch.setenv("XAGENT_STORAGE_ROOT", str(tmp_path / "storage"))
     pptx = _write_pptx(tmp_path)
-    process = _FakeProcess()
+    process = _FakeProcess(returncode=None)
 
     async def create_subprocess_exec(*_args, **_kwargs):
         return process

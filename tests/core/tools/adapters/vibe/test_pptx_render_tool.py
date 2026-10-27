@@ -261,6 +261,7 @@ async def test_factory_build_with_sandbox_keeps_the_tool_on_the_host(
 
     monkeypatch.setattr(render, "convert_pptx_to_pdf", convert_pptx_to_pdf)
     monkeypatch.setattr(render, "render_pdf_pages_to_pngs", render_pdf_pages_to_pngs)
+    monkeypatch.setattr(render, "read_pdf_page_count", lambda _path: 1)
     file_ids: dict[str, str] = {}
 
     def register_files(files, *, db_session=None):

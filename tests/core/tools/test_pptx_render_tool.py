@@ -163,7 +163,6 @@ class _FakeFitz:
         self.documents: list[_FakeDocument] = []
 
     def open(self, _path):
-        assert not self.documents, "the document must not be reopened"
         document = _FakeDocument(self.pages)
         self.documents.append(document)
         return document
@@ -203,6 +202,7 @@ def _install_rasterizer(monkeypatch, render, *, page_count, requested, rendered)
         return page_count, pages
 
     monkeypatch.setattr(render, "render_pdf_pages_to_pngs", render_pdf_pages_to_pngs)
+    monkeypatch.setattr(render, "read_pdf_page_count", lambda _path: page_count)
 
 
 def _output_rows(session_factory):
@@ -375,7 +375,7 @@ async def test_render_default_renders_every_page_of_a_small_deck(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(tmp_path)
+    deck = _write_deck(durable_workspace.workspace.input_dir)
     conversion_calls: list[pathlib.Path] = []
     timeouts: list[float] = []
     requested: list[list[int]] = []
@@ -426,7 +426,7 @@ async def test_render_default_caps_at_twenty_pages_without_rasterizing_more(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(tmp_path)
+    deck = _write_deck(durable_workspace.workspace.input_dir)
     requested: list[list[int]] = []
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
     _install_rasterizer(
@@ -451,7 +451,7 @@ async def test_render_rejects_an_explicit_range_over_the_page_limit_before_conve
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(tmp_path)
+    deck = _write_deck(durable_workspace.workspace.input_dir)
     conversions: list[pathlib.Path] = []
     _install_conversion(monkeypatch, render, calls=conversions, timeout_records=[])
     requested: list[list[int]] = []
@@ -476,7 +476,7 @@ async def test_render_honours_an_explicit_page_range(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(tmp_path)
+    deck = _write_deck(durable_workspace.workspace.input_dir)
     requested: list[list[int]] = []
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
     _install_rasterizer(
@@ -505,7 +505,7 @@ async def test_render_rejects_an_explicit_range_beyond_the_deck(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(tmp_path)
+    deck = _write_deck(durable_workspace.workspace.input_dir)
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
     requested: list[list[int]] = []
     _install_rasterizer(
@@ -528,7 +528,7 @@ async def test_render_reports_an_empty_presentation(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(tmp_path)
+    deck = _write_deck(durable_workspace.workspace.input_dir)
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
     requested: list[list[int]] = []
     _install_rasterizer(
@@ -548,7 +548,7 @@ async def test_render_page_limit_is_applied_before_any_pixmap_allocation(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(tmp_path)
+    deck = _write_deck(durable_workspace.workspace.input_dir)
     events: list = []
     fake_fitz = _FakeFitz([(720.0, 540.0)] * 25, events)
     monkeypatch.setattr(render, "fitz", fake_fitz)
@@ -568,7 +568,7 @@ async def test_render_limits_pixels_before_requesting_a_huge_pixmap(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(tmp_path)
+    deck = _write_deck(durable_workspace.workspace.input_dir)
     events: list = []
     fake_fitz = _FakeFitz([(1_000_000.0, 1_000_000.0)], events)
     monkeypatch.setattr(render, "fitz", fake_fitz)
@@ -649,7 +649,7 @@ async def test_render_each_page_is_durably_registered_and_resolvable(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(tmp_path)
+    deck = _write_deck(durable_workspace.workspace.input_dir)
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
     _install_rasterizer(monkeypatch, render, page_count=2, requested=[], rendered=[])
 
@@ -761,7 +761,7 @@ async def test_render_rejects_non_pptx_missing_outside_and_symlink_inputs(
         (str(directory_input), "input_not_a_file"),
         (str(missing), "input_not_found"),
         (str(outside), "input_outside_workspace"),
-        (str(escape), "input_not_found"),
+        (str(escape), "input_outside_workspace"),
         ("file:00000000-0000-0000-0000-000000000000", "input_not_found"),
     ]
     for selector, expected_code in cases:
@@ -794,7 +794,7 @@ async def test_render_rejects_mixed_argument_types_without_converting(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(tmp_path)
+    deck = _write_deck(durable_workspace.workspace.input_dir)
     conversions: list[pathlib.Path] = []
     _install_conversion(monkeypatch, render, calls=conversions, timeout_records=[])
 
@@ -822,7 +822,7 @@ async def test_render_passes_the_fixed_timeout_to_the_converter(
 ):
     render = _load_render_module()
     conversion = _load_conversion_module()
-    deck = _write_deck(tmp_path)
+    deck = _write_deck(durable_workspace.workspace.input_dir)
     timeouts: list[float] = []
     _install_conversion(monkeypatch, render, calls=[], timeout_records=timeouts)
     _install_rasterizer(monkeypatch, render, page_count=1, requested=[], rendered=[])
@@ -838,7 +838,7 @@ async def test_render_cancellation_reclaims_the_subprocess_and_cleans_up(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(tmp_path)
+    deck = _write_deck(durable_workspace.workspace.input_dir)
     started = asyncio.Event()
     seen: dict[str, pathlib.Path] = {}
 
@@ -872,8 +872,8 @@ async def test_concurrent_renders_use_isolated_directories(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    first = _write_deck(tmp_path / "one", "first.pptx")
-    second = _write_deck(tmp_path / "two", "second.pptx")
+    first = _write_deck(durable_workspace.workspace.input_dir, "first.pptx")
+    second = _write_deck(durable_workspace.workspace.input_dir, "second.pptx")
     seen: list[dict] = []
     release = asyncio.Event()
     arrived = asyncio.Event()
@@ -908,9 +908,11 @@ async def test_concurrent_renders_use_isolated_directories(
     results = await asyncio.wait_for(both, timeout=10)
 
     assert [result["success"] for result in results] == [True, True]
-    directories = [entry["output_dir"] for entry in seen]
+    directories = [pathlib.Path(result["output_dir"]) for result in results]
+    pdf_directories = [entry["output_dir"] for entry in seen]
     temp_roots = [entry["temp_root"] for entry in seen]
     assert len({str(path) for path in directories}) == 2
+    assert len({str(path) for path in pdf_directories}) == 2
     assert len({str(path) for path in temp_roots}) == 2
     for path in directories:
         assert path.is_dir()
@@ -926,7 +928,7 @@ async def test_render_fails_clearly_when_libreoffice_is_missing(
 ):
     render = _load_render_module()
     conversion = _load_conversion_module()
-    deck = _write_deck(tmp_path)
+    deck = _write_deck(durable_workspace.workspace.input_dir)
 
     async def convert_pptx_to_pdf(pptx_path, output_dir, *, timeout_seconds=60.0):
         raise conversion.PptxConverterUnavailableError(
@@ -950,7 +952,7 @@ async def test_render_reports_conversion_timeout_and_cleans_up(
 ):
     render = _load_render_module()
     conversion = _load_conversion_module()
-    deck = _write_deck(tmp_path)
+    deck = _write_deck(durable_workspace.workspace.input_dir)
 
     async def convert_pptx_to_pdf(pptx_path, output_dir, *, timeout_seconds=60.0):
         raise conversion.PptxConversionTimeoutError(
@@ -972,7 +974,7 @@ async def test_render_reports_conversion_failure_and_cleans_up(
 ):
     render = _load_render_module()
     conversion = _load_conversion_module()
-    deck = _write_deck(tmp_path)
+    deck = _write_deck(durable_workspace.workspace.input_dir)
 
     async def convert_pptx_to_pdf(pptx_path, output_dir, *, timeout_seconds=60.0):
         raise conversion.PptxConversionFailedError("soffice exited 1")
@@ -991,7 +993,7 @@ async def test_render_reports_a_bad_pdf_and_cleans_up(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(tmp_path)
+    deck = _write_deck(durable_workspace.workspace.input_dir)
 
     async def convert_pptx_to_pdf(pptx_path, output_dir, *, timeout_seconds=60.0):
         pdf_path = pathlib.Path(output_dir) / (pathlib.Path(pptx_path).stem + ".pdf")
@@ -1013,7 +1015,7 @@ async def test_render_cleans_up_when_rasterization_fails_midway(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(tmp_path)
+    deck = _write_deck(durable_workspace.workspace.input_dir)
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
 
     def failing_raster(pdf_path, page_numbers, output_dir, *, scale=2.0, max_pixels=0):
@@ -1023,6 +1025,7 @@ async def test_render_cleans_up_when_rasterization_fails_midway(
         raise render.PptxRenderRasterError("page 2 could not be rasterized")
 
     monkeypatch.setattr(render, "render_pdf_pages_to_pngs", failing_raster)
+    monkeypatch.setattr(render, "read_pdf_page_count", lambda _path: 2)
 
     result = await render.render_pptx_to_images(str(deck), durable_workspace.workspace)
 
@@ -1037,7 +1040,7 @@ async def test_render_cleans_up_when_a_png_cannot_be_written(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(tmp_path)
+    deck = _write_deck(durable_workspace.workspace.input_dir)
     events: list = []
     fake_fitz = _FakeFitz([(720.0, 540.0)], events)
 
@@ -1064,7 +1067,7 @@ async def test_render_reports_registration_failure_and_removes_unregistered_pngs
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(tmp_path)
+    deck = _write_deck(durable_workspace.workspace.input_dir)
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
     _install_rasterizer(monkeypatch, render, page_count=3, requested=[], rendered=[])
     workspace = durable_workspace.workspace
@@ -1088,7 +1091,7 @@ async def test_render_keeps_already_registered_pngs_when_registration_fails_part
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(tmp_path)
+    deck = _write_deck(durable_workspace.workspace.input_dir)
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
     _install_rasterizer(monkeypatch, render, page_count=3, requested=[], rendered=[])
     workspace = durable_workspace.workspace
@@ -1124,7 +1127,7 @@ async def test_render_two_page_deck_with_real_soffice(
         pytest.skip("LibreOffice (soffice) is not installed on this host")
 
     pptx = pytest.importorskip("pptx")
-    deck_path = tmp_path / "synthetic-two-slides.pptx"
+    deck_path = durable_workspace.workspace.input_dir / "synthetic-two-slides.pptx"
     presentation = pptx.Presentation()
     for index in range(2):
         slide = presentation.slides.add_slide(presentation.slide_layouts[6])

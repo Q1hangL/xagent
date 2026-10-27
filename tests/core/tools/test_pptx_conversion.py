@@ -139,6 +139,7 @@ async def test_conversion_passes_headless_convert_to_and_per_call_profile(
         observed["profile_dir"] = _profile_dir_from_arguments(calls[0]["arguments"])
         observed["profile_existed_during_run"] = observed["profile_dir"].is_dir()
         (output_dir / "deck.pdf").write_bytes(b"%PDF-1.4 conversion")
+        process.returncode = 0
         return b"", b""
 
     process.communicate = communicate  # type: ignore[method-assign]
@@ -208,6 +209,7 @@ async def test_non_zero_exit_reports_stderr_and_cleans_the_profile(
 
     async def communicate():
         observed["profile_dir"] = _profile_dir_from_arguments(calls[0]["arguments"])
+        process.returncode = 1
         return b"", b"libreoffice exploded"
 
     process.communicate = communicate  # type: ignore[method-assign]
@@ -250,6 +252,7 @@ async def test_a_different_pdf_is_not_silently_accepted(tmp_path, monkeypatch):
 
     async def communicate():
         (output_dir / "some-other.pdf").write_bytes(b"%PDF-1.4 stray")
+        process.returncode = 0
         return b"", b""
 
     process.communicate = communicate  # type: ignore[method-assign]
