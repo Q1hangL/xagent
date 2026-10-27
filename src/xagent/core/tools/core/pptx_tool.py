@@ -642,6 +642,76 @@ def register_namespaces() -> None:
 # PPTX READING
 # ============================================================================
 
+# Minimal OOXML parts every readable .pptx package must contain. This is a
+# cheap up-front check for damaged or incomplete files, not a full validation
+# of the OOXML structure.
+_REQUIRED_PPTX_PARTS: tuple[str, ...] = (
+    "[Content_Types].xml",
+    "ppt/presentation.xml",
+)
+
+_DAMAGED_PACKAGE_HINT = (
+    "The file may be damaged or incompletely uploaded. "
+    "Please re-export or re-upload this file. "
+    "This error applies only to this file; other files must be read separately."
+)
+
+# PresentationReader error strings mapped to the missing package part.
+_MISSING_PART_REASONS = {
+    "presentation.xml not found": (
+        'it is missing the required OOXML part "ppt/presentation.xml"'
+    ),
+    "relationships.xml not found": (
+        'it is missing the required relationship part "ppt/_rels/presentation.xml.rels"'
+    ),
+}
+
+
+def _invalid_pptx_error(file_name: str, reason: str) -> Dict[str, Any]:
+    """Build the explicit failure result for a file that is not a readable package."""
+    return {
+        "success": False,
+        "error": (
+            f'Cannot read "{file_name}": this is not a valid .pptx package; '
+            f"{reason}. {_DAMAGED_PACKAGE_HINT}"
+        ),
+    }
+
+
+def _check_pptx_package(pptx_path: Path) -> Optional[Dict[str, Any]]:
+    """Return an explicit failure when a file is not a readable .pptx package.
+
+    Only the ZIP container and the required package parts are checked here; the
+    entry point keeps its existing parsing behavior for readable packages.
+    """
+    file_name = pptx_path.name or str(pptx_path)
+    try:
+        with zipfile.ZipFile(pptx_path, "r") as archive:
+            members = set(archive.namelist())
+    except zipfile.BadZipFile:
+        return _invalid_pptx_error(
+            file_name, "its ZIP structure is missing or incomplete"
+        )
+    for part in _REQUIRED_PPTX_PARTS:
+        if part not in members:
+            return _invalid_pptx_error(
+                file_name, f'it is missing the required OOXML part "{part}"'
+            )
+    return None
+
+
+def _presentation_structure_error(
+    file_name: str, info: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """Convert an existing PresentationReader error result to an explicit failure."""
+    raw_error = info.get("error")
+    if not raw_error:
+        return None
+    reason = _MISSING_PART_REASONS.get(
+        str(raw_error), "its package structure could not be read"
+    )
+    return _invalid_pptx_error(file_name, reason)
+
 
 class PresentationReader:
     """Reads and extracts information from PPTX files."""
@@ -693,13 +763,24 @@ class PresentationReader:
 
     def __enter__(self) -> "PresentationReader":
         self.temp_dir = Path(tempfile.mkdtemp())
-        with zipfile.ZipFile(self.pptx_path, "r") as zf:
-            zf.extractall(self.temp_dir)
+        try:
+            with zipfile.ZipFile(self.pptx_path, "r") as zf:
+                zf.extractall(self.temp_dir)
+        except BaseException:
+            # ``__exit__`` is not called when entering fails, so release the
+            # temporary directory here instead of leaking it.
+            self._cleanup_temp_dir()
+            raise
         return self
 
     def __exit__(self, *args: Any) -> None:
+        self._cleanup_temp_dir()
+
+    def _cleanup_temp_dir(self) -> None:
+        """Remove the temporary extraction directory, if one exists."""
         if self.temp_dir and self.temp_dir.exists():
-            shutil.rmtree(self.temp_dir)
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+        self.temp_dir = None
 
     def read_presentation(self) -> Dict[str, Any]:
         """Extract presentation information."""
@@ -1936,14 +2017,36 @@ def read_pptx(
 
     Returns:
         Dictionary with slide information or extracted text
+
+    When several files are given, read them one at a time and report each
+    result separately; one file failing does not mean the other files cannot
+    be read.
     """
-    with PresentationReader(pptx_path, workspace=workspace) as reader:
-        if extract_text:
-            return {"text": reader.extract_text(), "success": True}
-        else:
+    reader = PresentationReader(pptx_path, workspace=workspace)
+    package_error = _check_pptx_package(reader.pptx_path)
+    if package_error is not None:
+        return package_error
+    file_name = reader.pptx_path.name or str(reader.pptx_path)
+    try:
+        with reader:
+            if extract_text:
+                info = reader.read_presentation()
+                structure_error = _presentation_structure_error(file_name, info)
+                if structure_error is not None:
+                    return structure_error
+                return {"text": reader.extract_text(), "success": True}
             result = reader.read_presentation()
+            structure_error = _presentation_structure_error(file_name, result)
+            if structure_error is not None:
+                return structure_error
             result["success"] = True
             return result
+    except zipfile.BadZipFile:
+        return _invalid_pptx_error(
+            file_name, "its ZIP structure is missing or incomplete"
+        )
+    except ET.ParseError:
+        return _invalid_pptx_error(file_name, "its XML content is not well-formed")
 
 
 def generate_pptx(
@@ -2045,9 +2148,23 @@ def unpack_pptx(
 
     Returns:
         Dictionary with success status and output directory
+
+    When several files are given, unpack them one at a time and report each
+    result separately; one file failing does not mean the other files cannot
+    be unpacked.
     """
-    with PresentationReader(pptx_path, workspace=workspace) as reader:
-        return reader.unpack(output_dir)
+    reader = PresentationReader(pptx_path, workspace=workspace)
+    package_error = _check_pptx_package(reader.pptx_path)
+    if package_error is not None:
+        return package_error
+    file_name = reader.pptx_path.name or str(reader.pptx_path)
+    try:
+        with reader:
+            return reader.unpack(output_dir)
+    except zipfile.BadZipFile:
+        return _invalid_pptx_error(
+            file_name, "its ZIP structure is missing or incomplete"
+        )
 
 
 def pack_pptx(

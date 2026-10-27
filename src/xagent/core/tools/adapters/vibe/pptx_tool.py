@@ -51,11 +51,11 @@ class PPTXGenerationTool:
         logger.debug(f"PPTX tool initialized with workspace: {workspace is not None}")
 
     async def read_pptx(self, pptx_path: str, extract_text: bool = False) -> Dict:
-        """Read PPTX file and extract information."""
+        """Read PPTX file and extract information, one file at a time."""
         return read_pptx(pptx_path, extract_text, self._workspace)
 
     async def unpack_pptx(self, pptx_path: str, output_dir: str) -> Dict:
-        """Unpack PPTX file to directory."""
+        """Unpack PPTX file to directory, one file at a time."""
         return unpack_pptx(pptx_path, output_dir, self._workspace)
 
     async def pack_pptx(
@@ -88,6 +88,8 @@ Args:
 
 Returns:
     Dictionary with slide information or extracted text
+
+When several files are given, read them one at a time and report each result separately; one file failing does not mean the other files cannot be read.
 """,
                 tags=["pptx", "presentation", "file"],
             ),
@@ -110,6 +112,8 @@ Args:
 
 Returns:
     Dictionary with success status, output directory, and file count
+
+When several files are given, unpack them one at a time and report each result separately; one file failing does not mean the other files cannot be unpacked.
 """,
                 tags=["pptx", "presentation", "unpack", "editing"],
             ),
