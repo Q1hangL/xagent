@@ -601,9 +601,11 @@ def _registered_descriptions() -> dict[str, str]:
 
 
 def _assert_per_file_guidance(text: str, others_unaffected: str) -> None:
-    assert PER_FILE_ONE_AT_A_TIME in text
-    assert PER_FILE_SEPARATELY in text
-    assert others_unaffected in text
+    # Docstrings wrap lines; compare on normalized whitespace.
+    normalized = " ".join(text.split())
+    assert PER_FILE_ONE_AT_A_TIME in normalized
+    assert PER_FILE_SEPARATELY in normalized
+    assert others_unaffected in normalized
 
 
 def test_registered_read_description_documents_per_file_reporting() -> None:
