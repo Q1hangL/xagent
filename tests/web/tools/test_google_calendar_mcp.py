@@ -9521,6 +9521,90 @@ def test_search_events_treats_all_day_and_timed_kind_changes_as_rescheduled(
     assert normalized["rescheduled"] is True
 
 
+@pytest.mark.parametrize(
+    ("timed_boundary", "response_timezone"),
+    [
+        ({"dateTime": "not-a-time"}, "Asia/Manila"),
+        ({"dateTime": "2026-03-08T02:30:00"}, "America/New_York"),
+        (
+            {"dateTime": "2026-10-23T06:15:00", "timeZone": "Not/AZone"},
+            "Asia/Manila",
+        ),
+        ({"dateTime": "2026-10-23T06:15:00"}, "Not/AZone"),
+    ],
+)
+def test_search_events_keeps_unresolvable_mixed_kind_boundaries_false(
+    monkeypatch, timed_boundary, response_timezone
+):
+    """A kind change is a reschedule only when the timed side resolves to a
+    real instant. A timed side that cannot be resolved (malformed value, a
+    daylight-saving gap, an unknown sibling zone, or no sibling plus an
+    unknown calendar zone) keeps the flag False in both directions."""
+    events = [
+        {
+            "id": "timed-current",
+            "status": "confirmed",
+            "recurringEventId": "series-1",
+            "start": dict(timed_boundary),
+            "end": {"dateTime": "2026-10-23T07:15:00+08:00"},
+            "originalStartTime": {"date": "2026-10-23"},
+        },
+        {
+            "id": "timed-original",
+            "status": "confirmed",
+            "recurringEventId": "series-2",
+            "start": {"date": "2026-10-23"},
+            "end": {"date": "2026-10-24"},
+            "originalStartTime": dict(timed_boundary),
+        },
+    ]
+    service = _search_service(events, response_timezone=response_timezone)
+
+    result = _search_result(monkeypatch, service)
+
+    by_id = _events_by_id(result)
+    assert by_id["timed-current"]["rescheduled"] is False
+    assert by_id["timed-original"]["rescheduled"] is False
+    assert by_id["timed-current"]["start"] == dict(timed_boundary)
+    assert by_id["timed-original"]["originalStartTime"] == dict(timed_boundary)
+    assert by_id["timed-current"]["local_start"] is None
+
+
+def test_search_events_keeps_valid_mixed_kind_changes_without_a_usable_calendar_zone(
+    monkeypatch,
+):
+    """An offset-bearing timed boundary is a real instant even when the
+    calendar's reported zone cannot be resolved, so a valid kind change stays
+    true and only the timed local wall times are null."""
+    events = [
+        {
+            "id": "timed-current",
+            "status": "confirmed",
+            "recurringEventId": "series-1",
+            "start": {"dateTime": "2026-10-23T06:15:00+08:00"},
+            "end": {"dateTime": "2026-10-23T06:45:00+08:00"},
+            "originalStartTime": {"date": "2026-10-23"},
+        },
+        {
+            "id": "timed-original",
+            "status": "confirmed",
+            "recurringEventId": "series-2",
+            "start": {"date": "2026-10-23"},
+            "end": {"date": "2026-10-24"},
+            "originalStartTime": {"dateTime": "2026-10-23T00:00:00+08:00"},
+        },
+    ]
+    service = _search_service(events, response_timezone="Not/AZone")
+
+    result = _search_result(monkeypatch, service)
+
+    by_id = _events_by_id(result)
+    assert by_id["timed-current"]["rescheduled"] is True
+    assert by_id["timed-original"]["rescheduled"] is True
+    assert by_id["timed-current"]["local_start"] is None
+    assert by_id["timed-original"]["local_start"] == "2026-10-23"
+
+
 def test_search_events_does_not_compare_an_original_start_without_a_current_start(
     monkeypatch,
 ):
