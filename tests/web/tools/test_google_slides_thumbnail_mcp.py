@@ -687,7 +687,7 @@ def test_thumbnail_rejects_declared_content_length_over_the_limit(
     assert not list((tmp_path / "output").glob("*.png"))
 
 
-def test_thumbnail_rejects_an_unlabelled_oversized_stream(monkeypatch):
+def test_thumbnail_rejects_an_unlabelled_oversized_stream(monkeypatch, tmp_path):
     _install_slides_api(monkeypatch)
     body = _PNG_SIGNATURE + b"x" * (2 * _LARGE_LIMIT)
     response, consumed = _streaming_response(body, chunks=2 * _LARGE_LIMIT // 65536 + 2)
@@ -698,9 +698,10 @@ def test_thumbnail_rejects_an_unlabelled_oversized_stream(monkeypatch):
     assert result["status"] == "error"
     assert "too large" in result["message"]
     assert consumed["bytes"] < len(body)
+    assert not list((tmp_path / "output").glob("*.png"))
 
 
-def test_thumbnail_rejects_a_stream_that_lies_about_its_length(monkeypatch):
+def test_thumbnail_rejects_a_stream_that_lies_about_its_length(monkeypatch, tmp_path):
     _install_slides_api(monkeypatch)
     body = _PNG_SIGNATURE + b"x" * (2 * _LARGE_LIMIT)
     response, consumed = _streaming_response(body, chunks=2 * _LARGE_LIMIT // 65536 + 2)
@@ -712,6 +713,7 @@ def test_thumbnail_rejects_a_stream_that_lies_about_its_length(monkeypatch):
     assert result["status"] == "error"
     assert "too large" in result["message"]
     assert consumed["bytes"] < len(body)
+    assert not list((tmp_path / "output").glob("*.png"))
 
 
 def test_thumbnail_rejects_a_malformed_content_length(monkeypatch):
@@ -737,7 +739,7 @@ def test_thumbnail_accepts_a_body_exactly_at_the_limit(monkeypatch):
     assert _result_path(result).stat().st_size == _LARGE_LIMIT
 
 
-def test_thumbnail_rejects_a_body_one_byte_over_the_limit(monkeypatch):
+def test_thumbnail_rejects_a_body_one_byte_over_the_limit(monkeypatch, tmp_path):
     _install_slides_api(monkeypatch)
     body = _png_of_size(_LARGE_LIMIT + 1)
     _install_http(monkeypatch, lambda index, request, state: _http_response(body))
@@ -746,17 +748,20 @@ def test_thumbnail_rejects_a_body_one_byte_over_the_limit(monkeypatch):
 
     assert result["status"] == "error"
     assert "too large" in result["message"]
+    assert not list((tmp_path / "output").glob("*.png"))
 
 
-def test_thumbnail_stops_reading_at_the_timeout(monkeypatch):
+def test_thumbnail_stops_reading_at_the_timeout(monkeypatch, tmp_path):
     _install_slides_api(monkeypatch)
     response, consumed = _streaming_response(_PNG_SIGNATURE + b"x" * 200_000, chunks=4)
     _install_http(monkeypatch, lambda index, request, state: response)
     clock = {"reads": 0}
+    readings = [0.0, 0.0, 10.0, 35.0]
 
     def fake_monotonic():
         clock["reads"] += 1
-        return 0.0 if clock["reads"] == 1 else 100.0
+        index = min(clock["reads"] - 1, len(readings) - 1)
+        return readings[index]
 
     monkeypatch.setattr(google_slides.time, "monotonic", fake_monotonic)
 
@@ -765,9 +770,10 @@ def test_thumbnail_stops_reading_at_the_timeout(monkeypatch):
     assert result["status"] == "error"
     assert "timed out" in result["message"]
     assert consumed["bytes"] < 200_008
+    assert not list((tmp_path / "output").glob("*.png"))
 
 
-def test_thumbnail_maps_an_interrupted_stream_to_an_error(monkeypatch):
+def test_thumbnail_maps_an_interrupted_stream_to_an_error(monkeypatch, tmp_path):
     _install_slides_api(monkeypatch)
     response = _http_response(b"")
 
@@ -784,9 +790,10 @@ def test_thumbnail_maps_an_interrupted_stream_to_an_error(monkeypatch):
 
     assert result["status"] == "error"
     assert "thumb-secret-token" not in json.dumps(result)
+    assert not list((tmp_path / "output").glob("*.png"))
 
 
-def test_thumbnail_maps_a_read_timeout_to_an_error(monkeypatch):
+def test_thumbnail_maps_a_read_timeout_to_an_error(monkeypatch, tmp_path):
     _install_slides_api(monkeypatch)
 
     def responder(index, request, state):
@@ -800,9 +807,10 @@ def test_thumbnail_maps_a_read_timeout_to_an_error(monkeypatch):
 
     assert result["status"] == "error"
     assert "thumb-secret-token" not in json.dumps(result)
+    assert not list((tmp_path / "output").glob("*.png"))
 
 
-def test_thumbnail_rejects_an_empty_response_body(monkeypatch):
+def test_thumbnail_rejects_an_empty_response_body(monkeypatch, tmp_path):
     _install_slides_api(monkeypatch)
     _install_http(monkeypatch, lambda index, request, state: _http_response(b""))
 
@@ -810,10 +818,11 @@ def test_thumbnail_rejects_an_empty_response_body(monkeypatch):
 
     assert result["status"] == "error"
     assert "empty" in result["message"]
+    assert not list((tmp_path / "output").glob("*.png"))
 
 
 @pytest.mark.parametrize("body", [b"not a png at all", b"<html>error</html>"])
-def test_thumbnail_rejects_a_non_png_response(monkeypatch, body):
+def test_thumbnail_rejects_a_non_png_response(monkeypatch, tmp_path, body):
     _install_slides_api(monkeypatch)
     _install_http(monkeypatch, lambda index, request, state: _http_response(body))
 
@@ -821,6 +830,7 @@ def test_thumbnail_rejects_a_non_png_response(monkeypatch, body):
 
     assert result["status"] == "error"
     assert "PNG" in result["message"]
+    assert not list((tmp_path / "output").glob("*.png"))
 
 
 def test_thumbnail_download_does_not_carry_credentials(monkeypatch):
@@ -861,7 +871,9 @@ def test_thumbnail_never_returns_or_logs_the_short_lived_content_url(
     assert "thumb-secret-token" not in caplog.text
 
 
-def test_thumbnail_http_failure_does_not_leak_the_content_url(monkeypatch, caplog):
+def test_thumbnail_http_failure_does_not_leak_the_content_url(
+    monkeypatch, caplog, tmp_path
+):
     caplog.set_level(logging.DEBUG)
     _install_slides_api(monkeypatch)
     _install_http(
@@ -876,6 +888,7 @@ def test_thumbnail_http_failure_does_not_leak_the_content_url(monkeypatch, caplo
     assert "thumb-secret-token" not in json.dumps(result)
     assert _THUMB_HOST not in json.dumps(result)
     assert "thumb-secret-token" not in caplog.text
+    assert not list((tmp_path / "output").glob("*.png"))
 
 
 def test_thumbnail_network_error_does_not_leak_the_signed_url(monkeypatch, caplog):
