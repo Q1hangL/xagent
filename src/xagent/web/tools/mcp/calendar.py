@@ -958,10 +958,12 @@ def _search_boundary_kind(field: Any) -> tuple[str, str | None] | None:
     Returns ("all_day", date_string) for a valid bare date, ("timed", None)
     for a non-empty `dateTime`, and None when the side is missing, is not a
     dict, or carries neither a valid date nor a `dateTime`. The shape alone
-    decides: an all-day date has no instant to resolve without inventing one,
-    so callers compare two all-day instances as dates and treat a date against
-    a timed boundary as a kind change instead of collapsing the date into a
-    time zone's midnight.
+    decides only the kind; it does not validate a timed value. An all-day date
+    has no instant to resolve without inventing one, so callers compare two
+    all-day instances as dates and treat a date against a timed boundary as a
+    kind change instead of collapsing the date into a time zone's midnight;
+    timed sides are resolved separately with `_event_boundary_key`, and an
+    unresolvable result is treated as unknown, never as a usable instant.
     """
     if not isinstance(field, dict):
         return None
@@ -1032,23 +1034,26 @@ def _search_event_was_rescheduled(event: dict[str, Any], tz_name: str) -> bool:
     an event without a usable one has nothing to compare and is not treated as
     moved. Each side is classified by its own shape first: two all-day dates
     compare as calendar dates (never as widened midnights, which can collapse
-    around a zone's skipped day), a date against a timed `dateTime` is a kind
-    change and counts as rescheduled, and two timed boundaries compare as the
+    around a zone's skipped day), and two timed boundaries compare as the
     instants they denote via `_event_boundary_key` (never as raw strings). A
-    side that cannot be resolved keeps this False instead of turning into a
-    guessed reschedule.
+    date against a timed boundary is a kind change and counts as rescheduled
+    only when the timed side resolves to a real instant; an unresolvable timed
+    value keeps this False instead of turning "can't tell" into a positive
+    answer. A side that cannot be classified at all also keeps this False.
     """
     original_start = event.get("originalStartTime")
+    current_start = event.get("start")
     original_kind = _search_boundary_kind(original_start)
-    current_kind = _search_boundary_kind(event.get("start"))
+    current_kind = _search_boundary_kind(current_start)
     if original_kind is None or current_kind is None:
         return False
     if original_kind[0] != current_kind[0]:
-        return True
+        timed_field = original_start if original_kind[0] == "timed" else current_start
+        return _event_boundary_key(timed_field, tz_name) is not None
     if original_kind[0] == "all_day":
         return original_kind[1] != current_kind[1]
     original_key = _event_boundary_key(original_start, tz_name)
-    current_key = _event_boundary_key(event.get("start"), tz_name)
+    current_key = _event_boundary_key(current_start, tz_name)
     if original_key is None or current_key is None:
         return False
     return original_key != current_key
