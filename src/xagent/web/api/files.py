@@ -41,6 +41,7 @@ from ...core.artifact_validation.service import validate_artifact
 from ...core.execution_scope import resolve_execution_scope
 from ...core.file_storage import get_user_file_storage, normalize_storage_key
 from ...core.tools.adapters.vibe.file_tool import read_file
+from ...core.tools.core import pptx_conversion
 from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
 from ...core.utils.svg import rasterize_svg_bytes
 from ...core.workspace import scoped_user_root
@@ -1233,6 +1234,12 @@ async def _convert_pptx_to_pdf_uncached(
     renderer. Production images (Docker) pre-install libreoffice so this
     path always succeeds there.
 
+    The LibreOffice process handling (argv list, per-call user profile,
+    timeout, kill/wait) is shared with the slide render tool in
+    :mod:`xagent.core.tools.core.pptx_conversion`. This function keeps the
+    preview-specific parts: the managed cache, the publication guard, the
+    same-filesystem temporary directory and the atomic cache publish.
+
     ``file_id`` is forwarded to ``_pptx_pdf_cache_path`` so the cache entry
     lands in the managed cache directory (keyed by file_id) rather than as
     a sidecar next to the source file.
@@ -1262,34 +1269,25 @@ async def _convert_pptx_to_pdf_uncached(
         with tempfile.TemporaryDirectory(
             dir=cache_path.parent, prefix=f".{file_id or cache_path.stem}.preview-"
         ) as temp_dir:
-            proc = await asyncio.create_subprocess_exec(
-                "soffice",
-                "--headless",
-                "--convert-to",
-                "pdf",
-                "--outdir",
-                temp_dir,
-                str(pptx_path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
             try:
-                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                logger.warning("pptx→pdf conversion timed out for %s", pptx_path)
-                return None
-            if proc.returncode != 0:
-                logger.warning(
-                    "soffice exited %s for %s: %s",
-                    proc.returncode,
+                converted_pdf = await pptx_conversion.convert_pptx_to_pdf(
                     pptx_path,
-                    stderr.decode("utf-8", "replace")[:200],
+                    Path(temp_dir),
+                    timeout_seconds=(
+                        pptx_conversion.DEFAULT_PPTX_CONVERSION_TIMEOUT_SECONDS
+                    ),
+                )
+            except pptx_conversion.PptxConverterUnavailableError:
+                # soffice binary is missing — this is the expected "fallback"
+                # path on developer machines. Log once at INFO so it doesn't
+                # spam.
+                logger.info(
+                    "soffice not on PATH; .pptx PDF previews will fall back to "
+                    "client-side rendering"
                 )
                 return None
-            pdf_files = list(Path(temp_dir).glob("*.pdf"))
-            if not pdf_files:
+            except pptx_conversion.PptxConversionError as exc:
+                logger.warning("pptx→pdf conversion failed for %s: %s", pptx_path, exc)
                 return None
             # The PDF is already fully written and closed inside the temp dir,
             # and the temp dir lives in the same filesystem as `cache_path`
@@ -1298,21 +1296,13 @@ async def _convert_pptx_to_pdf_uncached(
             # could leave orphans if a concurrent request raced. Per PR #542
             # review.
             try:
-                pdf_files[0].replace(cache_path)
+                converted_pdf.replace(cache_path)
             except OSError as exc:
                 logger.warning(
                     "Failed to cache pptx preview PDF at %s: %s", cache_path, exc
                 )
                 return None
             return cache_path
-    except FileNotFoundError:
-        # soffice binary is missing — this is the expected "fallback" path
-        # on developer machines. Log once at INFO so it doesn't spam.
-        logger.info(
-            "soffice not on PATH; .pptx PDF previews will fall back to "
-            "client-side rendering"
-        )
-        return None
     except Exception as exc:  # noqa: BLE001
         logger.warning("pptx→pdf conversion failed for %s: %s", pptx_path, exc)
         return None
