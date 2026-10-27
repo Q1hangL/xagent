@@ -692,6 +692,26 @@ def test_extraction_failure_removes_its_temp_directory(
     assert not created_temp_dirs[0].exists()
 
 
+def test_unpack_extraction_failure_returns_an_explicit_error(
+    deck: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    created_temp_dirs: list[Path],
+) -> None:
+    def failing_extractall(self, *args, **kwargs):
+        raise zipfile.BadZipFile("bad compressed data in member")
+
+    monkeypatch.setattr(zipfile.ZipFile, "extractall", failing_extractall)
+    output_dir = tmp_path / "unpack_extraction_failure_output"
+
+    result = unpack_pptx(str(deck), str(output_dir))
+
+    _assert_invalid_package(result, "sample_deck.pptx", ZIP_REASON)
+    assert len(created_temp_dirs) == 1
+    assert not created_temp_dirs[0].exists()
+    assert not output_dir.exists()
+
+
 def test_failed_unpack_leaves_no_output_directory(deck: Path, tmp_path: Path) -> None:
     broken = _missing_part_deck(deck, tmp_path, "[Content_Types].xml")
     output_dir = tmp_path / "failed_unpack_output"
