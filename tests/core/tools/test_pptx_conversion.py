@@ -65,7 +65,9 @@ class _HangingProcess(_RecordingProcess):
     async def communicate(self) -> tuple[bytes, bytes]:
         self.communicate_calls += 1
         self.started.set()
-        await asyncio.sleep(60)
+        # Bounded stand-in: the real per-call timeout used by the tests is much
+        # shorter, and a mutant that drops the timeout must not stall the suite.
+        await asyncio.sleep(5)
         return b"", b""
 
 
