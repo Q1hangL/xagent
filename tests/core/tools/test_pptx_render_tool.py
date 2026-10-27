@@ -11,10 +11,14 @@ import asyncio
 import base64
 import hashlib
 import math
+import os
 import pathlib
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
+import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -1567,3 +1571,266 @@ def test_fit_scale_to_page_lowers_the_scale_before_rasterizing(tmp_path):
 
     assert effective_scale < requested_scale
     assert extents[0] * extents[1] <= render.MAX_PAGE_PIXELS
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_output_creation_does_not_leak(
+    durable_workspace, monkeypatch
+):
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    deck = _write_deck(workspace.input_dir)
+    started = threading.Event()
+    release = threading.Event()
+    done = threading.Event()
+    created: list[pathlib.Path] = []
+    original_resolve = pathlib.Path.resolve
+
+    def delayed_resolve(path, *args, **kwargs):
+        if (
+            path.name.startswith("pptx_render_")
+            and path.parent == workspace.output_dir
+            and args == (True,)
+        ):
+            created.append(path)
+            started.set()
+            assert release.wait(5)
+            try:
+                return original_resolve(path, *args, **kwargs)
+            finally:
+                done.set()
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "resolve", delayed_resolve)
+    task = asyncio.create_task(render.render_pptx_to_images(str(deck), workspace))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        release.set()
+        assert await asyncio.to_thread(done.wait, 5)
+        await asyncio.sleep(0.05)
+        leaked = [str(path) for path in created if path.exists()]
+        assert leaked == [], (
+            "cancellation after the exclusive output-directory creation lost "
+            f"cleanup ownership: {leaked}"
+        )
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.to_thread(done.wait, 5)
+        for path in created:
+            shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_output_validation_filesystem_calls_run_off_event_loop(
+    durable_workspace, monkeypatch
+):
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    deck = _write_deck(workspace.input_dir)
+    _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
+    _install_rasterizer(monkeypatch, render, page_count=2, requested=[], rendered=[])
+    loop_thread = threading.get_ident()
+    seen: list[tuple[str, int]] = []
+    original_resolve = pathlib.Path.resolve
+    original_is_dir = pathlib.Path.is_dir
+
+    def observed_resolve(path, *args, **kwargs):
+        if path == workspace.workspace_dir:
+            seen.append(("resolve_workspace", threading.get_ident()))
+        return original_resolve(path, *args, **kwargs)
+
+    def observed_is_dir(path, *args, **kwargs):
+        if path == workspace.output_dir:
+            seen.append(("is_dir_output", threading.get_ident()))
+        return original_is_dir(path, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "resolve", observed_resolve)
+    monkeypatch.setattr(pathlib.Path, "is_dir", observed_is_dir)
+
+    result = await render.render_pptx_to_images(str(deck), workspace)
+
+    assert result["success"] is True, result
+    assert seen, "the output validation calls were not observed"
+    assert all(thread != loop_thread for _name, thread in seen), (
+        "output validation filesystem calls ran on the event loop"
+    )
+
+
+@pytest.mark.asyncio
+async def test_delegated_workspace_registration_matches_persisted_record(
+    durable_workspace, monkeypatch
+):
+    render = _load_render_module()
+    delegated = TaskWorkspace(
+        id="synthetic_delegated_render",
+        base_dir=str(durable_workspace.base_dir),
+        db_task_id=4242,
+    )
+    deck = _write_deck(delegated.input_dir)
+    rendered: list[list] = []
+    _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
+    _install_rasterizer(
+        monkeypatch, render, page_count=2, requested=[], rendered=rendered
+    )
+
+    result = await render.render_pptx_to_images(str(deck), delegated)
+
+    rows = _output_rows(durable_workspace.session_factory)
+    originals = [page.path for batch in rendered for page in batch]
+    assert rows and len(rows) == 2
+    assert result["success"] is True, (
+        "committed delegated outputs were classified as unregistered by "
+        f"their old local paths: {result}"
+    )
+    assert all(path.exists() for path in originals), (
+        "cleanup removed rendered PNGs whose records had committed under the "
+        "parent task's canonical directory"
+    )
+    parent_output = (
+        pathlib.Path(durable_workspace.base_dir) / "web_task_4242" / "output"
+    )
+    for row in rows:
+        assert row.task_id == 4242
+        assert pathlib.Path(str(row.storage_path)).is_relative_to(parent_output)
+    fresh_parent = TaskWorkspace(
+        id="web_task_4242", base_dir=str(durable_workspace.base_dir)
+    )
+    for page in result["pages"]:
+        assert fresh_parent.resolve_file_id_detached(page["file_id"]) is not None
+
+
+@pytest.mark.asyncio
+async def test_fake_registration_ids_are_reported_as_unregistered(
+    durable_workspace, monkeypatch
+):
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    deck = _write_deck(workspace.input_dir)
+    rendered: list[list] = []
+    _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
+    _install_rasterizer(
+        monkeypatch, render, page_count=2, requested=[], rendered=rendered
+    )
+    originals = [page.path for batch in rendered for page in batch]
+
+    def fake_registration(files, *, db_session=None):
+        del db_session
+        return tuple(str(uuid.uuid4()) for _entries in files)
+
+    monkeypatch.setattr(workspace, "register_files", fake_registration)
+
+    result = await render.render_pptx_to_images(str(deck), workspace)
+
+    assert result["success"] is False
+    assert result["error_code"] == "registration_failed"
+    assert result["registered_pages"] == []
+    assert result["unregistered_pages"] == [1, 2]
+    assert _output_rows(durable_workspace.session_factory) == []
+    assert not any(path.exists() for path in originals)
+
+
+def _render_lifecycle_source_root() -> str:
+    import xagent
+
+    return str(pathlib.Path(xagent.__path__[0]).resolve().parent)
+
+
+_RENDER_OUTPUT_CREATION_CHILD = r"""
+import asyncio
+import os
+import pathlib
+import time
+from pathlib import Path
+
+from xagent.core.tools.core import pptx_render as render
+from xagent.core.workspace import TaskWorkspace
+
+root = Path(os.environ["LIFECYCLE_DIR"])
+workspace = TaskWorkspace(id="web_task_1", base_dir=str(root / "uploads"))
+deck = workspace.input_dir / "deck.pptx"
+deck.write_bytes(b"PK\x03\x04 synthetic")
+original_resolve = pathlib.Path.resolve
+
+
+def delayed_resolve(path, *args, **kwargs):
+    if (
+        path.name.startswith("pptx_render_")
+        and path.parent == workspace.output_dir
+        and args == (True,)
+    ):
+        time.sleep(0.3)
+    return original_resolve(path, *args, **kwargs)
+
+
+pathlib.Path.resolve = delayed_resolve
+
+
+async def main():
+    task = asyncio.create_task(render.render_pptx_to_images(str(deck), workspace))
+    await asyncio.sleep(0.15)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+asyncio.run(main())
+print("CHILD_DONE")
+"""
+
+
+def test_output_creation_cleanup_survives_asyncio_run_exit(tmp_path):
+    environment = dict(os.environ)
+    ambient = os.environ.get("PYTHONPATH", "")
+    environment["PYTHONPATH"] = ":".join(
+        part for part in (_render_lifecycle_source_root(), ambient) if part
+    )
+    for key in (
+        "XAGENT_TEST_REDIS_URL",
+        "MILVUS_URI",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+    ):
+        environment.pop(key, None)
+    lifecycle_root = tmp_path / "lifecycle"
+    lifecycle_root.mkdir(parents=True, exist_ok=True)
+    environment["LIFECYCLE_DIR"] = str(lifecycle_root)
+    environment["HOME"] = str(tmp_path / "home")
+    (tmp_path / "home").mkdir(exist_ok=True)
+
+    completed = subprocess.run(
+        [sys.executable, "-B", "-c", _RENDER_OUTPUT_CREATION_CHILD],
+        cwd=str(pathlib.Path(_render_lifecycle_source_root()).parent),
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "CHILD_DONE" in completed.stdout
+    output_root = lifecycle_root / "uploads" / "web_task_1" / "output"
+    leftover = (
+        [str(path) for path in output_root.iterdir()] if output_root.is_dir() else []
+    )
+    assert leftover == [], (
+        f"asyncio.run() shutdown left a render output directory behind: {leftover}"
+    )
+    combined = completed.stdout + completed.stderr
+    for marker in (
+        "Task was destroyed but it is pending",
+        "Task exception was never retrieved",
+    ):
+        assert marker not in combined, combined

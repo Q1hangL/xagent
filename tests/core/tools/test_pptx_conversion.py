@@ -7,7 +7,10 @@ than any caller's caching behavior.
 """
 
 import asyncio
+import os
 import pathlib
+import subprocess
+import sys
 import tempfile
 import threading
 
@@ -462,3 +465,126 @@ async def test_expected_pdf_existence_check_runs_off_the_event_loop(
     assert all(thread != loop_thread for thread in observed), (
         "the produced-PDF filesystem check blocked the event loop"
     )
+
+
+def _active_source_root() -> str:
+    import xagent
+
+    return str(pathlib.Path(xagent.__path__[0]).resolve().parent)
+
+
+def _lifecycle_child_environment(tmp_path) -> dict[str, str]:
+    environment = dict(os.environ)
+    source_root = _active_source_root()
+    ambient = os.environ.get("PYTHONPATH", "")
+    environment["PYTHONPATH"] = ":".join(
+        part for part in (source_root, ambient) if part
+    )
+    for key in (
+        "XAGENT_TEST_REDIS_URL",
+        "MILVUS_URI",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+    ):
+        environment.pop(key, None)
+    lifecycle_root = tmp_path / "lifecycle"
+    lifecycle_root.mkdir(parents=True, exist_ok=True)
+    tmp_dir = tmp_path / "tmpdir"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    environment["LIFECYCLE_DIR"] = str(lifecycle_root)
+    environment["TMPDIR"] = str(tmp_dir)
+    environment["HOME"] = str(tmp_path / "home")
+    environment["XAGENT_STORAGE_ROOT"] = str(tmp_path / "storage")
+    (tmp_path / "home").mkdir(exist_ok=True)
+    return environment
+
+
+def _run_lifecycle_child(script: str, tmp_path) -> subprocess.CompletedProcess:
+    completed = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=str(pathlib.Path(_active_source_root()).parent),
+        env=_lifecycle_child_environment(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    return completed
+
+
+def _assert_no_pending_task_warnings(completed: subprocess.CompletedProcess) -> None:
+    combined = completed.stdout + completed.stderr
+    for marker in (
+        "Task was destroyed but it is pending",
+        "Task exception was never retrieved",
+    ):
+        assert marker not in combined, combined
+
+
+_PROFILE_CREATION_CHILD = r"""
+import asyncio
+import os
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+from xagent.core.tools.core import pptx_conversion as conversion
+
+root = Path(os.environ["LIFECYCLE_DIR"])
+tmpdir = Path(os.environ["TMPDIR"])
+deck = root / "deck.pptx"
+deck.write_bytes(b"pptx bytes")
+output_dir = root / "pdf-out"
+output_dir.mkdir()
+started = threading.Event()
+real_mkdtemp = tempfile.mkdtemp
+
+
+def delayed_mkdtemp(*args, **kwargs):
+    if kwargs.get("prefix") != "xagent-pptx-profile-":
+        return real_mkdtemp(*args, **kwargs)
+    started.set()
+    time.sleep(0.3)
+    return real_mkdtemp(*args, dir=str(tmpdir), **kwargs)
+
+
+conversion.tempfile.mkdtemp = delayed_mkdtemp
+
+
+async def main():
+    task = asyncio.create_task(conversion.convert_pptx_to_pdf(deck, output_dir))
+    while not started.is_set():
+        await asyncio.sleep(0.01)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+asyncio.run(main())
+print("CHILD_DONE")
+"""
+
+
+def test_cancelled_creation_cleanup_survives_asyncio_run_exit(tmp_path):
+    completed = _run_lifecycle_child(_PROFILE_CREATION_CHILD, tmp_path)
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "CHILD_DONE" in completed.stdout
+    leftover = [
+        path
+        for path in (tmp_path / "tmpdir").iterdir()
+        if path.name.startswith("xagent-pptx-profile-")
+    ]
+    assert leftover == [], (
+        "asyncio.run() shutdown left a profile directory behind: "
+        f"{[str(path) for path in leftover]}"
+    )
+    _assert_no_pending_task_warnings(completed)
