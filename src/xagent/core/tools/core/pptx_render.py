@@ -268,7 +268,8 @@ def unrendered_page_ranges(
 
 def _f32(value: float) -> float:
     """Round a Python float to the single precision MuPDF uses internally."""
-    return struct.unpack("f", struct.pack("f", float(value)))[0]
+    packed = struct.pack("f", float(value))
+    return float(struct.unpack("f", packed)[0])
 
 
 def _pixmap_extent(length: float, scale: float) -> int:
