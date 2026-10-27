@@ -14,6 +14,7 @@ import math
 import pathlib
 import shutil
 import tempfile
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -123,9 +124,24 @@ class _FakePixelExtent:
         pathlib.Path(path).write_bytes(PNG_1X1)
 
 
+class _FakeRect:
+    """Rect double that mirrors PyMuPDF's matrix/irect round trip."""
+
+    def __init__(self, width: float, height: float):
+        self.width = width
+        self.height = height
+
+    def __mul__(self, matrix):
+        width = max(1, math.ceil(self.width * matrix.a - 1e-9))
+        height = max(1, math.ceil(self.height * matrix.b - 1e-9))
+        return SimpleNamespace(irect=SimpleNamespace(width=width, height=height))
+
+    __rmul__ = __mul__
+
+
 class _FakePage:
     def __init__(self, width: float, height: float, events: list, number: int):
-        self.rect = SimpleNamespace(width=width, height=height)
+        self.rect = _FakeRect(width, height)
         self._events = events
         self._number = number
 
@@ -1122,7 +1138,15 @@ async def test_render_two_page_deck_with_real_soffice(
     if shutil.which("soffice") is None:
         pytest.skip("LibreOffice (soffice) is not installed on this host")
 
-    pptx = pytest.importorskip("pptx")
+    try:
+        import pptx
+    except (
+        ImportError
+    ) as exc:  # pragma: no cover - dependency is part of the backend image
+        pytest.fail(
+            "LibreOffice is available but python-pptx is not installed, so the "
+            f"real conversion cannot run: {exc}"
+        )
     deck_path = durable_workspace.workspace.input_dir / "synthetic-two-slides.pptx"
     presentation = pptx.Presentation()
     for index in range(2):
@@ -1150,8 +1174,377 @@ async def test_render_two_page_deck_with_real_soffice(
         )
         assert resolved is not None
         assert resolved.read_bytes().startswith(PNG_MAGIC)
+    image_hashes = [
+        hashlib.sha256(
+            pathlib.Path(page["file_ref"]["file_path"]).read_bytes()
+        ).hexdigest()
+        for page in result["pages"]
+    ]
+    assert len(set(image_hashes)) == 2, (
+        "the two synthetic slides must render to different images"
+    )
+    assert [
+        pathlib.Path(page["file_ref"]["file_path"]).name for page in result["pages"]
+    ] == [
+        "slide_001.png",
+        "slide_002.png",
+    ]
     assert hashlib.sha256(deck_path.read_bytes()).hexdigest() == deck_hash
     rows = _output_rows(durable_workspace.session_factory)
     assert len(rows) == 2
     assert not list(durable_workspace.storage_root.rglob("*.pdf"))
     assert not list(pathlib.Path(tempfile.gettempdir()).glob("xagent-pptx-profile-*"))
+
+
+@pytest.mark.parametrize(
+    ("width", "height"),
+    [(1430.0, 1670.0), (1810.0, 1080.0), (720.0, 540.0)],
+)
+def test_compute_page_geometry_keeps_common_page_sizes_within_budget(width, height):
+    render = _load_render_module()
+    fitz = pytest.importorskip("fitz")
+
+    geometry = render.compute_page_geometry(width, height)
+
+    assert geometry.scale > 0
+    assert geometry.width * geometry.height <= render.MAX_PAGE_PIXELS
+    # The predicted with-MuPDF dimensions must not exceed the budget either.
+    actual = (
+        fitz.Rect(0.0, 0.0, width, height) * fitz.Matrix(geometry.scale, geometry.scale)
+    ).irect
+    assert actual.width * actual.height <= render.MAX_PAGE_PIXELS
+    assert geometry.width >= actual.width
+    assert geometry.height >= actual.height
+    assert abs(geometry.width / geometry.height - width / height) < 0.01
+
+
+def test_compute_page_geometry_handles_exactly_one_pixel_over_budget():
+    render = _load_render_module()
+    fitz = pytest.importorskip("fitz")
+
+    # 41 * 97,561 = 4,000,001: one pixel over the page budget, so the scale
+    # must be lowered instead of rejecting the page or exceeding the budget.
+    geometry = render.compute_page_geometry(41.0, 97561.0, scale=1.0)
+
+    assert geometry.scale < 1.0
+    assert geometry.width * geometry.height <= render.MAX_PAGE_PIXELS
+    actual = (
+        fitz.Rect(0.0, 0.0, 41.0, 97561.0) * fitz.Matrix(geometry.scale, geometry.scale)
+    ).irect
+    assert actual.width * actual.height <= render.MAX_PAGE_PIXELS
+
+
+def test_compute_page_geometry_stays_within_budget_for_mupdf_rounding():
+    render = _load_render_module()
+    fitz = pytest.importorskip("fitz")
+    import random
+
+    rng = random.Random(20261027)
+    cases = [
+        (1430.0, 1670.0),
+        (1810.0, 1080.0),
+        (41.0, 97561.0),
+        (1_000_000.0, 1.0),
+        (1_000_000.0, 1_000_000.0),
+    ]
+    cases.extend(
+        (rng.uniform(200.0, 6000.0), rng.uniform(200.0, 6000.0)) for _ in range(200)
+    )
+    for width, height in cases:
+        geometry = render.compute_page_geometry(width, height)
+        rectangle = fitz.Rect(0.0, 0.0, width, height)
+        actual = (rectangle * fitz.Matrix(geometry.scale, geometry.scale)).irect
+        assert actual.width * actual.height <= render.MAX_PAGE_PIXELS, (
+            width,
+            height,
+            geometry,
+            actual,
+        )
+
+
+def _write_pdf_page(tmp_path, width: float, height: float, name: str):
+    fitz = pytest.importorskip("fitz")
+    document = fitz.open()
+    try:
+        page = document.new_page(width=width, height=height)
+        page.insert_text((72, 72), f"{width:g}x{height:g}")
+        pdf_path = tmp_path / name
+        document.save(str(pdf_path))
+    finally:
+        document.close()
+    return pdf_path
+
+
+def test_real_rasterizer_default_scale_renders_tall_page(tmp_path):
+    render = _load_render_module()
+    pdf_path = _write_pdf_page(tmp_path, 1430.0, 1670.0, "tall.pdf")
+    output_dir = tmp_path / "pngs"
+    output_dir.mkdir()
+
+    total_pages, pages = render.render_pdf_pages_to_pngs(pdf_path, [1], output_dir)
+
+    assert total_pages == 1
+    assert len(pages) == 1
+    assert pages[0].path.read_bytes().startswith(PNG_MAGIC)
+    assert pages[0].width * pages[0].height <= render.MAX_PAGE_PIXELS
+    assert abs(pages[0].width / pages[0].height - 1430 / 1670) < 0.01
+
+
+def test_real_rasterizer_default_scale_renders_wide_page(tmp_path):
+    render = _load_render_module()
+    pdf_path = _write_pdf_page(tmp_path, 1810.0, 1080.0, "wide.pdf")
+    output_dir = tmp_path / "pngs"
+    output_dir.mkdir()
+
+    total_pages, pages = render.render_pdf_pages_to_pngs(pdf_path, [1], output_dir)
+
+    assert total_pages == 1
+    assert len(pages) == 1
+    assert pages[0].path.read_bytes().startswith(PNG_MAGIC)
+    assert pages[0].width * pages[0].height <= render.MAX_PAGE_PIXELS
+    assert abs(pages[0].width / pages[0].height - 1810 / 1080) < 0.01
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("total_pages", "rendered_count", "truncated", "unrendered"),
+    [(20, 20, False, 0), (21, 20, True, 1)],
+)
+async def test_render_default_page_boundaries(
+    durable_workspace,
+    monkeypatch,
+    tmp_path,
+    total_pages,
+    rendered_count,
+    truncated,
+    unrendered,
+):
+    render = _load_render_module()
+    deck = _write_deck(durable_workspace.workspace.input_dir)
+    requested: list[list[int]] = []
+    _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
+    _install_rasterizer(
+        monkeypatch,
+        render,
+        page_count=total_pages,
+        requested=requested,
+        rendered=[],
+    )
+
+    result = await render.render_pptx_to_images(str(deck), durable_workspace.workspace)
+
+    assert result["success"] is True
+    assert result["total_pages"] == total_pages
+    assert result["rendered_pages"] == rendered_count
+    assert result["truncated"] is truncated
+    assert result["unrendered_pages"] == unrendered
+    assert requested == [list(range(1, rendered_count + 1))]
+    if truncated:
+        assert result["unrendered_page_ranges"] == [[21, 21]]
+    else:
+        assert result["unrendered_page_ranges"] == []
+
+
+@pytest.mark.parametrize(
+    ("start_page", "end_page"),
+    [
+        (True, 2),
+        (2, True),
+        (1.5, 2),
+        (2, 1.5),
+        ("1", 2),
+        (2, "3"),
+        ([1], 2),
+        (2, [3]),
+        ({"page": 1}, 2),
+        (2, {"page": 3}),
+        (1, 3.0),
+    ],
+)
+def test_page_arguments_reject_mixed_numeric_and_bad_types(start_page, end_page):
+    render = _load_render_module()
+
+    with pytest.raises(render.PptxRenderArgumentError):
+        render.validate_page_arguments(start_page, end_page)
+
+
+def test_one_sided_explicit_ranges_cannot_escape_the_page_limit():
+    render = _load_render_module()
+
+    with pytest.raises(render.PptxRenderArgumentError):
+        render.resolve_page_selection(21, 1, None)
+    with pytest.raises(render.PptxRenderArgumentError):
+        render.resolve_page_selection(21, None, 21)
+    assert list(render.resolve_page_selection(21, 21, None).page_numbers) == [21]
+    assert list(render.resolve_page_selection(21, None, 20).page_numbers) == list(
+        range(1, 21)
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_render_temp_directory_creation_removes_it(
+    durable_workspace, monkeypatch, tmp_path
+):
+    render = _load_render_module()
+    deck = _write_deck(durable_workspace.workspace.input_dir, "cancel.pptx")
+    real_mkdtemp = tempfile.mkdtemp
+    started = threading.Event()
+    release = threading.Event()
+    created: list[pathlib.Path] = []
+
+    def delayed_mkdtemp(*args, **kwargs):
+        if kwargs.get("prefix") != "xagent-pptx-render-":
+            return real_mkdtemp(*args, **kwargs)
+        started.set()
+        assert release.wait(5)
+        kwargs["dir"] = str(tmp_path)
+        path = pathlib.Path(real_mkdtemp(*args, **kwargs))
+        created.append(path)
+        return str(path)
+
+    monkeypatch.setattr(tempfile, "mkdtemp", delayed_mkdtemp)
+    task = asyncio.create_task(
+        render.render_pptx_to_images(str(deck), durable_workspace.workspace)
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        release.set()
+        await asyncio.sleep(0.05)
+        assert created, "the controlled render temp root was never created"
+        assert all(not path.exists() for path in created), (
+            "cancellation during render temp-directory creation leaked the "
+            "temporary root"
+        )
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        for path in created:
+            shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_output_symlink_escape_is_refused_before_writing(
+    durable_workspace, monkeypatch, tmp_path
+):
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    deck = _write_deck(workspace.input_dir)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    workspace.output_dir.rmdir()
+    workspace.output_dir.symlink_to(outside, target_is_directory=True)
+    _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
+    requested: list[list[int]] = []
+    rendered: list[list] = []
+    _install_rasterizer(
+        monkeypatch,
+        render,
+        page_count=2,
+        requested=requested,
+        rendered=rendered,
+    )
+
+    result = await render.render_pptx_to_images(str(deck), workspace)
+
+    assert result["success"] is False
+    assert result["error_code"] == "output_unavailable"
+    assert rendered == []
+    assert requested == []
+    assert list(outside.rglob("*")) == []
+
+
+@pytest.mark.asyncio
+async def test_preexisting_output_directory_is_not_deleted_on_collision(
+    durable_workspace, monkeypatch
+):
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    deck = _write_deck(workspace.input_dir)
+    existing = workspace.output_dir / "pptx_render_000000000000"
+    existing.mkdir()
+    sentinel = existing / "existing.png"
+    sentinel.write_bytes(b"pre-existing output")
+    monkeypatch.setattr(
+        render.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="0" * 32),
+    )
+    _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
+    _install_rasterizer(monkeypatch, render, page_count=1, requested=[], rendered=[])
+
+    result = await render.render_pptx_to_images(str(deck), workspace)
+
+    assert sentinel.exists(), (
+        "a failed mkdir must not delete a directory this call never created"
+    )
+    assert sentinel.read_bytes() == b"pre-existing output"
+    assert result["success"] is False
+    assert result["error_code"] == "output_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_postcommit_verification_outage_keeps_registered_pngs(
+    durable_workspace, monkeypatch, tmp_path
+):
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    deck = _write_deck(workspace.input_dir)
+    _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
+    _install_rasterizer(monkeypatch, render, page_count=2, requested=[], rendered=[])
+    real_register = workspace.register_files
+    committed: list[str] = []
+
+    def register_then_break_verification(files, *, db_session=None):
+        ids = real_register(files, db_session=db_session)
+        committed.extend(ids)
+
+        def failing_session():
+            raise RuntimeError("synthetic post-commit verification outage")
+
+        monkeypatch.setattr(storage_manager, "create_db_session", failing_session)
+        return ids
+
+    monkeypatch.setattr(workspace, "register_files", register_then_break_verification)
+
+    result = await render.render_pptx_to_images(str(deck), workspace)
+
+    rows = _output_rows(durable_workspace.session_factory)
+    assert len(committed) == 2
+    assert len(rows) == 2
+    assert all(pathlib.Path(str(row.storage_path)).is_file() for row in rows), (
+        "a verification outage must not delete already-registered PNGs"
+    )
+    assert result["success"] is False
+    assert result["error_code"] == "registration_failed"
+    assert result["registered_pages"] == [1, 2]
+    assert result["unverified_pages"] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_file_ref_build_runs_off_the_event_loop(durable_workspace, monkeypatch):
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    deck = _write_deck(workspace.input_dir)
+    _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
+    _install_rasterizer(monkeypatch, render, page_count=2, requested=[], rendered=[])
+    loop_thread = threading.get_ident()
+    seen_threads: list[int] = []
+    original = render.build_workspace_file_ref
+
+    def observed_build(**kwargs):
+        seen_threads.append(threading.get_ident())
+        return original(**kwargs)
+
+    monkeypatch.setattr(render, "build_workspace_file_ref", observed_build)
+
+    result = await render.render_pptx_to_images(str(deck), workspace)
+
+    assert result["success"] is True, result
+    assert len(seen_threads) == 2
+    assert all(thread != loop_thread for thread in seen_threads), (
+        "FileRef resolve/stat/is_file ran on the main event-loop thread"
+    )

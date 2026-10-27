@@ -2,8 +2,10 @@
 
 import asyncio
 import base64
+import os
 import pathlib
 import shutil
+import subprocess
 import sys
 from typing import Any
 
@@ -288,3 +290,54 @@ async def test_factory_build_with_sandbox_keeps_the_tool_on_the_host(
     assert result["success"] is True, result
     assert len(result["pages"]) == 1
     assert sandbox.calls == []
+
+
+def test_cold_factory_import_discovers_the_render_creator():
+    """The render adapter must be imported by the factory's own import list.
+
+    Importing the adapter directly first would hide a missing entry in
+    ``ToolRegistry._import_tool_modules``; this check runs a fresh interpreter
+    that only imports the factory and then triggers discovery.
+    """
+    _load_adapter_module()
+    repo_root = pathlib.Path(__file__).resolve().parents[5]
+    script = "\n".join(
+        [
+            "import sys",
+            "assert 'xagent.core.tools.adapters.vibe.pptx_render_tool' not in sys.modules",
+            "from xagent.core.tools.adapters.vibe.factory import ToolRegistry",
+            "ToolRegistry._import_tool_modules()",
+            "names = [",
+            "    creator.__name__",
+            "    for creator, _categories, _gate in ToolRegistry._tool_creators",
+            "]",
+            "assert 'create_pptx_render_tools' in names, names",
+            "print('COLD_FACTORY_OK')",
+        ]
+    )
+    environment = dict(os.environ)
+    for key in (
+        "PYTHONPATH",
+        "XAGENT_TEST_REDIS_URL",
+        "MILVUS_URI",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+    ):
+        environment.pop(key, None)
+    completed = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=repo_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "COLD_FACTORY_OK" in completed.stdout

@@ -8,6 +8,8 @@ than any caller's caching behavior.
 
 import asyncio
 import pathlib
+import tempfile
+import threading
 
 import pytest
 
@@ -373,3 +375,90 @@ async def test_concurrent_conversions_get_isolated_profiles(tmp_path, monkeypatc
         assert not profile.exists()
     assert (output_one / "first.pdf").is_file()
     assert (output_two / "second.pdf").is_file()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_profile_creation_removes_the_created_directory(
+    tmp_path, monkeypatch
+):
+    conversion = _load_conversion_module()
+    pptx_path = tmp_path / "deck.pptx"
+    pptx_path.write_bytes(b"pptx bytes")
+    output_dir = tmp_path / "pdf-out"
+    output_dir.mkdir()
+    real_mkdtemp = tempfile.mkdtemp
+    started = threading.Event()
+    release = threading.Event()
+    created: list[pathlib.Path] = []
+
+    def delayed_mkdtemp(*args, **kwargs):
+        if kwargs.get("prefix") != "xagent-pptx-profile-":
+            return real_mkdtemp(*args, **kwargs)
+        started.set()
+        assert release.wait(5)
+        kwargs["dir"] = str(tmp_path)
+        path = pathlib.Path(real_mkdtemp(*args, **kwargs))
+        created.append(path)
+        return str(path)
+
+    monkeypatch.setattr(tempfile, "mkdtemp", delayed_mkdtemp)
+    task = asyncio.create_task(conversion.convert_pptx_to_pdf(pptx_path, output_dir))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        release.set()
+        await asyncio.sleep(0.05)
+        assert created, "the controlled profile directory was never created"
+        assert all(not path.exists() for path in created), (
+            "cancellation during profile creation leaked the directory"
+        )
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        for path in created:
+            import shutil
+
+            shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_expected_pdf_existence_check_runs_off_the_event_loop(
+    tmp_path, monkeypatch
+):
+    conversion = _load_conversion_module()
+    assert hasattr(conversion, "_produced_pdf_exists"), (
+        "the shared helper must expose its produced-PDF check so it can run "
+        "in a worker thread"
+    )
+    pptx_path = tmp_path / "deck.pptx"
+    pptx_path.write_bytes(b"pptx bytes")
+    output_dir = tmp_path / "pdf-out"
+    output_dir.mkdir()
+    process = _RecordingProcess()
+    loop_thread = threading.get_ident()
+    observed: list[int] = []
+    original = conversion._produced_pdf_exists
+
+    def observed_exists(pdf_path):
+        observed.append(threading.get_ident())
+        return original(pdf_path)
+
+    async def communicate():
+        (output_dir / "deck.pdf").write_bytes(b"%PDF-1.4 conversion")
+        process.returncode = 0
+        return b"", b""
+
+    process.communicate = communicate  # type: ignore[method-assign]
+    _install_process_factory(monkeypatch, conversion, lambda _calls: process)
+    monkeypatch.setattr(conversion, "_produced_pdf_exists", observed_exists)
+
+    pdf_path = await conversion.convert_pptx_to_pdf(pptx_path, output_dir)
+
+    assert pdf_path == output_dir / "deck.pdf"
+    assert observed, "the produced-PDF check did not run"
+    assert all(thread != loop_thread for thread in observed), (
+        "the produced-PDF filesystem check blocked the event loop"
+    )
