@@ -492,6 +492,7 @@ _WORKSPACE_DOWNLOAD_FIELDS: dict[tuple[str, str], str] = {
     ("onedrive", "onedrive_download_file"): "file_path",
     ("sharepoint", "sharepoint_download_file"): "file_path",
     ("google-drive", "google_drive_download_file"): "path",
+    ("google-slides", "google_slides_get_slide_thumbnail"): "path",
 }
 
 

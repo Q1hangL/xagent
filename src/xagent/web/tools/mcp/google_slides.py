@@ -3,14 +3,17 @@
 # isort: skip_file
 
 import errno
+import ipaddress
 import json
 import logging
 import os
 import re
+import time
 import uuid
 from collections import Counter
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import urljoin, urlsplit
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-not-found]
@@ -19,6 +22,7 @@ from pydantic import BeforeValidator
 
 from mcp.server.fastmcp import FastMCP
 
+from ....core.utils import public_requests as requests
 from .utils import (
     GoogleFileKind,
     allowed_dirs_from_env,
@@ -1426,6 +1430,451 @@ def google_slides_batch_update(presentation_id: str, requests_json: str) -> str:
     except Exception as e:
         logger.error(f"Error applying batch update: {e}")
         return _presentation_error(e, presentation_id, editing=True)
+
+
+# Rendering one slide produces a short-lived signed image URL that is served
+# by Google's user-content host, not by the Slides API.  Downloading it must
+# therefore not reuse the OAuth transport, and the product bounds the transfer
+# (10 MiB, 30 s, 3 redirects) so a malformed response cannot exhaust a task.
+_THUMBNAIL_MAX_BYTES = 10 * 1024 * 1024
+_THUMBNAIL_TIMEOUT_SECONDS = 30.0
+_THUMBNAIL_MAX_REDIRECTS = 3
+_THUMBNAIL_CHUNK_BYTES = 64 * 1024
+# Google's getThumbnail documentation does not promise one fixed subdomain;
+# the images are served from Google's user-content domain (lh3, lh7-rt, ...).
+_THUMBNAIL_HOST_SUFFIX = "googleusercontent.com"
+_THUMBNAIL_PNG_MIME_TYPE = "image/png"
+_THUMBNAIL_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_THUMBNAIL_SIZES = ("SMALL", "MEDIUM", "LARGE")
+_THUMBNAIL_REQUEST_HEADERS = {
+    "Accept": "image/png",
+    "User-Agent": "Xagent-Google-Slides-Thumbnail/1.0",
+}
+_THUMBNAIL_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]")
+_THUMBNAIL_FILENAME_STEM_LENGTH = 120
+# The current task workspace, injected by the host exactly as for
+# google_drive_download_file; a thumbnail is another generated deliverable
+# under the same output directory.
+_THUMBNAIL_OUTPUT_DIR_ENV_VAR = "XAGENT_GOOGLE_DRIVE_OUTPUT_DIR"
+
+
+class _ThumbnailDownloadError(RuntimeError):
+    """A failure while fetching a thumbnail image.
+
+    The message is deliberately generic: the signed image URL must never reach
+    the caller, a log line, or an exception's text.
+    """
+
+
+def _normalize_thumbnail_size(value: object) -> str:
+    """Validate ``size`` inside FastMCP's schema layer as well.
+
+    The function body repeats this check for direct Python callers, which
+    bypass FastMCP validation.
+    """
+    if not isinstance(value, str):
+        raise ValueError("'size' must be one of SMALL, MEDIUM, LARGE")
+    normalized = value.strip().upper()
+    if normalized not in _THUMBNAIL_SIZES:
+        raise ValueError("'size' must be one of SMALL, MEDIUM, LARGE")
+    return normalized
+
+
+_ThumbnailSize = Annotated[
+    Literal["SMALL", "MEDIUM", "LARGE"], BeforeValidator(_normalize_thumbnail_size)
+]
+
+
+def _strict_page_number(value: object) -> int | None:
+    """Refuse every value that is not an actual integer.
+
+    Pydantic's lax mode would otherwise accept a JSON ``true`` or ``"2"`` as a
+    valid page and silently change which slide is returned.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("'page_number' must be an integer")
+    return value
+
+
+_PageNumber = Annotated[int | None, BeforeValidator(_strict_page_number)]
+
+
+def _is_allowed_thumbnail_host(hostname: str) -> bool:
+    return hostname == _THUMBNAIL_HOST_SUFFIX or hostname.endswith(
+        "." + _THUMBNAIL_HOST_SUFFIX
+    )
+
+
+def _validate_thumbnail_url(url: object) -> str:
+    """Return ``url`` when it is an HTTPS Google user-content image URL.
+
+    Every redirect hop is passed through this function, so a permitted first
+    URL cannot hand the next hop to a plain client.
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("thumbnail image URL is missing")
+    if "\\" in url or any(
+        character.isspace() or ord(character) < 32 for character in url
+    ):
+        raise ValueError("thumbnail image URL contains invalid characters")
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        raise ValueError("thumbnail image URL could not be parsed") from None
+    if parsed.scheme.lower() != "https":
+        raise ValueError("thumbnail image URL must use HTTPS")
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+        or "@" in parsed.netloc
+    ):
+        raise ValueError("thumbnail image URL must not include user information")
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("thumbnail image URL has no host")
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ValueError("thumbnail image URL has an invalid port") from None
+    if port not in (None, 443):
+        raise ValueError("thumbnail image URL must not use a non-standard port")
+    host = hostname.rstrip(".").lower()
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("thumbnail image URL host is not a Google image host")
+    if host in {"localhost", "ip6-localhost"} or host.endswith(".localhost"):
+        raise ValueError("thumbnail image URL host is not a Google image host")
+    if not _is_allowed_thumbnail_host(host):
+        raise ValueError("thumbnail image URL host is not a Google image host")
+    return url
+
+
+def _new_thumbnail_session() -> requests.Session:
+    """A fresh public-only client for the image host.
+
+    It carries no connector credentials, authorization or cookies, and it is
+    separate from the Google API client's OAuth transport.
+    """
+    return requests.Session()
+
+
+def _thumbnail_remaining_timeout(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _ThumbnailDownloadError("thumbnail image download timed out")
+    return min(remaining, _THUMBNAIL_TIMEOUT_SECONDS)
+
+
+def _read_thumbnail_body(response: Any, deadline: float) -> bytes:
+    """Read a bounded PNG body without buffering an unbounded response first."""
+    declared_length = response.headers.get("Content-Length")
+    if declared_length is not None:
+        trimmed_length = str(declared_length).strip()
+        if not trimmed_length.isdigit():
+            raise _ThumbnailDownloadError(
+                "thumbnail image download returned an invalid Content-Length header"
+            )
+        if int(trimmed_length) > _THUMBNAIL_MAX_BYTES:
+            raise _ThumbnailDownloadError("thumbnail image is too large to download")
+    content_encoding = (
+        str(response.headers.get("Content-Encoding", "identity")).strip().lower()
+    )
+    if content_encoding not in ("", "identity"):
+        raise _ThumbnailDownloadError(
+            "thumbnail image download used an unsupported content encoding"
+        )
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        for chunk in response.iter_content(_THUMBNAIL_CHUNK_BYTES):
+            if time.monotonic() > deadline:
+                raise _ThumbnailDownloadError("thumbnail image download timed out")
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > _THUMBNAIL_MAX_BYTES:
+                raise _ThumbnailDownloadError(
+                    "thumbnail image is too large to download"
+                )
+            chunks.append(chunk)
+    except requests.RequestException:
+        raise _ThumbnailDownloadError(
+            "thumbnail image download failed: network error"
+        ) from None
+    data = b"".join(chunks)
+    if not data:
+        raise _ThumbnailDownloadError("downloaded thumbnail image is empty")
+    if not data.startswith(_THUMBNAIL_PNG_SIGNATURE):
+        raise _ThumbnailDownloadError("downloaded thumbnail image is not a PNG image")
+    return data
+
+
+def _download_thumbnail_image(content_url: object) -> bytes:
+    """Fetch and validate one thumbnail image from an allowed image host."""
+    current_url = _validate_thumbnail_url(content_url)
+    deadline = time.monotonic() + _THUMBNAIL_TIMEOUT_SECONDS
+    redirects_followed = 0
+    session = _new_thumbnail_session()
+    try:
+        while True:
+            hop_timeout = _thumbnail_remaining_timeout(deadline)
+            try:
+                response = session.get(
+                    current_url,
+                    headers=_THUMBNAIL_REQUEST_HEADERS,
+                    stream=True,
+                    allow_redirects=False,
+                    timeout=(hop_timeout, hop_timeout),
+                )
+            except requests.RequestException:
+                raise _ThumbnailDownloadError(
+                    "thumbnail image download failed: network error"
+                ) from None
+            try:
+                status = response.status_code
+                if 300 <= status < 400:
+                    location = response.headers.get("Location")
+                    if not isinstance(location, str) or not location.strip():
+                        raise _ThumbnailDownloadError(
+                            "thumbnail image download returned an invalid redirect"
+                        )
+                    if redirects_followed >= _THUMBNAIL_MAX_REDIRECTS:
+                        raise _ThumbnailDownloadError(
+                            "thumbnail image download redirected too many times"
+                        )
+                    redirects_followed += 1
+                    current_url = _validate_thumbnail_url(
+                        urljoin(current_url, location.strip())
+                    )
+                    continue
+                if not 200 <= status < 300:
+                    raise _ThumbnailDownloadError(
+                        f"thumbnail image download failed with HTTP {int(status)}"
+                    )
+                return _read_thumbnail_body(response, deadline)
+            except requests.RequestException:
+                raise _ThumbnailDownloadError(
+                    "thumbnail image download failed: network error"
+                ) from None
+            finally:
+                response.close()
+    finally:
+        session.close()
+
+
+def _thumbnail_output_dir() -> Path:
+    """Return the current task's output directory for the saved image."""
+    base = os.environ.get(_THUMBNAIL_OUTPUT_DIR_ENV_VAR, "").strip()
+    if not base:
+        raise RuntimeError(
+            "No task workspace configured for this connector "
+            f"({_THUMBNAIL_OUTPUT_DIR_ENV_VAR} is unset) — "
+            "google_slides_get_slide_thumbnail needs a task workspace to "
+            "write into."
+        )
+    output_dir = Path(base).expanduser().resolve() / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def _thumbnail_filename(*, page_number: int | None, slide_object_id: str) -> str:
+    if page_number is not None:
+        stem = f"slide_{page_number}"
+    else:
+        sanitized = _THUMBNAIL_UNSAFE_FILENAME_CHARS.sub("_", slide_object_id).strip(
+            "._"
+        )
+        stem = f"slide_{sanitized or 'image'}"
+    return stem[:_THUMBNAIL_FILENAME_STEM_LENGTH] + ".png"
+
+
+def _unique_thumbnail_path(output_dir: Path, filename: str) -> Path:
+    candidate = output_dir / filename
+    if not candidate.exists():
+        return candidate
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    counter = 1
+    while (candidate := output_dir / f"{stem} ({counter}){suffix}").exists():
+        counter += 1
+    return candidate
+
+
+def _write_thumbnail_png(data: bytes, *, output_dir: Path, filename: str) -> Path:
+    output_path = _unique_thumbnail_path(output_dir, filename)
+    try:
+        output_path.write_bytes(data)
+    except OSError:
+        output_path.unlink(missing_ok=True)
+        raise _ThumbnailDownloadError(
+            "could not save the thumbnail image in the task workspace"
+        ) from None
+    return output_path
+
+
+@mcp.tool()
+def google_slides_get_slide_thumbnail(
+    presentation_id: str,
+    slide_id: str | None = None,
+    page_number: _PageNumber = None,
+    size: _ThumbnailSize = "LARGE",
+) -> str:
+    """
+    Render one slide of a Google Slides presentation as a PNG image in the
+    task workspace, so its look can be shown or inspected.
+
+    This covers Google Slides presentations only; it does not render slides
+    from an uploaded .pptx file.
+
+    Provide exactly one of slide_id or page_number:
+      - slide_id is the slide's object id, as returned by
+        google_slides_get_presentation ("object_id") or by
+        google_slides_add_slide ("slide_id"). It is always used as an object
+        id: a numeric-looking value is never reinterpreted as a page number.
+      - page_number is the slide's 1-based position in the presentation. The
+        object id is looked up with presentations.get(fields="slides.objectId"),
+        and a page outside the deck's slide count is rejected.
+
+    size selects the image size Google renders: "LARGE" (the default),
+    "MEDIUM", or "SMALL". The saved file is always a PNG image.
+
+    The result reports the saved PNG's path in the current task workspace
+    output directory, its mime_type ("image/png"), its byte size, and the
+    presentation and slide ids. Each call writes a new file and never
+    overwrites an existing output file. The short-lived thumbnail link Google
+    returns is never included in the result.
+
+    The host attaches a durable file_ref (file_id) to a successful result
+    after registering the saved file. Only a successful result with a
+    trusted, non-empty file_ref can be shown or reused in later turns; if the
+    result carries file_ref_error, report that the file is not durable instead
+    of presenting it as delivered.
+
+    Failures return an error result, never an empty success: an invalid,
+    unknown or out-of-range slide, a presentation or API error, an image host
+    or redirect that is not allowed, a timeout, an oversized download, or a
+    response that is empty or not a PNG image.
+    """
+    opened = False
+    try:
+        if not isinstance(presentation_id, str) or not presentation_id.strip():
+            return _error("'presentation_id' must be a non-empty string.")
+        if slide_id is not None and not isinstance(slide_id, str):
+            return _error("'slide_id' must be a string.")
+        if page_number is not None and (
+            isinstance(page_number, bool) or not isinstance(page_number, int)
+        ):
+            return _error("'page_number' must be an integer.")
+        if not isinstance(size, str):
+            return _error("'size' must be one of SMALL, MEDIUM, LARGE.")
+        if slide_id is None and page_number is None:
+            return _error(
+                "Provide exactly one of slide_id (a slide object id) or "
+                "page_number (1-based); neither was given."
+            )
+        if slide_id is not None and page_number is not None:
+            return _error(
+                "Provide exactly one of slide_id (a slide object id) or "
+                "page_number (1-based); both were given."
+            )
+        normalized_size = size.strip().upper()
+        if normalized_size not in _THUMBNAIL_SIZES:
+            return _error(
+                f"Unknown size '{size}'. Supported sizes: SMALL, MEDIUM, LARGE."
+            )
+        if slide_id is not None:
+            slide_id = slide_id.strip()
+            if not slide_id:
+                return _error("'slide_id' must not be empty.")
+        if page_number is not None and page_number < 1:
+            return _error("'page_number' must be 1 or greater.")
+
+        output_dir = _thumbnail_output_dir()
+        pres_id = _resolve_presentation_id(presentation_id)
+        service = get_slides_service()
+
+        if page_number is not None:
+            presentation = (
+                service.presentations()
+                .get(presentationId=pres_id, fields="slides.objectId")
+                .execute()
+            )
+            opened = True
+            slides = (
+                presentation.get("slides", []) if isinstance(presentation, dict) else []
+            )
+            object_ids = [
+                slide.get("objectId")
+                for slide in slides
+                if isinstance(slide, dict)
+                and isinstance(slide.get("objectId"), str)
+                and slide.get("objectId")
+            ]
+            if not object_ids:
+                return _error("The presentation has no slides to render.")
+            if page_number > len(object_ids):
+                return _error(
+                    f"page_number {page_number} is out of range: the "
+                    f"presentation has {len(object_ids)} slides."
+                )
+            target_slide_id = object_ids[page_number - 1]
+        else:
+            target_slide_id = slide_id
+
+        thumbnail = (
+            service.presentations()
+            .pages()
+            .getThumbnail(
+                presentationId=pres_id,
+                pageObjectId=target_slide_id,
+                thumbnailProperties_mimeType="PNG",
+                thumbnailProperties_thumbnailSize=normalized_size,
+            )
+            .execute()
+        )
+        content_url = (
+            thumbnail.get("contentUrl") if isinstance(thumbnail, dict) else None
+        )
+        if not isinstance(content_url, str) or not content_url.strip():
+            return _error(
+                "Google Slides did not return a thumbnail image URL for this slide."
+            )
+
+        data = _download_thumbnail_image(content_url)
+        output_path = _write_thumbnail_png(
+            data,
+            output_dir=output_dir,
+            filename=_thumbnail_filename(
+                page_number=page_number, slide_object_id=target_slide_id
+            ),
+        )
+        width = thumbnail.get("width")
+        height = thumbnail.get("height")
+        return json.dumps(
+            {
+                "status": "success",
+                "presentation_id": pres_id,
+                "slide_id": target_slide_id,
+                "page_number": page_number,
+                "mime_type": _THUMBNAIL_PNG_MIME_TYPE,
+                "size": len(data),
+                "path": str(output_path),
+                "width": width if isinstance(width, int) else None,
+                "height": height if isinstance(height, int) else None,
+            },
+            ensure_ascii=False,
+        )
+    except (ValueError, _ThumbnailDownloadError) as e:
+        logger.error("Could not render slide thumbnail: %s", type(e).__name__)
+        return _error(str(e))
+    except Exception as e:
+        logger.error("Error rendering slide thumbnail: %s", type(e).__name__)
+        return _presentation_error(e, presentation_id, opened=opened)
 
 
 if __name__ == "__main__":
