@@ -315,9 +315,18 @@ def test_cold_factory_import_discovers_the_render_creator():
             "print('COLD_FACTORY_OK')",
         ]
     )
+    # Import the same source tree this pytest process imported, not whatever
+    # the venv's editable install points at. Under a mutation/review worktree
+    # the ambient environment carries that tree on PYTHONPATH; keep it and make
+    # the explicit source root authoritative.
+    factory_module = sys.modules["xagent.core.tools.adapters.vibe.factory"]
+    source_root = str(pathlib.Path(factory_module.__file__).resolve().parents[5])
+    ambient_path = os.environ.get("PYTHONPATH", "")
     environment = dict(os.environ)
+    environment["PYTHONPATH"] = ":".join(
+        part for part in (source_root, ambient_path) if part
+    )
     for key in (
-        "PYTHONPATH",
         "XAGENT_TEST_REDIS_URL",
         "MILVUS_URI",
         "http_proxy",

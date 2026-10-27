@@ -1548,3 +1548,22 @@ async def test_file_ref_build_runs_off_the_event_loop(durable_workspace, monkeyp
     assert all(thread != loop_thread for thread in seen_threads), (
         "FileRef resolve/stat/is_file ran on the main event-loop thread"
     )
+
+
+def test_fit_scale_to_page_lowers_the_scale_before_rasterizing(tmp_path):
+    render = _load_render_module()
+    fitz = pytest.importorskip("fitz")
+    pdf_path = _write_pdf_page(tmp_path, 720.0, 540.0, "budget.pdf")
+    document = fitz.open(str(pdf_path))
+    try:
+        page = document[0]
+        requested_scale = 100.0
+        effective_scale = render._fit_scale_to_page(
+            page, requested_scale, render.MAX_PAGE_PIXELS
+        )
+        extents = render._mupdf_pixel_extents(page, effective_scale)
+    finally:
+        document.close()
+
+    assert effective_scale < requested_scale
+    assert extents[0] * extents[1] <= render.MAX_PAGE_PIXELS
