@@ -119,10 +119,6 @@ class _FakePixelExtent:
         self.width = width
         self.height = height
 
-    def tobytes(self, fmt: str = "png") -> bytes:
-        assert fmt == "png"
-        return PNG_1X1
-
     def save(self, path) -> None:
         pathlib.Path(path).write_bytes(PNG_1X1)
 
