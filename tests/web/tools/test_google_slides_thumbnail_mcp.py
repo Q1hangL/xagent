@@ -1,31 +1,42 @@
 """Thumbnail download behavior of the Google Slides connector.
 
-The tests drive the registered MCP tool, not private helpers, wherever the
-observable contract is the tool's JSON result.  The HTTP layer is replaced by
-a fake transport that runs through a real ``requests`` session preparation, so
-the request headers and the per-hop URLs the tool actually sends are asserted
-rather than mocked away.
+The tests drive the registered MCP tool.  Argument, mapping and size checks use
+a fake transport, while the transport-boundary tests (slow streams, redirects,
+cookies, transport logging) run through a real ``requests`` session against a
+loopback HTTP server whose adapter is mounted in place of the public one.  That
+keeps the real redirect, cookie and streaming code paths under test instead of
+replacing ``Session.send``.
 """
 
-import base64
+import http.server
+import io
 import json
 import logging
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
+from urllib.parse import urlsplit
 
 import pytest
+import requests
+from PIL import Image
 
 from xagent.web.tools.mcp import google_slides
 
-# A 1x1 PNG.  Real image bytes keep the "output file holds a valid PNG"
-# assertion meaningful instead of comparing an opaque blob with itself.
-_PNG_BYTES = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8"
-    "/x8AAwMCAO+aXioAAAAASUVORK5CYII="
-)
+# A real PNG produced by Pillow.  Decodable image bytes keep the "the saved
+# file is a valid image" assertion meaningful; the signature-only and truncated
+# bodies in the invalid-image tests are rejected by the integrity check.
+_PNG_BYTES = io.BytesIO()
+Image.new("RGB", (2, 3), (10, 20, 30)).save(_PNG_BYTES, format="PNG")
+_PNG_BYTES = _PNG_BYTES.getvalue()
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _THUMB_HOST = "lh3.googleusercontent.com"
 _THUMB_URL = f"https://{_THUMB_HOST}/pages/thumb?token=thumb-secret-token"
+_THUMB_SECRET = "thumb-secret-token"
+_REVIEW_SECRET = "synthetic-review-signed-token"
 _LARGE_LIMIT = 10 * 1024 * 1024
 
 
@@ -108,16 +119,28 @@ def _install_slides_api(monkeypatch):
 
 
 def _install_http(monkeypatch, responder):
-    """Replace the transport behind the tool's own requests session."""
+    """Replace the controlled send seam behind the tool's requests session."""
     _thumbnail_tool()
     state = {"calls": [], "sessions": []}
 
-    def fake_send(session, request, **kwargs):
+    def _record(session, request, kwargs):
         state["sessions"].append(session)
         state["calls"].append((request, kwargs))
         return responder(len(state["calls"]) - 1, request, state)
 
-    monkeypatch.setattr(google_slides.requests.Session, "send", fake_send)
+    seam = getattr(google_slides, "_send_thumbnail_request", None)
+    if seam is not None:
+
+        def _fake_send(session, request, *, timeout):
+            return _record(session, request, {"timeout": timeout})
+
+        monkeypatch.setattr(google_slides, "_send_thumbnail_request", _fake_send)
+    else:
+
+        def _fake_session_send(session, request, **kwargs):
+            return _record(session, request, kwargs)
+
+        monkeypatch.setattr(google_slides.requests.Session, "send", _fake_session_send)
     return state
 
 
@@ -142,7 +165,13 @@ def _no_body_response(status=200, headers=None):
 
 
 def _png_of_size(size):
-    return _PNG_SIGNATURE + b"x" * (size - len(_PNG_SIGNATURE))
+    """A decodable PNG padded to exactly ``size`` bytes.
+
+    Trailing bytes after IEND are ignored by decoders, so this keeps the size
+    boundary meaningful without synthesizing a huge image.
+    """
+    assert size >= len(_PNG_BYTES)
+    return _PNG_BYTES + b"\x00" * (size - len(_PNG_BYTES))
 
 
 def _streaming_response(body, chunks):
@@ -993,3 +1022,321 @@ async def test_thumbnail_tool_is_registered_with_its_limits_and_failure_contract
     # Existing connector tools stay registered.
     assert "google_slides_get_presentation" in tools
     assert "google_slides_import_pptx" in tools
+
+
+class _LoopbackAdapter(requests.adapters.HTTPAdapter):
+    """A real HTTPAdapter that connects the allowed HTTPS URL to a local server.
+
+    The tool still sees and validates the ordinary public hostname; only the
+    socket destination is redirected, so requests' real redirect, cookie and
+    streaming code paths keep running.
+    """
+
+    def __init__(self, port, recorded_responses):
+        super().__init__()
+        self._port = port
+        self._recorded_responses = recorded_responses
+
+    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+        return self.poolmanager.connection_from_host(
+            "127.0.0.1", self._port, scheme="http"
+        )
+
+    def cert_verify(self, *args, **kwargs):
+        return None
+
+    def send(self, request, **kwargs):
+        response = super().send(request, **kwargs)
+        self._recorded_responses.append(response)
+        return response
+
+
+@pytest.fixture
+def real_http(monkeypatch):
+    """A loopback image host exercised through a real requests session."""
+    seen = []
+    responses = []
+    sessions = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            return None
+
+        def _write(self, body):
+            try:
+                self.wfile.write(body)
+            except OSError:
+                return None
+            return None
+
+        def do_GET(self):
+            seen.append({"path": self.path, "headers": dict(self.headers)})
+            route = urlsplit(self.path).path
+            if route == "/cookie":
+                body = b"redirect"
+                self.send_response(302)
+                self.send_header(
+                    "Location", f"https://{_THUMB_HOST}/image?token={_REVIEW_SECRET}"
+                )
+                self.send_header(
+                    "Set-Cookie", "thumbnail_session=synthetic-cookie; Path=/"
+                )
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self._write(body)
+                return
+            if route == "/large-redirect":
+                body = b"x" * (10 * 1024 * 1024 + 1)
+                self.send_response(302)
+                self.send_header("Location", "https://evil.example/not-requested")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self._write(body)
+                return
+            if route == "/slow":
+                body = _PNG_BYTES[:20]
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                for byte in body:
+                    self._write(bytes([byte]))
+                    try:
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                    time.sleep(0.1)
+                return
+            if route == "/stall":
+                time.sleep(3.0)
+            body = _PNG_BYTES
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self._write(body)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    original_new_session = google_slides._new_thumbnail_session
+
+    def _new_thumbnail_session():
+        session = original_new_session()
+        session.mount("https://", _LoopbackAdapter(server.server_port, responses))
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr(google_slides, "_new_thumbnail_session", _new_thumbnail_session)
+    try:
+        yield SimpleNamespace(
+            server=server,
+            seen=seen,
+            responses=responses,
+            sessions=sessions,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def _install_real_api(monkeypatch, path, secret=_REVIEW_SECRET):
+    api = _install_slides_api(monkeypatch)
+    api.set_thumbnail(
+        {
+            "contentUrl": f"https://{_THUMB_HOST}{path}?token={secret}",
+            "width": 2,
+            "height": 3,
+        }
+    )
+    return api
+
+
+def test_thumbnail_real_slow_stream_stops_at_the_total_deadline(
+    monkeypatch, real_http, tmp_path
+):
+    """A byte-dripping body must be cut off at the configured total deadline."""
+    monkeypatch.setattr(google_slides, "_THUMBNAIL_TIMEOUT_SECONDS", 0.8)
+    _install_real_api(monkeypatch, "/slow")
+
+    started = time.monotonic()
+    result = _call_tool(presentation_id="pres1", slide_id="obj1")
+    elapsed = time.monotonic() - started
+
+    assert result["status"] == "error"
+    assert "timed out" in result["message"]
+    assert elapsed < 1.7
+    assert not list((tmp_path / "output").glob("*.png"))
+
+
+def test_thumbnail_real_stalled_response_headers_respect_the_total_deadline(
+    monkeypatch, real_http, tmp_path
+):
+    """Connection/headers must not outlive the total deadline either."""
+    monkeypatch.setattr(google_slides, "_THUMBNAIL_TIMEOUT_SECONDS", 0.8)
+    _install_real_api(monkeypatch, "/stall")
+
+    started = time.monotonic()
+    result = _call_tool(presentation_id="pres1", slide_id="obj1")
+    elapsed = time.monotonic() - started
+
+    assert result["status"] == "error"
+    assert "timed out" in result["message"]
+    assert elapsed < 2.5
+    assert not list((tmp_path / "output").glob("*.png"))
+
+
+def test_thumbnail_real_redirect_body_is_not_read_before_validation(
+    monkeypatch, real_http
+):
+    """A disallowed redirect body must not be buffered before the host check."""
+    _install_real_api(monkeypatch, "/large-redirect")
+
+    result = _call_tool(presentation_id="pres1", slide_id="obj1")
+
+    assert result["status"] == "error"
+    assert "host" in result["message"]
+    assert len(real_http.seen) == 1
+    redirects = [
+        response for response in real_http.responses if response.status_code == 302
+    ]
+    assert redirects
+    for response in redirects:
+        assert not response._content
+
+
+def test_thumbnail_real_redirect_does_not_replay_cookies(monkeypatch, real_http):
+    """Set-Cookie on an allowed redirect must not reach the next hop."""
+    _install_real_api(monkeypatch, "/cookie")
+
+    result = _call_tool(presentation_id="pres1", slide_id="obj1")
+
+    assert result["status"] == "success"
+    assert len(real_http.seen) == 2
+    assert "Cookie" not in real_http.seen[1]["headers"]
+    assert all("Authorization" not in request["headers"] for request in real_http.seen)
+    assert all(len(session.cookies) == 0 for session in real_http.sessions)
+
+
+def test_thumbnail_real_transport_debug_log_does_not_leak_the_signed_query(
+    monkeypatch, real_http, caplog
+):
+    caplog.set_level(logging.DEBUG, logger="urllib3.connectionpool")
+    _install_real_api(monkeypatch, "/image")
+
+    result = _call_tool(presentation_id="pres1", slide_id="obj1")
+
+    assert result["status"] == "success"
+    assert _REVIEW_SECRET not in caplog.text
+
+
+def _signed_api_error(signed_url):
+    from googleapiclient.errors import HttpError
+    from httplib2 import Response
+
+    def value_error():
+        return ValueError(f"provider failure {signed_url}")
+
+    def runtime_error():
+        return RuntimeError(f"provider failure {signed_url}")
+
+    def http_error():
+        return HttpError(
+            Response({"status": "500"}),
+            json.dumps(
+                {"error": {"message": f"provider failure {signed_url}"}}
+            ).encode(),
+        )
+
+    return {"value": value_error, "runtime": runtime_error, "http": http_error}
+
+
+@pytest.mark.parametrize("kind", ["value", "runtime", "http"])
+def test_thumbnail_api_errors_do_not_leak_the_signed_url(monkeypatch, caplog, kind):
+    caplog.set_level(logging.DEBUG)
+    signed_url = f"https://{_THUMB_HOST}/image?token={_REVIEW_SECRET}"
+    api = _install_slides_api(monkeypatch)
+    api.set_thumbnail(error=_signed_api_error(signed_url)[kind]())
+    _install_http(monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES))
+
+    result = _call_tool(presentation_id="pres1", slide_id="obj1")
+
+    assert result["status"] == "error"
+    assert _REVIEW_SECRET not in json.dumps(result)
+    assert _REVIEW_SECRET not in caplog.text
+
+
+def test_thumbnail_does_not_follow_a_symlink_in_the_output_directory(
+    monkeypatch, tmp_path
+):
+    _install_slides_api(monkeypatch)
+    _install_http(monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES))
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    outside = tmp_path / "outside.png"
+    (output_dir / "slide_obj1.png").symlink_to(outside)
+
+    result = _call_tool(presentation_id="pres1", slide_id="obj1")
+
+    assert result["status"] == "success"
+    path = _result_path(result)
+    assert path.parent == output_dir
+    assert path.name != "slide_obj1.png"
+    assert not outside.exists()
+    assert path.read_bytes() == _PNG_BYTES
+
+
+def test_thumbnail_concurrent_calls_write_two_distinct_files(monkeypatch, tmp_path):
+    _install_slides_api(monkeypatch)
+    _install_http(monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES))
+    output_dir = tmp_path / "output"
+    barrier = threading.Barrier(2)
+    original_exists = Path.exists
+
+    def synchronized_exists(self):
+        if self.parent == output_dir and self.suffix == ".png":
+            barrier.wait(timeout=5)
+            return False
+        return original_exists(self)
+
+    monkeypatch.setattr(Path, "exists", synchronized_exists)
+
+    def _call(_index):
+        return _call_tool(presentation_id="pres1", slide_id="obj1")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(_call, (0, 1)))
+
+    assert all(result["status"] == "success" for result in results)
+    paths = {result["path"] for result in results}
+    assert len(paths) == 2
+    assert len(list(output_dir.glob("*.png"))) == 2
+
+
+@pytest.mark.parametrize(
+    "body",
+    [_PNG_SIGNATURE, _PNG_SIGNATURE + b"junk", _PNG_BYTES[:33]],
+    ids=["signature_only", "signature_and_junk", "truncated"],
+)
+def test_thumbnail_rejects_png_like_bodies_that_cannot_be_decoded(
+    monkeypatch, tmp_path, body
+):
+    _install_slides_api(monkeypatch)
+    _install_http(monkeypatch, lambda index, request, state: _http_response(body))
+
+    result = _call_tool(presentation_id="pres1", slide_id="obj1")
+
+    assert result["status"] == "error"
+    assert "PNG" in result["message"]
+    assert not list((tmp_path / "output").glob("*.png"))
+
+
+def test_thumbnail_saves_a_decodable_png(monkeypatch):
+    _install_slides_api(monkeypatch)
+    _install_http(monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES))
+
+    result = _call_tool(presentation_id="pres1", slide_id="obj1")
+
+    assert result["status"] == "success"
+    with Image.open(_result_path(result)) as image:
+        image.load()
+        assert image.format == "PNG"
