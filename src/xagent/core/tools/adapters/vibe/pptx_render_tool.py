@@ -54,8 +54,8 @@ Behavior and limits:
       with a clear error instead of returning images.
     - Every returned PNG is registered as a durable workspace file. Each page
       entry carries the 1-based page_number, a file_ref and an inline image
-      artifact. Layout is preserved, but fonts and animations may render
-      slightly differently from the original editor.
+      artifact. Rendered pages keep the slide layout; exact fonts and
+      animations may differ from the original editor.
 """.strip()
 
 

@@ -24,6 +24,7 @@ import asyncio
 import logging
 import math
 import shutil
+import struct
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -40,6 +41,7 @@ from .pptx_conversion import (
     PptxConversionTimeoutError,
     PptxConverterUnavailableError,
     convert_pptx_to_pdf,
+    create_owned_directory,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,12 +102,27 @@ class PptxRenderRasterError(PptxRenderError):
     error_code = "raster_failed"
 
 
+class PptxRenderOutputError(PptxRenderError):
+    error_code = "output_unavailable"
+
+
 class PptxRenderRegistrationError(PptxRenderError):
     error_code = "registration_failed"
 
-    def __init__(self, message: str, *, registered_pages: tuple[int, ...] = ()):
+    def __init__(
+        self,
+        message: str,
+        *,
+        registered_pages: tuple[int, ...] = (),
+        registered_file_ids: dict[int, str] | None = None,
+        unverified_pages: tuple[int, ...] = (),
+        unregistered_pages: tuple[int, ...] = (),
+    ):
         super().__init__(message)
         self.registered_pages = registered_pages
+        self.registered_file_ids = registered_file_ids or {}
+        self.unverified_pages = unverified_pages
+        self.unregistered_pages = unregistered_pages
 
 
 @dataclass(frozen=True)
@@ -249,9 +266,33 @@ def unrendered_page_ranges(
     return ranges
 
 
+def _f32(value: float) -> float:
+    """Round a Python float to the single precision MuPDF uses internally."""
+    return struct.unpack("f", struct.pack("f", float(value)))[0]
+
+
 def _pixmap_extent(length: float, scale: float) -> int:
-    """Predict the pixel extent PyMuPDF allocates for one page dimension."""
-    return max(1, math.ceil(length * scale - 1e-9))
+    """Return a conservative pixel extent for one page dimension.
+
+    MuPDF stores page geometry and matrices as 32-bit floats and rounds the
+    rendered bounding box with a small epsilon. The returned value is an upper
+    bound of what ``Page.get_pixmap`` will allocate, so a budget checked with
+    it can never be exceeded by the real raster. Exact integers keep their
+    value (an N-pixel page at scale 1 is allowed to use exactly N pixels).
+    """
+    raw = _f32(_f32(length) * _f32(scale))
+    if not math.isfinite(raw):
+        raise PptxRenderRasterError("The PDF page raster size is not finite.")
+    nearest_integer = round(raw)
+    if abs(raw - nearest_integer) <= 1e-9:
+        return max(1, int(nearest_integer))
+    fraction = raw - math.floor(raw)
+    if fraction <= 0.002:
+        # MuPDF rounds with a ~0.001 epsilon, so a value just above an
+        # integer can still round down; use the next whole pixel as the
+        # conservative upper bound instead of under-predicting.
+        return max(1, math.floor(raw) + 1)
+    return max(1, math.ceil(raw))
 
 
 def compute_page_geometry(
@@ -263,10 +304,13 @@ def compute_page_geometry(
 ) -> PageGeometry:
     """Decide the raster scale and rounded pixel size for one PDF page.
 
-    The scale is lowered until the *rounded* width x height product fits
-    ``max_pixels``; the aspect ratio is preserved because one scale is shared
-    by both dimensions. Called before the pixmap exists, so an oversized page
-    never allocates an oversized raster.
+    A bounded bisection finds the largest scale whose conservative rounded
+    width x height product fits ``max_pixels``. The search always progresses
+    (it halves the scale interval instead of nudging by a rounding-dependent
+    factor), so a page that can legally be rendered is never rejected for a
+    rounding plateau. The aspect ratio is preserved because one scale is
+    shared by both dimensions. Called before the pixmap exists, so an
+    oversized page never allocates an oversized raster.
     """
     for value in (page_width, page_height, scale):
         if not isinstance(value, (int, float)) or isinstance(value, bool):
@@ -286,21 +330,77 @@ def compute_page_geometry(
         raise PptxRenderRasterError(
             "The PDF page area is too large to compute a raster size."
         )
-    max_scale = math.sqrt(max_pixels / area)
-    effective_scale = min(float(scale), max_scale)
-    width = _pixmap_extent(float(page_width), effective_scale)
-    height = _pixmap_extent(float(page_height), effective_scale)
-    for _attempt in range(64):
-        if width * height <= max_pixels:
-            return PageGeometry(scale=effective_scale, width=width, height=height)
-        effective_scale *= math.sqrt(max_pixels / (width * height)) * (1 - 1e-9)
-        if not math.isfinite(effective_scale) or effective_scale <= 0:
+
+    def extents(candidate_scale: float) -> tuple[int, int]:
+        return (
+            _pixmap_extent(float(page_width), candidate_scale),
+            _pixmap_extent(float(page_height), candidate_scale),
+        )
+
+    def fits(candidate_scale: float) -> bool:
+        width, height = extents(candidate_scale)
+        return width * height <= max_pixels
+
+    requested_scale = float(scale)
+    if fits(requested_scale):
+        width, height = extents(requested_scale)
+        return PageGeometry(scale=requested_scale, width=width, height=height)
+    lower_scale = 0.0
+    upper_scale = requested_scale
+    for _attempt in range(80):
+        middle_scale = (lower_scale + upper_scale) / 2.0
+        if middle_scale <= 0:
             break
-        width = _pixmap_extent(float(page_width), effective_scale)
-        height = _pixmap_extent(float(page_height), effective_scale)
-    raise PptxRenderRasterError(
-        "Could not reduce the page raster below the pixel budget."
-    )
+        if fits(middle_scale):
+            lower_scale = middle_scale
+        else:
+            upper_scale = middle_scale
+    width, height = extents(lower_scale)
+    if lower_scale <= 0 or width * height > max_pixels:
+        raise PptxRenderRasterError(
+            "Could not reduce the page raster below the pixel budget."
+        )
+    return PageGeometry(scale=lower_scale, width=width, height=height)
+
+
+def _mupdf_pixel_extents(page: Any, scale: float) -> tuple[int, int]:
+    """Return the exact pixel extents MuPDF will use for one page and scale."""
+    if fitz is None:  # pragma: no cover - guarded by _open_pdf
+        raise PptxRenderRasterError("PyMuPDF is not available.")
+    rectangle = (page.rect * fitz.Matrix(scale, scale)).irect
+    return max(1, int(rectangle.width)), max(1, int(rectangle.height))
+
+
+def _fit_scale_to_page(page: Any, requested_scale: float, max_pixels: int) -> float:
+    """Find the largest scale whose MuPDF-rounded raster fits the budget.
+
+    ``compute_page_geometry`` only predicts the extent from the page
+    rectangle; this check uses MuPDF's own rounding on the real page and is
+    still run before any pixmap is allocated. A bisection guarantees progress
+    even when the rounding keeps the extent on a plateau.
+    """
+
+    def fits(candidate_scale: float) -> bool:
+        width, height = _mupdf_pixel_extents(page, candidate_scale)
+        return width * height <= max_pixels
+
+    if fits(requested_scale):
+        return requested_scale
+    lower_scale = 0.0
+    upper_scale = float(requested_scale)
+    for _attempt in range(80):
+        middle_scale = (lower_scale + upper_scale) / 2.0
+        if middle_scale <= 0:
+            break
+        if fits(middle_scale):
+            lower_scale = middle_scale
+        else:
+            upper_scale = middle_scale
+    if lower_scale <= 0 or not fits(lower_scale):
+        raise PptxRenderRasterError(
+            "Could not reduce the page raster below the pixel budget."
+        )
+    return lower_scale
 
 
 def _open_pdf(pdf_path: Path) -> Any:
@@ -358,7 +458,8 @@ def render_pdf_pages_to_pngs(
             )
             if fitz is None:  # pragma: no cover - guarded by _open_pdf
                 raise PptxRenderRasterError("PyMuPDF is not available.")
-            matrix = fitz.Matrix(geometry.scale, geometry.scale)
+            effective_scale = _fit_scale_to_page(page, geometry.scale, max_pixels)
+            matrix = fitz.Matrix(effective_scale, effective_scale)
             pixmap = page.get_pixmap(matrix=matrix, alpha=False)
             if int(pixmap.width) * int(pixmap.height) > max_pixels:
                 raise PptxRenderRasterError(
@@ -438,24 +539,85 @@ def _resolve_pptx_input(workspace: TaskWorkspace, raw_selector: str) -> Path:
     return path
 
 
-def _persisted_page_ids(
+@dataclass(frozen=True)
+class _RegistrationState:
+    """Result of looking up the durable file records for rendered PNGs.
+
+    A page is only reported as unregistered when a working metadata lookup
+    definitively found no record. Lookup errors are "unverified" and must
+    never authorize deleting the local image.
+    """
+
+    registered: dict[int, str]
+    unregistered: set[int]
+    unverified: set[int]
+
+
+def _lookup_persisted_file_id(path: Path) -> str | None:
+    """Return the persisted file id for one local path, or raise on failure.
+
+    ``TaskWorkspace.get_registered_file_id`` intentionally swallows database
+    faults and reports them as "no record"; that is indistinguishable from a
+    really missing record. This lookup keeps the metadata fault visible so the
+    render cleanup can distinguish unregistered from unverifiable.
+    """
+    from ....web.models.uploaded_file import UploadedFile
+    from ...storage.manager import create_db_session
+
+    database = create_db_session()
+    try:
+        record = (
+            database.query(UploadedFile)
+            .filter(UploadedFile.storage_path == str(Path(path).resolve()))
+            .first()
+        )
+        if record is None:
+            return None
+        return str(record.file_id)
+    finally:
+        database.close()
+
+
+def _verify_registrations(
     workspace: TaskWorkspace, rendered: list[RenderedPage]
-) -> dict[int, str]:
-    """Return the page numbers whose PNG path has a persisted file record."""
-    persisted: dict[int, str] = {}
+) -> _RegistrationState:
+    """Classify every rendered PNG as registered, unregistered or unverified.
+
+    The workspace API answers the normal case. Because it reports metadata
+    faults as "no record", a miss is re-checked with an exception-preserving
+    lookup: only a working lookup that still finds nothing downgrades the page
+    to unregistered, while a fault keeps it unverified.
+    """
+    registered: dict[int, str] = {}
+    unregistered: set[int] = set()
+    unverified: set[int] = set()
     for page in rendered:
         try:
-            file_id = workspace.get_registered_file_id(str(page.path))
-        except Exception:  # pragma: no cover - defensive: unreadable metadata
+            known_file_id = workspace.get_registered_file_id(str(page.path))
+        except Exception:  # noqa: BLE001 - explicit tri-state classification
+            known_file_id = None
+        if known_file_id:
+            registered[page.page_number] = str(known_file_id)
+            continue
+        try:
+            file_id = _lookup_persisted_file_id(page.path)
+        except Exception:  # noqa: BLE001 - explicit tri-state classification
             logger.warning(
                 "Could not verify registration of rendered slide %s",
                 page.path,
                 exc_info=True,
             )
-            file_id = None
+            unverified.add(page.page_number)
+            continue
         if file_id:
-            persisted[page.page_number] = str(file_id)
-    return persisted
+            registered[page.page_number] = file_id
+        else:
+            unregistered.add(page.page_number)
+    return _RegistrationState(
+        registered=registered,
+        unregistered=unregistered,
+        unverified=unverified,
+    )
 
 
 def _register_rendered_pages(
@@ -466,46 +628,75 @@ def _register_rendered_pages(
     try:
         registered_ids = workspace.register_files([(path, None) for path in paths])
     except Exception as exc:
-        persisted = _persisted_page_ids(workspace, rendered)
+        state = _verify_registrations(workspace, rendered)
         raise PptxRenderRegistrationError(
             f"Rendered slide images could not be registered durably: {exc}",
-            registered_pages=tuple(sorted(persisted)),
+            registered_pages=tuple(sorted(state.registered)),
+            registered_file_ids=dict(state.registered),
+            unverified_pages=tuple(sorted(state.unverified)),
+            unregistered_pages=tuple(sorted(state.unregistered)),
         ) from exc
     if len(registered_ids) != len(rendered):
-        persisted = _persisted_page_ids(workspace, rendered)
+        state = _verify_registrations(workspace, rendered)
         raise PptxRenderRegistrationError(
             f"Only {len(registered_ids)} of {len(rendered)} rendered slide "
             "images received a file id.",
-            registered_pages=tuple(sorted(persisted)),
+            registered_pages=tuple(sorted(state.registered)),
+            registered_file_ids=dict(state.registered),
+            unverified_pages=tuple(sorted(state.unverified)),
+            unregistered_pages=tuple(sorted(state.unregistered)),
         )
-    persisted = _persisted_page_ids(workspace, rendered)
-    missing = [
-        page.page_number for page in rendered if page.page_number not in persisted
-    ]
-    if missing:
+    state = _verify_registrations(workspace, rendered)
+    returned_ids = {
+        page.page_number: str(file_id)
+        for page, file_id in zip(rendered, registered_ids)
+    }
+    # A successful registration call already handed back these ids; a page
+    # whose lookup failed is unverified, not unregistered. Keep its returned
+    # id as a known registration candidate and never delete its image.
+    known_registered = dict(state.registered)
+    for page_number in state.unverified:
+        known_registered.setdefault(page_number, returned_ids[page_number])
+    if state.unregistered:
         raise PptxRenderRegistrationError(
             "Rendered slide images were not persisted as durable files for "
-            f"page(s) {', '.join(str(number) for number in missing)}; their "
-            "file ids would not be reusable in a later turn.",
-            registered_pages=tuple(sorted(persisted)),
+            f"page(s) {', '.join(str(number) for number in sorted(state.unregistered))}; "
+            "their file ids would not be reusable in a later turn.",
+            registered_pages=tuple(sorted(known_registered)),
+            registered_file_ids=dict(known_registered),
+            unverified_pages=tuple(sorted(state.unverified)),
+            unregistered_pages=tuple(sorted(state.unregistered)),
+        )
+    if state.unverified:
+        raise PptxRenderRegistrationError(
+            "Registration could not be verified for page(s) "
+            f"{', '.join(str(number) for number in sorted(state.unverified))}; "
+            "the images were kept because their registration may have "
+            "committed, but this call cannot claim delivery.",
+            registered_pages=tuple(sorted(known_registered)),
+            registered_file_ids=dict(known_registered),
+            unverified_pages=tuple(sorted(state.unverified)),
+            unregistered_pages=(),
         )
     for page, file_id in zip(rendered, registered_ids):
-        if persisted.get(page.page_number) != str(file_id):
+        if state.registered.get(page.page_number) != str(file_id):
             raise PptxRenderRegistrationError(
                 f"The persisted file id for page {page.page_number} does not "
                 "match the id returned by registration.",
-                registered_pages=tuple(sorted(persisted)),
+                registered_pages=tuple(sorted(state.registered)),
+                registered_file_ids=dict(state.registered),
+                unverified_pages=(),
+                unregistered_pages=(),
             )
-    return persisted
+    return state.registered
 
 
 def _delete_unregistered_outputs(
-    rendered: list[RenderedPage], persisted_pages: set[int]
+    rendered: list[RenderedPage], unregistered_pages: set[int]
 ) -> None:
-    """Remove this call's PNGs that were not durably registered."""
-    directories = {page.path.parent for page in rendered}
+    """Remove this call's PNGs that are definitively not registered."""
     for page in rendered:
-        if page.page_number in persisted_pages:
+        if page.page_number not in unregistered_pages:
             continue
         try:
             page.path.unlink()
@@ -517,12 +708,74 @@ def _delete_unregistered_outputs(
                 page.path,
                 exc_info=True,
             )
-    for directory in directories:
+
+
+def _create_output_directory(output_root: Path) -> Path:
+    """Exclusively create this call's unique PNG directory under ``output_root``.
+
+    ``mkdir`` without ``exist_ok`` makes ownership unambiguous: the directory
+    either did not exist before this call or creation fails. A pre-existing
+    directory is never adopted or deleted.
+    """
+    for _attempt in range(8):
+        candidate = output_root / (f"{RENDER_OUTPUT_DIR_PREFIX}{uuid.uuid4().hex[:12]}")
         try:
-            directory.rmdir()
-        except OSError:
-            # A registered PNG from this call still lives here.
-            pass
+            candidate.mkdir()
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise PptxRenderOutputError(
+                f"Could not create the slide image directory: {exc}"
+            ) from exc
+        return candidate
+    raise PptxRenderOutputError(
+        "Could not create a fresh slide image directory under the workspace "
+        "output directory."
+    )
+
+
+async def _create_render_output_directory(workspace: TaskWorkspace) -> Path:
+    """Resolve and create a trusted per-call output directory inside output/.
+
+    The workspace output root must resolve inside the workspace directory (a
+    symlinked output root that escapes it is refused), and the created
+    directory is verified to be a direct child of that resolved root before any
+    image is written.
+    """
+    workspace_root = Path(workspace.workspace_dir).resolve()
+    output_root = Path(workspace.output_dir)
+    try:
+        resolved_output_root = await asyncio.to_thread(output_root.resolve, True)
+    except OSError as exc:
+        raise PptxRenderOutputError(
+            f"The workspace output directory is not available: {exc}"
+        ) from exc
+    if not resolved_output_root.is_relative_to(workspace_root):
+        raise PptxRenderOutputError(
+            "The workspace output directory resolves outside the workspace; "
+            "refusing to write slide images there."
+        )
+    if not resolved_output_root.is_dir():
+        raise PptxRenderOutputError(
+            "The workspace output directory is not a directory."
+        )
+    created = await create_owned_directory(
+        lambda: _create_output_directory(resolved_output_root)
+    )
+    try:
+        resolved_created = await asyncio.to_thread(created.resolve, True)
+    except OSError as exc:
+        await asyncio.to_thread(shutil.rmtree, created, True)
+        raise PptxRenderOutputError(
+            f"Could not verify the created slide image directory: {exc}"
+        ) from exc
+    if resolved_created.parent != resolved_output_root:
+        await asyncio.to_thread(shutil.rmtree, created, True)
+        raise PptxRenderOutputError(
+            "The created slide image directory is not directly inside the "
+            "workspace output directory."
+        )
+    return resolved_created
 
 
 def _remove_tree(path: Path | None) -> None:
@@ -574,6 +827,85 @@ def _selection_payload(selection: PageSelection) -> dict[str, Any]:
     }
 
 
+async def _cleanup_failed_render(
+    workspace: TaskWorkspace,
+    output_dir: Path,
+    rendered: list[RenderedPage],
+    registration_state: _RegistrationState | None,
+) -> None:
+    """Remove only this call's unregistered images after a failed render.
+
+    Registered pages and pages whose registration could not be verified are
+    kept: a metadata outage is not evidence that the image is unowned. When no
+    page needs keeping, the call-owned output directory itself is removed.
+    """
+    if not rendered:
+        try:
+            await asyncio.to_thread(_remove_tree, output_dir)
+        except BaseException:  # pragma: no cover - never mask the outcome
+            logger.warning(
+                "Could not remove the empty render output directory",
+                exc_info=True,
+            )
+        return
+    state = registration_state
+    if state is None:
+        try:
+            state = await _run_blocking(
+                lambda: _verify_registrations(workspace, rendered)
+            )
+        except BaseException:  # pragma: no cover - keep files if unclassifiable
+            logger.warning(
+                "Could not classify rendered slide registrations during "
+                "cleanup; keeping the images",
+                exc_info=True,
+            )
+            return
+    try:
+        await asyncio.to_thread(
+            _delete_unregistered_outputs, rendered, set(state.unregistered)
+        )
+    except BaseException:  # pragma: no cover - never mask the outcome
+        logger.warning("Could not clean up unregistered rendered slides", exc_info=True)
+    kept_pages = len(rendered) - len(state.unregistered)
+    if kept_pages == 0:
+        try:
+            await asyncio.to_thread(_remove_tree, output_dir)
+        except BaseException:  # pragma: no cover - never mask the outcome
+            logger.warning(
+                "Could not remove the empty render output directory",
+                exc_info=True,
+            )
+
+
+def _build_pages_payload(
+    workspace: TaskWorkspace,
+    rendered: list[RenderedPage],
+    persisted: dict[int, str],
+) -> list[dict[str, Any]]:
+    """Build FileRefs and inline artifacts; runs in a worker thread."""
+    pages: list[dict[str, Any]] = []
+    for page in rendered:
+        file_id = persisted[page.page_number]
+        file_ref = build_workspace_file_ref(
+            workspace=workspace,
+            file_path=page.path,
+            file_id=file_id,
+            mime_type=PNG_MIME_TYPE,
+        )
+        pages.append(
+            {
+                "page_number": page.page_number,
+                "width": page.width,
+                "height": page.height,
+                "file_id": file_id,
+                "file_ref": file_ref,
+                "artifacts": [build_inline_artifact(file_ref)],
+            }
+        )
+    return pages
+
+
 async def render_pptx_to_images(
     pptx_path: Any,
     workspace: Any,
@@ -619,25 +951,34 @@ async def render_pptx_to_images(
 
     temp_root: Path | None = None
     output_dir: Path | None = None
+    output_owned = False
     rendered: list[RenderedPage] = []
     persisted: dict[int, str] = {}
+    registration_state: _RegistrationState | None = None
     succeeded = False
     try:
         try:
-            temp_root = Path(
-                await asyncio.to_thread(tempfile.mkdtemp, prefix="xagent-pptx-render-")
+            temp_root = await create_owned_directory(
+                lambda: Path(tempfile.mkdtemp(prefix="xagent-pptx-render-"))
             )
             pdf_dir = temp_root / "pdf"
             await asyncio.to_thread(pdf_dir.mkdir)
-            output_dir = Path(workspace.output_dir) / (
-                f"{RENDER_OUTPUT_DIR_PREFIX}{uuid.uuid4().hex[:12]}"
-            )
-            await asyncio.to_thread(output_dir.mkdir)
         except OSError as exc:
             return _error(
                 "raster_failed",
                 f"Could not create a temporary render directory: {exc}",
             )
+
+        try:
+            output_dir = await _create_render_output_directory(workspace)
+        except PptxRenderError as exc:
+            return _error(exc.error_code, str(exc))
+        except OSError as exc:  # pragma: no cover - defensive fallback
+            return _error(
+                "output_unavailable",
+                f"Could not create the slide image directory: {exc}",
+            )
+        output_owned = True
 
         try:
             pdf_path = await convert_pptx_to_pdf(
@@ -679,31 +1020,40 @@ async def render_pptx_to_images(
                 lambda: _register_rendered_pages(workspace, rendered)
             )
         except PptxRenderRegistrationError as exc:
+            registration_state = _RegistrationState(
+                registered=dict(exc.registered_file_ids),
+                unregistered=set(exc.unregistered_pages),
+                unverified=set(exc.unverified_pages),
+            )
             return _error(
                 "registration_failed",
                 str(exc),
                 registered_pages=list(exc.registered_pages),
+                unverified_pages=list(exc.unverified_pages),
+                unregistered_pages=list(exc.unregistered_pages),
                 rendered_pages=len(rendered),
             )
 
-        pages_payload: list[dict[str, Any]] = []
-        for page in rendered:
-            file_id = persisted[page.page_number]
-            file_ref = build_workspace_file_ref(
-                workspace=workspace,
-                file_path=page.path,
-                file_id=file_id,
-                mime_type=PNG_MIME_TYPE,
+        try:
+            pages_payload = await _run_blocking(
+                lambda: _build_pages_payload(workspace, rendered, persisted)
             )
-            pages_payload.append(
-                {
-                    "page_number": page.page_number,
-                    "width": page.width,
-                    "height": page.height,
-                    "file_id": file_id,
-                    "file_ref": file_ref,
-                    "artifacts": [build_inline_artifact(file_ref)],
-                }
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            logger.warning(
+                "Could not build FileRefs for rendered slides", exc_info=True
+            )
+            registration_state = _RegistrationState(
+                registered=dict(persisted),
+                unregistered=set(),
+                unverified=set(),
+            )
+            return _error(
+                "registration_failed",
+                f"Could not build FileRefs for the rendered slides: {exc}",
+                registered_pages=sorted(persisted),
+                unverified_pages=[],
+                unregistered_pages=[],
+                rendered_pages=len(rendered),
             )
         succeeded = True
         return {
@@ -721,28 +1071,13 @@ async def render_pptx_to_images(
             await asyncio.to_thread(_remove_tree, temp_root)
         except BaseException:  # pragma: no cover - never mask the outcome
             logger.warning("Could not remove the render temp directory", exc_info=True)
-        if not succeeded and rendered:
+        if not succeeded and output_owned and output_dir is not None:
             try:
-                persisted_pages = set(persisted)
-                if not persisted_pages:
-                    persisted_pages = set(
-                        await _run_blocking(
-                            lambda: _persisted_page_ids(workspace, rendered)
-                        )
-                    )
-                await asyncio.to_thread(
-                    _delete_unregistered_outputs, rendered, persisted_pages
+                await _cleanup_failed_render(
+                    workspace, output_dir, rendered, registration_state
                 )
             except BaseException:  # pragma: no cover - never mask the outcome
                 logger.warning(
-                    "Could not clean up unregistered rendered slides",
-                    exc_info=True,
-                )
-        elif not succeeded and output_dir is not None:
-            try:
-                await asyncio.to_thread(_remove_tree, output_dir)
-            except BaseException:  # pragma: no cover
-                logger.warning(
-                    "Could not remove the empty render output directory",
+                    "Could not clean up the failed render output",
                     exc_info=True,
                 )
