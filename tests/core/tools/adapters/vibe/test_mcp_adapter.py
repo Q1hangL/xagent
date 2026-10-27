@@ -7262,7 +7262,9 @@ async def test_google_slides_thumbnail_registration_updates_every_exposed_copy(
     if envelope == "structured_json":
         structured_payload = json.loads(result["structured_content"]["result"])
         assert structured_payload["file_ref"] == file_ref
-    elif envelope in ("structured_dict", "direct_dict"):
+    elif envelope == "structured_dict":
+        assert result["structured_content"]["result"]["file_ref"] == file_ref
+    elif envelope == "direct_dict":
         assert result["structured_content"]["file_ref"] == file_ref
 
 
@@ -7338,9 +7340,6 @@ async def test_google_slides_thumbnail_download_registers_a_durable_file_ref(
             "xagent.core.storage.manager.create_db_session", session_factory
         )
         monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-        monkeypatch.setattr(
-            "xagent.web.models.database.get_session_local", lambda: session_factory
-        )
         get_unscoped_file_storage.cache_clear()
 
         workspace = TaskWorkspace(
@@ -7395,6 +7394,9 @@ async def test_google_slides_thumbnail_download_registers_a_durable_file_ref(
         assert record.storage_status == "available"
         assert record.storage_key
         assert record.file_size == downloaded.stat().st_size
+        # Release the pool's only connection before the second workspace
+        # instance opens its own session on the same engine.
+        db.commit()
 
         other_workspace = TaskWorkspace(
             id="web_task_7314", base_dir=str(tmp_path / "workspaces")
