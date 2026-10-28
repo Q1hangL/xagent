@@ -73,11 +73,31 @@ def _outdir_from_arguments(arguments) -> pathlib.Path:
     return pathlib.Path(arguments[arguments.index("--outdir") + 1])
 
 
+_simulated_processes = {}
+
+
+@pytest.fixture(autouse=True)
+def simulated_process_groups(monkeypatch):
+    kill_group = os.killpg
+
+    def kill(group, signal):
+        if group in _simulated_processes:
+            _simulated_processes[group].kill()
+        else:
+            kill_group(group, signal)
+
+    monkeypatch.setattr(os, "killpg", kill)
+    yield
+    _simulated_processes.clear()
+
+
 class _FakeProcess:
     def __init__(self, *, returncode: int = 0, stderr: bytes = b"", write_pdf=None):
         self.returncode = returncode
         self._stderr = stderr
         self._write_pdf = write_pdf
+        self.pid = id(self)
+        _simulated_processes[self.pid] = self
         self.killed = 0
         self.waits = 0
 

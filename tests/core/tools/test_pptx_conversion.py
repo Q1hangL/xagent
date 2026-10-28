@@ -7,6 +7,9 @@ than any caller's caching behavior.
 """
 
 import asyncio
+import json
+import signal
+import time
 import os
 import pathlib
 import subprocess
@@ -35,6 +38,24 @@ def _profile_dir_from_arguments(arguments: list[str]) -> pathlib.Path:
     raise AssertionError(f"no -env:UserInstallation argument in {arguments!r}")
 
 
+_simulated_processes = {}
+
+
+@pytest.fixture(autouse=True)
+def simulated_process_groups(monkeypatch):
+    kill_group = os.killpg
+
+    def kill(group, signal):
+        if group in _simulated_processes:
+            _simulated_processes[group].kill()
+        else:
+            kill_group(group, signal)
+
+    monkeypatch.setattr(os, "killpg", kill)
+    yield
+    _simulated_processes.clear()
+
+
 class _RecordingProcess:
     """Fake asyncio subprocess that records kill/wait/communicate usage."""
 
@@ -42,6 +63,8 @@ class _RecordingProcess:
         self.returncode: int | None = None
         self.final_returncode = returncode
         self.stderr = stderr
+        self.pid = id(self)
+        _simulated_processes[self.pid] = self
         self.killed = 0
         self.wait_calls = 0
         self.communicate_calls = 0
@@ -528,6 +551,9 @@ def _assert_no_pending_task_warnings(completed: subprocess.CompletedProcess) -> 
 
 _PROFILE_CREATION_CHILD = r"""
 import asyncio
+import json
+import signal
+import time
 import os
 import tempfile
 import threading
@@ -631,3 +657,104 @@ async def test_cancelled_handoff_removes_directory_off_event_loop(
     assert await asyncio.to_thread(removed.wait, 5)
     assert not path.exists()
     assert observed and all(thread != loop_thread for thread in observed)
+
+
+_FAKE_CONVERTER_SCRIPT = r"""
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+
+source = pathlib.Path(sys.argv[-1])
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+source.with_suffix(".pids").write_text(json.dumps([os.getpid(), child.pid]))
+if source.stem == "normal":
+    output = pathlib.Path(sys.argv[sys.argv.index("--outdir") + 1])
+    (output / (source.stem + ".pdf")).write_bytes(b"%PDF synthetic")
+else:
+    time.sleep(60)
+"""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["timeout", "cancel", "exception", "normal"])
+async def test_converter_group_teardown_is_bounded_with_inherited_pipes(
+    tmp_path, monkeypatch, mode
+):
+    conversion = _load_conversion_module()
+    source = tmp_path / (mode + ".pptx")
+    source.write_bytes(b"synthetic presentation")
+    binary = tmp_path / "local-converter"
+    binary.write_text("#!" + sys.executable + "\n" + _FAKE_CONVERTER_SCRIPT)
+    binary.chmod(0o700)
+    output = tmp_path / "pdf"
+    output.mkdir()
+    profile_paths = []
+    create_process = asyncio.create_subprocess_exec
+
+    async def spawn(*arguments, **kwargs):
+        profile_paths.append(_profile_dir_from_arguments(arguments))
+        process = await create_process(*arguments, **kwargs)
+        if mode == "exception":
+
+            async def broken_pipe():
+                while not source.with_suffix(".pids").exists():
+                    await asyncio.sleep(0.01)
+                raise RuntimeError("synthetic pipe reader error")
+
+            process.communicate = broken_pipe
+        return process
+
+    monkeypatch.setattr(conversion.asyncio, "create_subprocess_exec", spawn)
+    task = asyncio.create_task(
+        conversion.convert_pptx_to_pdf(
+            source,
+            output,
+            soffice_binary=str(binary),
+            timeout_seconds=0.8 if mode == "timeout" else 30,
+        )
+    )
+    pids = []
+    try:
+        deadline = time.monotonic() + 5
+        while not source.with_suffix(".pids").exists() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert source.with_suffix(".pids").exists(), "converter did not start"
+        pids = json.loads(source.with_suffix(".pids").read_text())
+        started = time.monotonic()
+        if mode == "cancel":
+            task.cancel()
+        done, pending = await asyncio.wait({task}, timeout=3)
+        assert not pending, "conversion teardown exceeded three seconds"
+        assert time.monotonic() - started < 3
+        if mode == "normal":
+            assert task.result() == output / "normal.pdf"
+        else:
+            expected = {
+                "timeout": conversion.PptxConversionTimeoutError,
+                "cancel": asyncio.CancelledError,
+                "exception": RuntimeError,
+            }[mode]
+            with pytest.raises(expected):
+                task.result()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pids[1], 0)
+            except ProcessLookupError:
+                break
+            await asyncio.sleep(0.01)
+        with pytest.raises(ProcessLookupError):
+            os.kill(pids[1], 0)
+        assert profile_paths and all(not path.exists() for path in profile_paths)
+    finally:
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
