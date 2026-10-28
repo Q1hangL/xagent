@@ -522,3 +522,73 @@ def test_hidden_slide_export_is_an_explicit_impress_filter_option(tmp_path):
     assert json.loads(options) == {
         "ExportHiddenSlides": {"type": "boolean", "value": "true"}
     }
+
+
+@pytest.mark.asyncio
+async def test_success_uses_file_stderr_without_killing_group(tmp_path, monkeypatch):
+    conversion = _load_conversion_module()
+    source = tmp_path / "deck.pptx"
+    source.write_bytes(b"presentation")
+    (tmp_path / "deck.pdf").write_bytes(b"%PDF-1.4")
+    process = _RecordingProcess()
+    async def wait():
+        process.returncode = 0
+        return 0
+    process.wait = wait
+    calls = _install_process_factory(monkeypatch, conversion, lambda _: process)
+    await conversion.convert_pptx_to_pdf(source, tmp_path)
+    assert calls[0]["kwargs"]["stdout"] == asyncio.subprocess.DEVNULL
+    stderr = calls[0]["kwargs"]["stderr"]
+    assert hasattr(stderr, "fileno")
+    assert pathlib.Path(stderr.name).parent.name.startswith("xagent-pptx-profile-")
+    assert process.killed == 0
+
+
+@pytest.mark.asyncio
+async def test_permission_denied_during_group_cleanup_preserves_timeout(
+    tmp_path, monkeypatch
+):
+    conversion = _load_conversion_module()
+    process = _HangingProcess()
+    async def wait():
+        await asyncio.sleep(5)
+        return 0
+    process.wait = wait
+    _install_process_factory(monkeypatch, conversion, lambda _: process)
+    def denied(*args):
+        raise PermissionError("group cannot be signalled")
+    monkeypatch.setattr(os, "killpg", denied)
+    with pytest.raises(conversion.PptxConversionTimeoutError):
+        await conversion.convert_pptx_to_pdf(tmp_path / "deck.pptx", tmp_path, timeout_seconds=0.01)
+
+
+@pytest.mark.asyncio
+async def test_normal_leader_exit_does_not_wait_for_descendant(tmp_path, monkeypatch):
+    conversion = _load_conversion_module()
+    source = tmp_path / "deck.pptx"
+    source.write_bytes(b"presentation")
+    ready_path = tmp_path / "child.pid"
+    binary = tmp_path / "soffice"
+    binary.write_text("#!" + sys.executable + "\n" +
+        "import pathlib, subprocess, sys\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        f"pathlib.Path({str(ready_path)!r}).write_text(str(child.pid))\n"
+        f"pathlib.Path({str(tmp_path / 'deck.pdf')!r}).write_bytes(b'%PDF-1.4')\n")
+    binary.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setattr(conversion.tempfile, "tempdir", str(tmp_path))
+    child_pid = None
+    try:
+        result = await asyncio.wait_for(conversion.convert_pptx_to_pdf(source, tmp_path), 3)
+        child_pid = int(ready_path.read_text())
+        assert result == tmp_path / "deck.pdf"
+        assert not list(tmp_path.glob("xagent-pptx-profile-*"))
+        os.kill(child_pid, 0)
+    finally:
+        if child_pid is None and ready_path.exists():
+            child_pid = int(ready_path.read_text())
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass

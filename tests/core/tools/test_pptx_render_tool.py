@@ -13,6 +13,8 @@ import hashlib
 import math
 import pathlib
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 from types import SimpleNamespace
@@ -989,6 +991,8 @@ async def test_render_keeps_already_registered_pngs_when_registration_fails_part
     assert remaining == ["slide_001.png", "slide_002.png", "slide_003.png"]
     rows = _output_rows(durable_workspace.session_factory)
     assert [row.filename for row in rows] == ["slide_001.png"]
+    assert result["registered_pages"] == {1: rows[0].file_id}
+    assert result["output_dir"] == str(output_dirs[0])
 
 
 @pytest.mark.asyncio
@@ -1501,3 +1505,136 @@ def test_page_range_rejects_invalid_bounds(start, end):
     render = _load_render_module()
     with pytest.raises(render.PptxRenderArgumentError):
         render.resolve_page_selection(5, start, end)
+
+
+def test_cold_import_without_optional_renderer_keeps_tool_registry():
+    code = """
+import asyncio
+import sys
+sys.modules["fitz"] = None
+from xagent.core.tools.adapters.vibe.factory import ToolRegistry
+ToolRegistry._import_tool_modules()
+assert ToolRegistry._modules_imported
+modules = {creator.__module__.rsplit(".", 1)[-1] for creator, _, _ in ToolRegistry._tool_creators}
+assert {"pptx_render_tool", "pptx_tool", "vision_tool", "workspace_file_tool"} <= modules
+from xagent.core.tools.core.pptx_render import render_pptx_to_images
+result = asyncio.run(render_pptx_to_images("deck.pptx", None))
+assert result["error_code"] == "dependency_unavailable", result
+assert "PyMuPDF" in result["error"]
+"""
+    completed = subprocess.run(
+        [sys.executable, "-B", "-c", code], capture_output=True, text=True, timeout=30
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_start_only_range_is_capped_and_reports_truncation():
+    render = _load_render_module()
+    selection = render.resolve_page_selection(80, 21)
+    assert selection.page_numbers == tuple(range(21, 41))
+    assert selection.truncated is True
+    assert render.resolve_page_selection(24, 21).page_numbers == (21, 22, 23, 24)
+    assert render.resolve_page_selection(24, 21).truncated is False
+
+
+@pytest.mark.asyncio
+async def test_oversized_input_has_a_distinct_error(durable_workspace, monkeypatch):
+    render = _load_render_module()
+    source = _write_deck(durable_workspace.workspace.input_dir)
+    monkeypatch.setattr(render, "get_max_upload_size_bytes", lambda: 1)
+    result = await render.render_pptx_to_images(str(source), durable_workspace.workspace)
+    assert result["error_code"] == "input_too_large", result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registered", [False, True])
+async def test_render_cache_reuses_content_and_uses_existing_cleanup(
+    durable_workspace, monkeypatch, registered
+):
+    from xagent.web.api.files import _pptx_pdf_cache_path
+    from xagent.web.services.uploaded_file_store import (
+        delete_legacy_preview_caches, delete_pptx_pdf_cache,
+    )
+    from xagent.web.services.uploaded_file_cleanup_resources import capture_previews
+
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    source = _write_deck(workspace.input_dir)
+    file_id = _register_input_deck(workspace, source) if registered else None
+    calls = []
+    _install_conversion(monkeypatch, render, calls=calls, timeout_records=[])
+    _install_rasterizer(monkeypatch, render, page_count=3, requested=[], rendered=[])
+    preview = _pptx_pdf_cache_path(source, file_id)
+    preview.write_bytes(b"default preview excludes hidden slides")
+    for number in (2, 3):
+        result = await render.render_pptx_to_images(
+            str(source), workspace, start_page=number, end_page=number
+        )
+        assert result["success"], result
+    assert len(calls) == 1
+    cached = list(preview.parent.glob("*.hidden.preview.pdf"))
+    assert len(cached) == 1
+    assert preview.read_bytes() == b"default preview excludes hidden slides"
+    source.write_bytes(source.read_bytes() + b" changed")
+    result = await render.render_pptx_to_images(str(source), workspace, end_page=1)
+    assert result["success"], result
+    assert len(calls) == 2
+    cached = list(preview.parent.glob("*.hidden.preview.pdf"))
+    assert len(cached) == 2
+    if registered:
+        captured = capture_previews({
+            "roots": ["", "", str(durable_workspace.storage_root)],
+            "file_id": file_id, "generation": "render-cache-test",
+        })
+        assert len(captured) == 3
+        delete_pptx_pdf_cache(file_id)
+    else:
+        delete_legacy_preview_caches(source.resolve())
+    assert not preview.exists()
+    assert all(not path.exists() for path in cached)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page_count", [1, 3])
+async def test_cancelled_raster_stops_before_registration(
+    durable_workspace, monkeypatch, page_count
+):
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    source = _write_deck(workspace.input_dir)
+    _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
+    events = []
+    fake = _FakeFitz([(72, 54)] * page_count, events)
+    monkeypatch.setattr(render, "fitz", fake)
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    finished = asyncio.Event()
+    release = threading.Event()
+    pixmap = fake.pages[0].get_pixmap
+    worker = render._render_and_register
+
+    def blocked(**kwargs):
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(5)
+        return pixmap(**kwargs)
+
+    def observed(*args, **kwargs):
+        try:
+            return worker(*args, **kwargs)
+        finally:
+            loop.call_soon_threadsafe(finished.set)
+
+    fake.pages[0].get_pixmap = blocked
+    monkeypatch.setattr(render, "_render_and_register", observed)
+    task = asyncio.create_task(render.render_pptx_to_images(str(source), workspace))
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+    finally:
+        release.set()
+    await asyncio.wait_for(finished.wait(), 5)
+    assert _output_rows(durable_workspace.session_factory) == []
+    assert list(workspace.output_dir.iterdir()) == []
+    assert len(events) == 1
