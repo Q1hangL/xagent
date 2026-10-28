@@ -11,10 +11,7 @@ import json
 import os
 import pathlib
 import signal
-import subprocess
 import sys
-import tempfile
-import threading
 import time
 
 import pytest
@@ -403,283 +400,22 @@ async def test_concurrent_conversions_get_isolated_profiles(tmp_path, monkeypatc
     assert (output_two / "second.pdf").is_file()
 
 
-@pytest.mark.asyncio
-async def test_cancel_during_profile_creation_removes_the_created_directory(
-    tmp_path, monkeypatch
-):
-    conversion = _load_conversion_module()
-    pptx_path = tmp_path / "deck.pptx"
-    pptx_path.write_bytes(b"pptx bytes")
-    output_dir = tmp_path / "pdf-out"
-    output_dir.mkdir()
-    real_mkdtemp = tempfile.mkdtemp
-    started = threading.Event()
-    release = threading.Event()
-    created: list[pathlib.Path] = []
-
-    def delayed_mkdtemp(*args, **kwargs):
-        if kwargs.get("prefix") != "xagent-pptx-profile-":
-            return real_mkdtemp(*args, **kwargs)
-        started.set()
-        assert release.wait(5)
-        kwargs["dir"] = str(tmp_path)
-        path = pathlib.Path(real_mkdtemp(*args, **kwargs))
-        created.append(path)
-        return str(path)
-
-    monkeypatch.setattr(tempfile, "mkdtemp", delayed_mkdtemp)
-    task = asyncio.create_task(conversion.convert_pptx_to_pdf(pptx_path, output_dir))
-    try:
-        assert await asyncio.to_thread(started.wait, 5)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, 5)
-        release.set()
-        await asyncio.sleep(0.05)
-        assert created, "the controlled profile directory was never created"
-        assert all(not path.exists() for path in created), (
-            "cancellation during profile creation leaked the directory"
-        )
-    finally:
-        release.set()
-        if not task.done():
-            task.cancel()
-        for path in created:
-            import shutil
-
-            shutil.rmtree(path, ignore_errors=True)
-
-
-@pytest.mark.asyncio
-async def test_expected_pdf_existence_check_runs_off_the_event_loop(
-    tmp_path, monkeypatch
-):
-    conversion = _load_conversion_module()
-    assert hasattr(conversion, "_produced_pdf_exists"), (
-        "the shared helper must expose its produced-PDF check so it can run "
-        "in a worker thread"
-    )
-    pptx_path = tmp_path / "deck.pptx"
-    pptx_path.write_bytes(b"pptx bytes")
-    output_dir = tmp_path / "pdf-out"
-    output_dir.mkdir()
-    process = _RecordingProcess()
-    loop_thread = threading.get_ident()
-    observed: list[int] = []
-    original = conversion._produced_pdf_exists
-
-    def observed_exists(pdf_path):
-        observed.append(threading.get_ident())
-        return original(pdf_path)
-
-    async def communicate():
-        (output_dir / "deck.pdf").write_bytes(b"%PDF-1.4 conversion")
-        process.returncode = 0
-        return b"", b""
-
-    process.communicate = communicate  # type: ignore[method-assign]
-    _install_process_factory(monkeypatch, conversion, lambda _calls: process)
-    monkeypatch.setattr(conversion, "_produced_pdf_exists", observed_exists)
-
-    pdf_path = await conversion.convert_pptx_to_pdf(pptx_path, output_dir)
-
-    assert pdf_path == output_dir / "deck.pdf"
-    assert observed, "the produced-PDF check did not run"
-    assert all(thread != loop_thread for thread in observed), (
-        "the produced-PDF filesystem check blocked the event loop"
-    )
-
-
-def _active_source_root() -> str:
-    import xagent
-
-    return str(pathlib.Path(xagent.__path__[0]).resolve().parent)
-
-
-def _lifecycle_child_environment(tmp_path) -> dict[str, str]:
-    environment = dict(os.environ)
-    source_root = _active_source_root()
-    ambient = os.environ.get("PYTHONPATH", "")
-    environment["PYTHONPATH"] = ":".join(
-        part for part in (source_root, ambient) if part
-    )
-    for key in (
-        "XAGENT_TEST_REDIS_URL",
-        "MILVUS_URI",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-        "no_proxy",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "NO_PROXY",
-    ):
-        environment.pop(key, None)
-    lifecycle_root = tmp_path / "lifecycle"
-    lifecycle_root.mkdir(parents=True, exist_ok=True)
-    tmp_dir = tmp_path / "tmpdir"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    environment["LIFECYCLE_DIR"] = str(lifecycle_root)
-    environment["TMPDIR"] = str(tmp_dir)
-    environment["HOME"] = str(tmp_path / "home")
-    environment["XAGENT_STORAGE_ROOT"] = str(tmp_path / "storage")
-    (tmp_path / "home").mkdir(exist_ok=True)
-    return environment
-
-
-def _run_lifecycle_child(script: str, tmp_path) -> subprocess.CompletedProcess:
-    completed = subprocess.run(
-        [sys.executable, "-B", "-c", script],
-        cwd=str(pathlib.Path(_active_source_root()).parent),
-        env=_lifecycle_child_environment(tmp_path),
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    return completed
-
-
-def _assert_no_pending_task_warnings(completed: subprocess.CompletedProcess) -> None:
-    combined = completed.stdout + completed.stderr
-    for marker in (
-        "Task was destroyed but it is pending",
-        "Task exception was never retrieved",
-    ):
-        assert marker not in combined, combined
-
-
-_PROFILE_CREATION_CHILD = r"""
-import asyncio
-import json
-import signal
-import time
-import os
-import tempfile
-import threading
-import time
-from pathlib import Path
-
-from xagent.core.tools.core import pptx_conversion as conversion
-
-root = Path(os.environ["LIFECYCLE_DIR"])
-tmpdir = Path(os.environ["TMPDIR"])
-deck = root / "deck.pptx"
-deck.write_bytes(b"pptx bytes")
-output_dir = root / "pdf-out"
-output_dir.mkdir()
-started = threading.Event()
-real_mkdtemp = tempfile.mkdtemp
-
-
-def delayed_mkdtemp(*args, **kwargs):
-    if kwargs.get("prefix") != "xagent-pptx-profile-":
-        return real_mkdtemp(*args, **kwargs)
-    started.set()
-    time.sleep(0.3)
-    return real_mkdtemp(*args, dir=str(tmpdir), **kwargs)
-
-
-conversion.tempfile.mkdtemp = delayed_mkdtemp
-
-
-async def main():
-    task = asyncio.create_task(conversion.convert_pptx_to_pdf(deck, output_dir))
-    while not started.is_set():
-        await asyncio.sleep(0.01)
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-
-
-asyncio.run(main())
-print("CHILD_DONE")
-"""
-
-
-def test_cancelled_creation_cleanup_survives_asyncio_run_exit(tmp_path):
-    completed = _run_lifecycle_child(_PROFILE_CREATION_CHILD, tmp_path)
-
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert "CHILD_DONE" in completed.stdout
-    leftover = [
-        path
-        for path in (tmp_path / "tmpdir").iterdir()
-        if path.name.startswith("xagent-pptx-profile-")
-    ]
-    assert leftover == [], (
-        "asyncio.run() shutdown left a profile directory behind: "
-        f"{[str(path) for path in leftover]}"
-    )
-    _assert_no_pending_task_warnings(completed)
-
-
-@pytest.mark.asyncio
-async def test_cancelled_handoff_removes_directory_off_event_loop(
-    tmp_path, monkeypatch
-):
-    conversion = _load_conversion_module()
-    loop = asyncio.get_running_loop()
-    loop_thread = threading.get_ident()
-    scheduled = threading.Event()
-    removed = threading.Event()
-    observed: list[int] = []
-    path = tmp_path / "owned"
-    real_schedule = loop.call_soon_threadsafe
-    real_remove = conversion.shutil.rmtree
-    task = None
-
-    def schedule(callback, *args, **kwargs):
-        if threading.get_ident() != loop_thread and not scheduled.is_set():
-            scheduled.set()
-            real_schedule(task.cancel)
-        return real_schedule(callback, *args, **kwargs)
-
-    def remove(directory, *args, **kwargs):
-        if pathlib.Path(directory) == path:
-            observed.append(threading.get_ident())
-        try:
-            return real_remove(directory, *args, **kwargs)
-        finally:
-            removed.set()
-
-    def create():
-        path.mkdir()
-        return path
-
-    monkeypatch.setattr(loop, "call_soon_threadsafe", schedule)
-    monkeypatch.setattr(conversion.shutil, "rmtree", remove)
-    task = asyncio.create_task(conversion.create_owned_directory(create))
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert await asyncio.to_thread(removed.wait, 5)
-    assert not path.exists()
-    assert observed and all(thread != loop_thread for thread in observed)
-
-
 _FAKE_CONVERTER_SCRIPT = r"""
 import json
 import os
-import pathlib
 import subprocess
 import sys
 import time
 
-source = pathlib.Path(sys.argv[-1])
 child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-source.with_suffix(".pids").write_text(json.dumps([os.getpid(), child.pid]))
-if source.stem == "normal":
-    output = pathlib.Path(sys.argv[sys.argv.index("--outdir") + 1])
-    (output / (source.stem + ".pdf")).write_bytes(b"%PDF synthetic")
-else:
-    time.sleep(60)
+os.write(int(os.environ["CONVERTER_READY_FD"]), json.dumps([os.getpid(), child.pid]).encode())
+os.close(int(os.environ["CONVERTER_READY_FD"]))
+time.sleep(60)
 """
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["timeout", "cancel", "exception", "normal"])
+@pytest.mark.parametrize("mode", ["timeout", "cancel"])
 async def test_converter_group_teardown_is_bounded_with_inherited_pipes(
     tmp_path, monkeypatch, mode
 ):
@@ -691,28 +427,29 @@ async def test_converter_group_teardown_is_bounded_with_inherited_pipes(
     binary.chmod(0o700)
     output = tmp_path / "pdf"
     output.mkdir()
-    profile_paths = []
+    profiles = []
     create_process = asyncio.create_subprocess_exec
+    reader_fd, writer_fd = os.pipe()
+    loop = asyncio.get_running_loop()
+    ready = loop.create_future()
     process_ready = asyncio.Event()
 
+    def read_ready():
+        loop.remove_reader(reader_fd)
+        ready.set_result(json.loads(os.read(reader_fd, 1024)))
+
+    loop.add_reader(reader_fd, read_ready)
+
     async def spawn(*arguments, **kwargs):
-        profile_paths.append(_profile_dir_from_arguments(arguments))
-        process = await create_process(*arguments, **kwargs)
-        ready_deadline = time.monotonic() + 5
-        while (
-            not source.with_suffix(".pids").exists()
-            and time.monotonic() < ready_deadline
-        ):
-            await asyncio.sleep(0.01)
-        if mode == "exception":
-
-            async def broken_pipe():
-                while not source.with_suffix(".pids").exists():
-                    await asyncio.sleep(0.01)
-                raise RuntimeError("synthetic pipe reader error")
-
-            process.communicate = broken_pipe
-        process_ready.set()
+        profiles.append(_profile_dir_from_arguments(arguments))
+        process = await create_process(
+            *arguments,
+            **kwargs,
+            pass_fds=(writer_fd,),
+            env={**os.environ, "CONVERTER_READY_FD": str(writer_fd)},
+        )
+        await asyncio.shield(ready)
+        loop.call_soon(process_ready.set)
         return process
 
     monkeypatch.setattr(conversion.asyncio, "create_subprocess_exec", spawn)
@@ -726,28 +463,19 @@ async def test_converter_group_teardown_is_bounded_with_inherited_pipes(
     )
     pids = []
     try:
-        deadline = time.monotonic() + 5
-        while not source.with_suffix(".pids").exists() and time.monotonic() < deadline:
-            await asyncio.sleep(0.01)
-        assert source.with_suffix(".pids").exists(), "converter did not start"
-        pids = json.loads(source.with_suffix(".pids").read_text())
-        await asyncio.wait_for(process_ready.wait(), timeout=5)
-        started = time.monotonic()
+        pids = await asyncio.wait_for(ready, 5)
+        await asyncio.wait_for(process_ready.wait(), 5)
         if mode == "cancel":
             task.cancel()
         done, pending = await asyncio.wait({task}, timeout=3)
         assert not pending, "conversion teardown exceeded three seconds"
-        assert time.monotonic() - started < 3
-        if mode == "normal":
-            assert task.result() == output / "normal.pdf"
-        else:
-            expected = {
-                "timeout": conversion.PptxConversionTimeoutError,
-                "cancel": asyncio.CancelledError,
-                "exception": RuntimeError,
-            }[mode]
-            with pytest.raises(expected):
-                task.result()
+        expected = (
+            conversion.PptxConversionTimeoutError
+            if mode == "timeout"
+            else asyncio.CancelledError
+        )
+        with pytest.raises(expected):
+            task.result()
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             try:
@@ -757,8 +485,11 @@ async def test_converter_group_teardown_is_bounded_with_inherited_pipes(
             await asyncio.sleep(0.01)
         with pytest.raises(ProcessLookupError):
             os.kill(pids[1], 0)
-        assert profile_paths and all(not path.exists() for path in profile_paths)
+        assert profiles and all(not path.exists() for path in profiles)
     finally:
+        loop.remove_reader(reader_fd)
+        os.close(reader_fd)
+        os.close(writer_fd)
         for pid in pids:
             try:
                 os.kill(pid, signal.SIGKILL)

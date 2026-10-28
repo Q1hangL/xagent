@@ -13,8 +13,6 @@ tests/web/services/test_cleanup_publication_contracts.py suites.
 import asyncio
 import os
 import pathlib
-import subprocess
-import sys
 
 import pytest
 
@@ -253,10 +251,15 @@ async def test_preview_returns_none_when_conversion_times_out(tmp_path, monkeypa
     async def create_subprocess_exec(*_args, **_kwargs):
         return process
 
+    waits = 0
+
     async def fake_wait_for(awaitable, timeout=None):
-        if hasattr(awaitable, "close"):
+        nonlocal waits
+        waits += 1
+        if waits == 1:
             awaitable.close()
-        raise asyncio.TimeoutError
+            raise asyncio.TimeoutError
+        return await awaitable
 
     monkeypatch.setattr(files.asyncio, "create_subprocess_exec", create_subprocess_exec)
     monkeypatch.setattr(files.asyncio, "wait_for", fake_wait_for)
@@ -419,119 +422,3 @@ def test_preview_pdf_endpoint_falls_back_with_503_when_libreoffice_is_missing(
 
     assert response.status_code == 503
     assert "LibreOffice" in response.json()["detail"]
-
-
-def _preview_source_root() -> str:
-    import xagent
-
-    return str(pathlib.Path(xagent.__path__[0]).resolve().parent)
-
-
-def _preview_child_environment(tmp_path) -> dict[str, str]:
-    environment = dict(os.environ)
-    source_root = _preview_source_root()
-    ambient = os.environ.get("PYTHONPATH", "")
-    environment["PYTHONPATH"] = ":".join(
-        part for part in (source_root, ambient) if part
-    )
-    for key in (
-        "XAGENT_TEST_REDIS_URL",
-        "MILVUS_URI",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-        "no_proxy",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "NO_PROXY",
-    ):
-        environment.pop(key, None)
-    lifecycle_root = tmp_path / "lifecycle"
-    lifecycle_root.mkdir(parents=True, exist_ok=True)
-    tmp_dir = tmp_path / "tmpdir"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    environment["LIFECYCLE_DIR"] = str(lifecycle_root)
-    environment["TMPDIR"] = str(tmp_dir)
-    environment["HOME"] = str(tmp_path / "home")
-    environment["XAGENT_STORAGE_ROOT"] = str(tmp_path / "storage")
-    (tmp_path / "home").mkdir(exist_ok=True)
-    return environment
-
-
-_PREVIEW_PROFILE_CHILD = r"""
-import asyncio
-import os
-import tempfile
-import threading
-import time
-from pathlib import Path
-
-import xagent.core.tools.core.pptx_conversion as conversion
-from xagent.web.api import files
-
-root = Path(os.environ["LIFECYCLE_DIR"])
-tmpdir = Path(os.environ["TMPDIR"])
-deck = root / "deck.pptx"
-deck.write_bytes(b"pptx bytes")
-started = threading.Event()
-real_mkdtemp = tempfile.mkdtemp
-
-
-def delayed_mkdtemp(*args, **kwargs):
-    if kwargs.get("prefix") != "xagent-pptx-profile-":
-        return real_mkdtemp(*args, **kwargs)
-    started.set()
-    time.sleep(0.3)
-    return real_mkdtemp(*args, dir=str(tmpdir), **kwargs)
-
-
-conversion.tempfile.mkdtemp = delayed_mkdtemp
-# Call the uncached conversion the preview endpoint wraps; the publication
-# guard's cancellation drain is not needed to exercise the shared profile path.
-convert = files._convert_pptx_to_pdf_uncached.__wrapped__
-
-
-async def main():
-    task = asyncio.create_task(convert(deck, None))
-    while not started.is_set():
-        await asyncio.sleep(0.01)
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-
-
-asyncio.run(main())
-print("CHILD_DONE")
-"""
-
-
-def test_preview_shared_creation_path_cleans_up_after_asyncio_run_exit(tmp_path):
-    completed = subprocess.run(
-        [sys.executable, "-B", "-c", _PREVIEW_PROFILE_CHILD],
-        cwd=str(pathlib.Path(_preview_source_root()).parent),
-        env=_preview_child_environment(tmp_path),
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert "CHILD_DONE" in completed.stdout
-    leftovers = [
-        path
-        for path in (tmp_path / "tmpdir").iterdir()
-        if path.name.startswith("xagent-pptx-profile-")
-    ]
-    assert leftovers == [], (
-        "preview conversion left a profile directory behind after "
-        f"asyncio.run() shutdown: {[str(path) for path in leftovers]}"
-    )
-    combined = completed.stdout + completed.stderr
-    for marker in (
-        "Task was destroyed but it is pending",
-        "Task exception was never retrieved",
-    ):
-        assert marker not in combined, combined

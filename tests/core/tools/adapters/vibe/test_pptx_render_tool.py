@@ -251,7 +251,13 @@ async def test_factory_build_with_sandbox_keeps_the_tool_on_the_host(
         return pdf_path
 
     def render_pdf_pages_to_pngs(
-        pdf_path, page_numbers, output_dir, *, scale=2.0, max_pixels=4_000_000
+        pdf_path,
+        page_numbers,
+        output_dir,
+        *,
+        output_fd=None,
+        scale=2.0,
+        max_pixels=4_000_000,
     ):
         output_dir = pathlib.Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -267,40 +273,11 @@ async def test_factory_build_with_sandbox_keeps_the_tool_on_the_host(
     monkeypatch.setattr(render, "convert_pptx_to_pdf", convert_pptx_to_pdf)
     monkeypatch.setattr(render, "render_pdf_pages_to_pngs", render_pdf_pages_to_pngs)
     monkeypatch.setattr(render, "read_pdf_page_count", lambda _path: 1)
-    file_ids: dict[str, str] = {}
-
-    def register_files(files, *, db_session=None):
-        ids = []
-        for path, _file_id in files:
-            file_id = f"00000000-0000-4000-8000-{len(ids) + 1:012d}"
-            file_ids[str(path)] = file_id
-            ids.append(file_id)
-        return tuple(ids)
-
     monkeypatch.setattr(
         workspace,
-        "register_files",
-        register_files,
+        "register_delivery_file",
+        lambda path: "00000000-0000-4000-8000-000000000001",
     )
-    monkeypatch.setattr(
-        render, "_expected_registration_owner", lambda _workspace: (1, 4242)
-    )
-
-    def lookup_record(file_id):
-        path = next(
-            path for path, registered_id in file_ids.items() if registered_id == file_id
-        )
-        return render._PersistedFileRecord(
-            file_id=file_id,
-            user_id=1,
-            task_id=4242,
-            storage_status="available",
-            storage_path=path,
-            storage_key=None,
-            detached_reason=None,
-        )
-
-    monkeypatch.setattr(render, "_lookup_uploaded_file_record", lookup_record)
 
     result = await tool.run_json_async({"pptx_path": str(deck)})
 
