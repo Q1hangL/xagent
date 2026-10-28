@@ -21,11 +21,13 @@ LibreOffice converts the whole deck; only the PNG output is page-bounded.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import math
 import shutil
 import struct
 import tempfile
+import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -1019,18 +1021,38 @@ def _remove_tree(path: Path | None) -> None:
 
 
 async def _run_blocking(operation: Callable[[], _T]) -> _T:
-    """Run blocking work in a thread and drain it if the caller is cancelled."""
-    task = asyncio.create_task(asyncio.to_thread(operation))
+    """Drain the actual worker before cancellation can trigger output cleanup."""
+    completed = threading.Event()
+    context = contextvars.copy_context()
+
+    def run() -> _T:
+        try:
+            return context.run(operation)
+        finally:
+            completed.set()
+
+    # Submit directly so normal loop shutdown cannot cancel a proxy Task before
+    # the worker has finished. Only the worker signals completion.
+    future = asyncio.get_running_loop().run_in_executor(None, run)
     try:
-        return await asyncio.shield(task)
+        return await asyncio.shield(future)
     except asyncio.CancelledError:
-        while not task.done():
+        while not completed.is_set():
             try:
-                await asyncio.shield(task)
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                continue
+        # The thread can signal completion just before its result reaches the
+        # loop. Consume that result too, including exceptions after a commit.
+        while not future.done():
+            try:
+                await asyncio.shield(future)
             except asyncio.CancelledError:
                 continue
             except BaseException:
                 break
+        if not future.cancelled():
+            future.exception()
         raise
 
 
