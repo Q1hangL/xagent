@@ -8,22 +8,24 @@ LibreOffice invocation contract, so the process handling lives here:
 * one LibreOffice user profile per call, so two concurrent conversions cannot
   fight over the same configuration lock;
 * a bounded wait whose timeout terminates the isolated process group;
-* cleanup of the profile and of the child on success, failure and
-  cancellation.
+* cleanup of the profile on every exit, and of the process group on failure
+  or cancellation.
 
-Callers own what happens to the produced PDF: the preview keeps its managed
-cache and publication guard, the render tool uses a disposable directory.
+Callers publish complete PDFs into the shared preview cache namespace.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import shutil
 import signal
 import tempfile
 from pathlib import Path
 from typing import Final
+
+from ....config import get_storage_root
 
 DEFAULT_PPTX_CONVERSION_TIMEOUT_SECONDS: Final[float] = 60.0
 DEFAULT_SOFFICE_BINARY: Final[str] = "soffice"
@@ -50,7 +52,6 @@ def build_soffice_arguments(
     output_dir: Path,
     profile_dir: Path,
     *,
-    soffice_binary: str = DEFAULT_SOFFICE_BINARY,
     include_hidden_slides: bool = False,
 ) -> list[str]:
     """Return the argv for one headless ``.pptx`` -> PDF conversion.
@@ -66,7 +67,7 @@ def build_soffice_arguments(
         else "pdf"
     )
     return [
-        soffice_binary,
+        DEFAULT_SOFFICE_BINARY,
         "--headless",
         f"-env:UserInstallation={profile_dir.as_uri()}",
         "--convert-to",
@@ -86,28 +87,10 @@ PROCESS_REAP_TIMEOUT_SECONDS: Final[float] = 1.0
 
 
 def _kill_process_group(process: asyncio.subprocess.Process) -> None:
-    # A conversion owns its session. Kill descendants too, including after the
-    # session leader exits while a descendant still holds the output pipes.
     try:
         os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
-
-
-async def _communicate_with_group(
-    process: asyncio.subprocess.Process,
-) -> tuple[bytes, bytes]:
-    communication = asyncio.create_task(process.communicate())
-    try:
-        while process.returncode is None and not communication.done():
-            await asyncio.sleep(0.01)
-        if process.returncode is not None and not communication.done():
-            _kill_process_group(process)
-        return await communication
-    finally:
-        if not communication.done():
-            communication.cancel()
-        await asyncio.gather(communication, return_exceptions=True)
 
 
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:
@@ -116,10 +99,7 @@ async def _terminate_process(process: asyncio.subprocess.Process) -> None:
     try:
         await asyncio.wait_for(process.wait(), PROCESS_REAP_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
-        # asyncio exposes no public close for subprocess pipe transports.
-        transport = getattr(process, "_transport", None)
-        if transport is not None:
-            transport.close()
+        pass
 
 
 async def convert_pptx_to_pdf(
@@ -127,7 +107,6 @@ async def convert_pptx_to_pdf(
     output_dir: Path,
     *,
     timeout_seconds: float = DEFAULT_PPTX_CONVERSION_TIMEOUT_SECONDS,
-    soffice_binary: str = DEFAULT_SOFFICE_BINARY,
     include_hidden_slides: bool = False,
 ) -> Path:
     """Convert ``pptx_path`` into ``output_dir`` and return the produced PDF.
@@ -140,7 +119,7 @@ async def convert_pptx_to_pdf(
     Raises:
         PptxConverterUnavailableError: LibreOffice cannot be started.
         PptxConversionTimeoutError: the conversion exceeded ``timeout_seconds``;
-            the process group was terminated and reaping was bounded.
+            process-group termination was attempted and reaping was bounded.
         PptxConversionFailedError: a non-zero exit or no expected PDF.
     """
     pptx_path = Path(pptx_path)
@@ -152,32 +131,31 @@ async def convert_pptx_to_pdf(
             pptx_path,
             output_dir,
             profile_dir,
-            soffice_binary=soffice_binary,
             include_hidden_slides=include_hidden_slides,
         )
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *arguments,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
-        except FileNotFoundError as exc:
-            raise PptxConverterUnavailableError(
-                f"LibreOffice is not installed or not on PATH ({soffice_binary!r}); "
-                f"cannot convert {pptx_path.name} to PDF."
-            ) from exc
-        try:
-            _stdout, stderr = await asyncio.wait_for(
-                _communicate_with_group(process), timeout=timeout_seconds
-            )
-        except asyncio.TimeoutError as exc:
-            raise PptxConversionTimeoutError(
-                f"LibreOffice conversion of {pptx_path.name} timed out after "
-                f"{timeout_seconds:g} seconds."
-            ) from exc
+        stderr_path = profile_dir / "stderr.log"
+        with stderr_path.open("wb") as stderr_file:
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *arguments,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=stderr_file,
+                    start_new_session=True,
+                )
+            except FileNotFoundError as exc:
+                raise PptxConverterUnavailableError(
+                    f"LibreOffice is not installed or not on PATH ({DEFAULT_SOFFICE_BINARY!r}); "
+                    f"cannot convert {pptx_path.name} to PDF."
+                ) from exc
+            try:
+                await asyncio.wait_for(process.wait(), timeout=timeout_seconds)
+            except asyncio.TimeoutError as exc:
+                raise PptxConversionTimeoutError(
+                    f"LibreOffice conversion of {pptx_path.name} timed out after "
+                    f"{timeout_seconds:g} seconds."
+                ) from exc
         if process.returncode != 0:
-            detail = stderr.decode("utf-8", "replace").strip()[:200]
+            detail = await asyncio.to_thread(_stderr_summary, stderr_path)
             raise PptxConversionFailedError(
                 f"LibreOffice exited {process.returncode} while converting "
                 f"{pptx_path.name}: {detail or 'no stderr output'}"
@@ -189,9 +167,25 @@ async def convert_pptx_to_pdf(
                 f"{pdf_path.name} for {pptx_path.name}."
             )
         return pdf_path
+    except (Exception, asyncio.CancelledError):
+        if process is not None:
+            await _terminate_process(process)
+        raise
     finally:
-        try:
-            if process is not None:
-                await _terminate_process(process)
-        finally:
-            await asyncio.to_thread(shutil.rmtree, profile_dir, ignore_errors=True)
+        await asyncio.to_thread(shutil.rmtree, profile_dir, ignore_errors=True)
+
+
+def _stderr_summary(path: Path) -> str:
+    with path.open("rb") as stream:
+        return stream.read(800).decode("utf-8", "replace").strip()[:200]
+
+
+def pptx_pdf_cache_path(
+    source: Path, file_id: str | None = None, *, content_hash: str | None = None
+) -> Path:
+    """Use the preview cache namespace for default and hidden-slide exports."""
+    directory = get_storage_root() / "pptx_pdf_cache"
+    directory.mkdir(parents=True, exist_ok=True)
+    owner = file_id or hashlib.sha256(str(source.resolve()).encode()).hexdigest()[:24]
+    variant = f".{content_hash}.hidden" if content_hash is not None else ""
+    return directory / f"{owner}{variant}.preview.pdf"

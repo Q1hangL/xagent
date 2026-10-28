@@ -39,7 +39,8 @@ _simulated_processes = {}
 
 
 @pytest.fixture(autouse=True)
-def simulated_process_groups(monkeypatch):
+def simulated_process_groups(monkeypatch, tmp_path):
+    monkeypatch.setattr(_load_conversion_module().tempfile, "tempdir", str(tmp_path))
     kill_group = os.killpg
 
     def kill(group, signal):
@@ -54,7 +55,7 @@ def simulated_process_groups(monkeypatch):
 
 
 class _RecordingProcess:
-    """Fake asyncio subprocess that records kill/wait/communicate usage."""
+    """Fake asyncio subprocess that records kill/wait usage."""
 
     def __init__(self, *, returncode: int = 0, stderr: bytes = b""):
         self.returncode: int | None = None
@@ -64,36 +65,33 @@ class _RecordingProcess:
         _simulated_processes[self.pid] = self
         self.killed = 0
         self.wait_calls = 0
-        self.communicate_calls = 0
-
-    async def communicate(self) -> tuple[bytes, bytes]:
-        self.communicate_calls += 1
-        self.returncode = self.final_returncode
-        return b"", self.stderr
 
     def kill(self) -> None:
         self.killed += 1
 
     async def wait(self) -> int:
         self.wait_calls += 1
-        self.returncode = -9
-        return -9
+        self.returncode = -9 if self.killed else self.final_returncode
+        return self.returncode
 
 
 class _HangingProcess(_RecordingProcess):
-    """Fake subprocess whose communicate() never finishes on its own."""
+    """Fake subprocess whose wait() remains pending until termination."""
 
     def __init__(self):
         super().__init__()
         self.started = asyncio.Event()
 
-    async def communicate(self) -> tuple[bytes, bytes]:
-        self.communicate_calls += 1
+    async def wait(self) -> int:
+        self.wait_calls += 1
+        if self.killed:
+            self.returncode = -9
+            return -9
         self.started.set()
         # Bounded stand-in: the real per-call timeout used by the tests is much
         # shorter, and a mutant that drops the timeout must not stall the suite.
         await asyncio.sleep(5)
-        return b"", b""
+        return 0
 
 
 def _install_process_factory(monkeypatch, conversion, factory):
@@ -101,7 +99,10 @@ def _install_process_factory(monkeypatch, conversion, factory):
 
     async def create_subprocess_exec(*arguments, **kwargs):
         calls.append({"arguments": list(arguments), "kwargs": dict(kwargs)})
-        return factory(calls)
+        process = factory(calls)
+        kwargs["stderr"].write(process.stderr)
+        kwargs["stderr"].flush()
+        return process
 
     monkeypatch.setattr(
         conversion.asyncio, "create_subprocess_exec", create_subprocess_exec
@@ -162,14 +163,14 @@ async def test_conversion_passes_headless_convert_to_and_per_call_profile(
 
     process = _RecordingProcess()
 
-    async def communicate():
+    async def wait():
         observed["profile_dir"] = _profile_dir_from_arguments(calls[0]["arguments"])
         observed["profile_existed_during_run"] = observed["profile_dir"].is_dir()
         (output_dir / "deck.pdf").write_bytes(b"%PDF-1.4 conversion")
         process.returncode = 0
-        return b"", b""
+        return 0
 
-    process.communicate = communicate  # type: ignore[method-assign]
+    process.wait = wait  # type: ignore[method-assign]
 
     calls = _install_process_factory(monkeypatch, conversion, lambda _calls: process)
 
@@ -185,8 +186,8 @@ async def test_conversion_passes_headless_convert_to_and_per_call_profile(
     assert arguments[5] == "--outdir"
     assert arguments[6] == str(output_dir)
     assert arguments[7] == str(pptx_path)
-    assert calls[0]["kwargs"]["stdout"] == asyncio.subprocess.PIPE
-    assert calls[0]["kwargs"]["stderr"] == asyncio.subprocess.PIPE
+    assert calls[0]["kwargs"]["stdout"] == asyncio.subprocess.DEVNULL
+    assert hasattr(calls[0]["kwargs"]["stderr"], "fileno")
     # The user profile is a per-call directory, not the PDF output directory.
     assert observed["profile_existed_during_run"] is True
     assert observed["profile_dir"] != output_dir
@@ -234,12 +235,12 @@ async def test_non_zero_exit_reports_stderr_and_cleans_the_profile(
 
     process = _RecordingProcess(returncode=1, stderr=b"libreoffice exploded")
 
-    async def communicate():
+    async def wait():
         observed["profile_dir"] = _profile_dir_from_arguments(calls[0]["arguments"])
         process.returncode = 1
-        return b"", b"libreoffice exploded"
+        return 1
 
-    process.communicate = communicate  # type: ignore[method-assign]
+    process.wait = wait  # type: ignore[method-assign]
     calls = _install_process_factory(monkeypatch, conversion, lambda _calls: process)
 
     with pytest.raises(conversion.PptxConversionFailedError) as fault:
@@ -277,12 +278,12 @@ async def test_a_different_pdf_is_not_silently_accepted(tmp_path, monkeypatch):
     output_dir.mkdir()
     process = _RecordingProcess()
 
-    async def communicate():
+    async def wait():
         (output_dir / "some-other.pdf").write_bytes(b"%PDF-1.4 stray")
         process.returncode = 0
-        return b"", b""
+        return 0
 
-    process.communicate = communicate  # type: ignore[method-assign]
+    process.wait = wait  # type: ignore[method-assign]
     _install_process_factory(monkeypatch, conversion, lambda _calls: process)
 
     with pytest.raises(conversion.PptxConversionFailedError) as fault:
@@ -311,7 +312,7 @@ async def test_timeout_kills_and_awaits_the_process_and_cleans_the_profile(
     assert "0.05" in str(fault.value)
     assert "deck.pptx" in str(fault.value)
     assert process.killed == 1
-    assert process.wait_calls == 1
+    assert process.wait_calls == 2
     profile_dir = _profile_dir_from_arguments(calls[0]["arguments"])
     assert not profile_dir.exists()
 
@@ -336,7 +337,7 @@ async def test_cancellation_kills_and_awaits_the_process_then_cleans_up(
         await task
 
     assert process.killed == 1
-    assert process.wait_calls == 1
+    assert process.wait_calls == 2
     profile_dir = _profile_dir_from_arguments(calls[0]["arguments"])
     assert not profile_dir.exists()
 
@@ -362,12 +363,12 @@ async def test_concurrent_conversions_get_isolated_profiles(tmp_path, monkeypatc
             self.output_dir = output_dir
             self.name = name
 
-        async def communicate(self):
+        async def wait(self):
             self.returncode = 0
             arrived.set()
             await release.wait()
             self.output_dir.joinpath(self.name).write_bytes(b"%PDF-1.4")
-            return b"", b""
+            return 0
 
     async def create_subprocess_exec(*arguments, **kwargs):
         calls.append({"arguments": list(arguments), "kwargs": dict(kwargs)})
@@ -422,7 +423,8 @@ async def test_converter_group_teardown_is_bounded_with_inherited_pipes(
     conversion = _load_conversion_module()
     source = tmp_path / (mode + ".pptx")
     source.write_bytes(b"synthetic presentation")
-    binary = tmp_path / "local-converter"
+    binary = tmp_path / "soffice"
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
     binary.write_text("#!" + sys.executable + "\n" + _FAKE_CONVERTER_SCRIPT)
     binary.chmod(0o700)
     output = tmp_path / "pdf"
@@ -457,7 +459,6 @@ async def test_converter_group_teardown_is_bounded_with_inherited_pipes(
         conversion.convert_pptx_to_pdf(
             source,
             output,
-            soffice_binary=str(binary),
             timeout_seconds=0.8 if mode == "timeout" else 30,
         )
     )
@@ -531,9 +532,11 @@ async def test_success_uses_file_stderr_without_killing_group(tmp_path, monkeypa
     source.write_bytes(b"presentation")
     (tmp_path / "deck.pdf").write_bytes(b"%PDF-1.4")
     process = _RecordingProcess()
+
     async def wait():
         process.returncode = 0
         return 0
+
     process.wait = wait
     calls = _install_process_factory(monkeypatch, conversion, lambda _: process)
     await conversion.convert_pptx_to_pdf(source, tmp_path)
@@ -550,16 +553,22 @@ async def test_permission_denied_during_group_cleanup_preserves_timeout(
 ):
     conversion = _load_conversion_module()
     process = _HangingProcess()
+
     async def wait():
         await asyncio.sleep(5)
         return 0
+
     process.wait = wait
     _install_process_factory(monkeypatch, conversion, lambda _: process)
+
     def denied(*args):
         raise PermissionError("group cannot be signalled")
+
     monkeypatch.setattr(os, "killpg", denied)
     with pytest.raises(conversion.PptxConversionTimeoutError):
-        await conversion.convert_pptx_to_pdf(tmp_path / "deck.pptx", tmp_path, timeout_seconds=0.01)
+        await conversion.convert_pptx_to_pdf(
+            tmp_path / "deck.pptx", tmp_path, timeout_seconds=0.01
+        )
 
 
 @pytest.mark.asyncio
@@ -569,17 +578,20 @@ async def test_normal_leader_exit_does_not_wait_for_descendant(tmp_path, monkeyp
     source.write_bytes(b"presentation")
     ready_path = tmp_path / "child.pid"
     binary = tmp_path / "soffice"
-    binary.write_text("#!" + sys.executable + "\n" +
-        "import pathlib, subprocess, sys\n"
+    binary.write_text(
+        "#!" + sys.executable + "\n" + "import pathlib, subprocess, sys\n"
         "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
         f"pathlib.Path({str(ready_path)!r}).write_text(str(child.pid))\n"
-        f"pathlib.Path({str(tmp_path / 'deck.pdf')!r}).write_bytes(b'%PDF-1.4')\n")
+        f"pathlib.Path({str(tmp_path / 'deck.pdf')!r}).write_bytes(b'%PDF-1.4')\n"
+    )
     binary.chmod(0o700)
     monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
     monkeypatch.setattr(conversion.tempfile, "tempdir", str(tmp_path))
     child_pid = None
     try:
-        result = await asyncio.wait_for(conversion.convert_pptx_to_pdf(source, tmp_path), 3)
+        result = await asyncio.wait_for(
+            conversion.convert_pptx_to_pdf(source, tmp_path), 3
+        )
         child_pid = int(ready_path.read_text())
         assert result == tmp_path / "deck.pdf"
         assert not list(tmp_path.glob("xagent-pptx-profile-*"))

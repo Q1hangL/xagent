@@ -868,9 +868,15 @@ def delete_pptx_pdf_cache(file_id: str) -> None:
     if Path(file_id).name != file_id or file_id in {".", ".."}:
         logger.warning("Skipping invalid registered preview cache ID: %r", file_id)
         return
-    cache_path = get_storage_root() / "pptx_pdf_cache" / f"{file_id}.preview.pdf"
+    directory = get_storage_root() / "pptx_pdf_cache"
     try:
-        cache_path.unlink(missing_ok=True)
+        for cache_path in directory.iterdir():
+            if cache_path.name.startswith(f"{file_id}.") and cache_path.name.endswith(
+                ".preview.pdf"
+            ):
+                cache_path.unlink(missing_ok=True)
+    except FileNotFoundError:
+        pass
     except OSError:
         logger.warning("Failed to remove PDF preview cache for %s", file_id)
 
@@ -930,10 +936,8 @@ def delete_legacy_preview_caches(source_path: Path) -> None:
     """
 
     path_key = hashlib.sha256(str(source_path).encode()).hexdigest()[:24]
-    cache_paths = (
-        get_storage_root() / "pptx_pdf_cache" / f"{path_key}.preview.pdf",
-        get_storage_root() / "svg_png_cache" / f"{path_key}.preview.png",
-    )
+    delete_pptx_pdf_cache(path_key)
+    cache_paths = (get_storage_root() / "svg_png_cache" / f"{path_key}.preview.png",)
     for cache_path in cache_paths:
         try:
             cache_path.unlink(missing_ok=True)

@@ -177,14 +177,11 @@ async def test_managed_pptx_conversion_allows_cached_reads_and_releases_connecti
             pid = 123_456_789
             returncode = None
 
-            async def communicate(self):
+            async def wait(self):
                 entered.set()
                 await release.wait()
                 (output / "source.pdf").write_bytes(b"converted preview")
                 self.returncode = 0
-                return b"", b""
-
-            async def wait(self):
                 return self.returncode
 
         return Process()

@@ -1191,18 +1191,11 @@ def _pptx_pdf_cache_path(pptx_path: Path, file_id: Optional[str] = None) -> Path
       the upload endpoint live there.
 
     For registered UUID files the cache key is the ``file_id``, which lets
-    ``delete_file()`` remove it with a single unlink.  For legacy / non-UUID
-    paths (no lifecycle management) we fall back to a SHA-256 prefix of the
-    resolved source path — entries there age out naturally.
+    ``delete_file()`` remove all of its export variants.  For legacy / non-UUID
+    paths we fall back to a SHA-256 prefix of the resolved source path; legacy
+    source deletion uses that same prefix to remove its previews.
     """
-    import hashlib
-
-    cache_dir = get_storage_root() / "pptx_pdf_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    if file_id:
-        return cache_dir / f"{file_id}.preview.pdf"
-    path_key = hashlib.sha256(str(pptx_path.resolve()).encode()).hexdigest()[:24]
-    return cache_dir / f"{path_key}.preview.pdf"
+    return pptx_conversion.pptx_pdf_cache_path(pptx_path, file_id)
 
 
 async def _convert_pptx_to_pdf(

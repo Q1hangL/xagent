@@ -11,6 +11,7 @@ import asyncio
 import base64
 import hashlib
 import math
+import os
 import pathlib
 import shutil
 import subprocess
@@ -210,9 +211,8 @@ def _install_rasterizer(monkeypatch, render, *, page_count, requested, rendered)
         page_numbers,
         output_dir,
         *,
-        output_fd=None,
-        scale=2.0,
-        max_pixels=4_000_000,
+        output_fd,
+        cancelled,
     ):
         requested.append(list(page_numbers))
         output_dir = pathlib.Path(output_dir)
@@ -223,10 +223,12 @@ def _install_rasterizer(monkeypatch, render, *, page_count, requested, rendered)
             path.write_bytes(PNG_1X1)
             pages.append(RenderedPage(page_number=number, path=path, width=1, height=1))
         rendered.append(pages)
-        return page_count, pages
+        return pages
 
     monkeypatch.setattr(render, "render_pdf_pages_to_pngs", render_pdf_pages_to_pngs)
-    monkeypatch.setattr(render, "read_pdf_page_count", lambda _path: page_count)
+    monkeypatch.setattr(
+        render, "_open_pdf", lambda _path: _FakeDocument([None] * page_count)
+    )
 
 
 def _output_rows(session_factory):
@@ -464,7 +466,7 @@ async def test_render_page_limit_is_applied_before_any_pixmap_allocation(
     deck = _write_deck(durable_workspace.workspace.input_dir)
     events: list = []
     fake_fitz = _FakeFitz([(720.0, 540.0)] * 25, events)
-    monkeypatch.setattr(render, "fitz", fake_fitz)
+    monkeypatch.setitem(sys.modules, "fitz", fake_fitz)
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
 
     result = await render.render_pptx_to_images(str(deck), durable_workspace.workspace)
@@ -484,7 +486,7 @@ async def test_render_limits_pixels_before_requesting_a_huge_pixmap(
     deck = _write_deck(durable_workspace.workspace.input_dir)
     events: list = []
     fake_fitz = _FakeFitz([(1_000_000.0, 1_000_000.0)], events)
-    monkeypatch.setattr(render, "fitz", fake_fitz)
+    monkeypatch.setitem(sys.modules, "fitz", fake_fitz)
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
 
     result = await render.render_pptx_to_images(str(deck), durable_workspace.workspace)
@@ -492,6 +494,7 @@ async def test_render_limits_pixels_before_requesting_a_huge_pixmap(
     assert result["success"] is True
     pixmap_events = [event for event in events if event[0] == "get_pixmap"]
     assert len(pixmap_events) == 1
+    assert len(fake_fitz.documents) == 1
     matrix = pixmap_events[0][2]
     assert matrix.a == matrix.b
     predicted_width = math.ceil(1_000_000.0 * matrix.a - 1e-9)
@@ -500,9 +503,26 @@ async def test_render_limits_pixels_before_requesting_a_huge_pixmap(
     assert matrix.a < 1.0
 
 
+def _rasterize(render, pdf_path, numbers, output_dir):
+    document = render._open_pdf(pdf_path)
+    descriptor = os.open(output_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        pages = render.render_pdf_pages_to_pngs(
+            document,
+            numbers,
+            output_dir,
+            output_fd=descriptor,
+            cancelled=threading.Event(),
+        )
+        return document.page_count, pages
+    finally:
+        os.close(descriptor)
+        document.close()
+
+
 def test_real_rasterizer_stays_within_the_pixel_budget(tmp_path):
-    render = _load_render_module()
     fitz = pytest.importorskip("fitz")
+    render = _load_render_module()
     document = fitz.open()
     try:
         page = document.new_page(width=720, height=540)
@@ -514,9 +534,7 @@ def test_real_rasterizer_stays_within_the_pixel_budget(tmp_path):
     output_dir = tmp_path / "pngs"
     output_dir.mkdir()
 
-    total_pages, pages = render.render_pdf_pages_to_pngs(
-        pdf_path, [1], output_dir, scale=100.0
-    )
+    total_pages, pages = _rasterize(render, pdf_path, [1], output_dir)
 
     assert total_pages == 1
     assert len(pages) == 1
@@ -529,8 +547,8 @@ def test_real_rasterizer_stays_within_the_pixel_budget(tmp_path):
 
 
 def test_real_rasterizer_renders_only_the_selected_pages(tmp_path):
-    render = _load_render_module()
     fitz = pytest.importorskip("fitz")
+    render = _load_render_module()
     document = fitz.open()
     try:
         for number in range(5):
@@ -543,7 +561,7 @@ def test_real_rasterizer_renders_only_the_selected_pages(tmp_path):
     output_dir = tmp_path / "pngs"
     output_dir.mkdir()
 
-    total_pages, pages = render.render_pdf_pages_to_pngs(pdf_path, [2, 4], output_dir)
+    total_pages, pages = _rasterize(render, pdf_path, [2, 4], output_dir)
 
     assert total_pages == 5
     assert [page.page_number for page in pages] == [2, 4]
@@ -642,7 +660,7 @@ async def test_render_accepts_persistent_file_ids_and_allowed_paths(
         assert result["success"] is True, (selector, result)
         assert pathlib.Path(result["pptx_path"]).resolve() == deck.resolve()
 
-    assert len(conversions) == len(selectors)
+    assert len(conversions) == 1
     assert all(path != deck and not path.exists() for path in conversions)
     assert (
         hashlib.sha256(deck.read_bytes()).hexdigest()
@@ -756,12 +774,17 @@ async def test_render_cancellation_reclaims_the_subprocess_and_cleans_up(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("same_source", [False, True])
 async def test_concurrent_renders_use_isolated_directories(
-    durable_workspace, monkeypatch, tmp_path
+    durable_workspace, monkeypatch, tmp_path, same_source
 ):
     render = _load_render_module()
     first = _write_deck(durable_workspace.workspace.input_dir, "first.pptx")
-    second = _write_deck(durable_workspace.workspace.input_dir, "second.pptx")
+    second = (
+        first
+        if same_source
+        else _write_deck(durable_workspace.workspace.input_dir, "second.pptx")
+    )
     seen: list[dict] = []
     release = asyncio.Event()
     arrived = asyncio.Event()
@@ -810,6 +833,9 @@ async def test_concurrent_renders_use_isolated_directories(
     for path in temp_roots:
         assert not path.exists()
     assert len(_output_rows(durable_workspace.session_factory)) == 2
+    cached = list(durable_workspace.storage_root.rglob("*.hidden.preview.pdf"))
+    assert len(cached) == (1 if same_source else 2)
+    assert all(path.read_bytes() == b"%PDF-1.4 synthetic" for path in cached)
 
 
 @pytest.mark.asyncio
@@ -923,7 +949,7 @@ async def test_render_cleans_up_when_rasterization_fails_midway(
         raise render.PptxRenderRasterError("page 2 could not be rasterized")
 
     monkeypatch.setattr(render, "render_pdf_pages_to_pngs", failing_raster)
-    monkeypatch.setattr(render, "read_pdf_page_count", lambda _path: 2)
+    monkeypatch.setattr(render, "_open_pdf", lambda _path: _FakeDocument([None] * 2))
 
     result = await render.render_pptx_to_images(str(deck), durable_workspace.workspace)
 
@@ -949,7 +975,7 @@ async def test_render_cleans_up_when_a_png_cannot_be_written(
     fake_fitz.pages[0].get_pixmap = lambda *, matrix, alpha: _UnwritableExtent(
         1440, 1080
     )
-    monkeypatch.setattr(render, "fitz", fake_fitz)
+    monkeypatch.setitem(sys.modules, "fitz", fake_fitz)
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
 
     result = await render.render_pptx_to_images(str(deck), durable_workspace.workspace)
@@ -1057,7 +1083,7 @@ async def test_render_two_page_deck_with_real_soffice(
     assert hashlib.sha256(deck_path.read_bytes()).hexdigest() == deck_hash
     rows = _output_rows(durable_workspace.session_factory)
     assert len(rows) == 2
-    assert not list(durable_workspace.storage_root.rglob("*.pdf"))
+    assert len(list(durable_workspace.storage_root.rglob("*.hidden.preview.pdf"))) == 1
     assert not list(pathlib.Path(tempfile.gettempdir()).glob("xagent-pptx-profile-*"))
 
 
@@ -1075,12 +1101,13 @@ def _write_pdf_page(tmp_path, width: float, height: float, name: str):
 
 
 def test_real_rasterizer_default_scale_renders_tall_page(tmp_path):
+    pytest.importorskip("fitz")
     render = _load_render_module()
     pdf_path = _write_pdf_page(tmp_path, 1430.0, 1670.0, "tall.pdf")
     output_dir = tmp_path / "pngs"
     output_dir.mkdir()
 
-    total_pages, pages = render.render_pdf_pages_to_pngs(pdf_path, [1], output_dir)
+    total_pages, pages = _rasterize(render, pdf_path, [1], output_dir)
 
     assert total_pages == 1
     assert len(pages) == 1
@@ -1090,12 +1117,13 @@ def test_real_rasterizer_default_scale_renders_tall_page(tmp_path):
 
 
 def test_real_rasterizer_default_scale_renders_wide_page(tmp_path):
+    pytest.importorskip("fitz")
     render = _load_render_module()
     pdf_path = _write_pdf_page(tmp_path, 1810.0, 1080.0, "wide.pdf")
     output_dir = tmp_path / "pngs"
     output_dir.mkdir()
 
-    total_pages, pages = render.render_pdf_pages_to_pngs(pdf_path, [1], output_dir)
+    total_pages, pages = _rasterize(render, pdf_path, [1], output_dir)
 
     assert total_pages == 1
     assert len(pages) == 1
@@ -1147,8 +1175,9 @@ async def test_render_default_page_boundaries(
 def test_one_sided_explicit_ranges_cannot_escape_the_page_limit():
     render = _load_render_module()
 
-    with pytest.raises(render.PptxRenderArgumentError):
-        render.resolve_page_selection(21, 1, None)
+    selection = render.resolve_page_selection(21, 1, None)
+    assert len(selection.page_numbers) == 20
+    assert selection.truncated
     with pytest.raises(render.PptxRenderArgumentError):
         render.resolve_page_selection(21, None, 21)
     assert list(render.resolve_page_selection(21, 21, None).page_numbers) == [21]
@@ -1285,7 +1314,7 @@ async def test_replaced_render_directory_never_modifies_outside_files(
         return get_pixmap(**kwargs)
 
     fake_fitz.pages[0].get_pixmap = replace_before_write
-    monkeypatch.setattr(render, "fitz", fake_fitz)
+    monkeypatch.setitem(sys.modules, "fitz", fake_fitz)
     result = await render.render_pptx_to_images(str(deck), workspace)
 
     assert {p.name: p.read_bytes() for p in outside.iterdir()} == before
@@ -1495,9 +1524,9 @@ async def test_cancellation_does_not_wait_for_registration(
 @pytest.mark.parametrize("dimensions", [(0, 10), (10, 0), (float("inf"), 10)])
 def test_rasterizer_rejects_invalid_page_dimensions(tmp_path, monkeypatch, dimensions):
     render = _load_render_module()
-    monkeypatch.setattr(render, "fitz", _FakeFitz([dimensions], []))
+    monkeypatch.setitem(sys.modules, "fitz", _FakeFitz([dimensions], []))
     with pytest.raises(render.PptxRenderRasterError, match="dimensions"):
-        render.render_pdf_pages_to_pngs(tmp_path / "deck.pdf", [1], tmp_path)
+        _rasterize(render, tmp_path / "deck.pdf", [1], tmp_path)
 
 
 @pytest.mark.parametrize("start,end", [(0, 2), (-1, 2), (2, 1), (1, 0)])
@@ -1542,7 +1571,9 @@ async def test_oversized_input_has_a_distinct_error(durable_workspace, monkeypat
     render = _load_render_module()
     source = _write_deck(durable_workspace.workspace.input_dir)
     monkeypatch.setattr(render, "get_max_upload_size_bytes", lambda: 1)
-    result = await render.render_pptx_to_images(str(source), durable_workspace.workspace)
+    result = await render.render_pptx_to_images(
+        str(source), durable_workspace.workspace
+    )
     assert result["error_code"] == "input_too_large", result
 
 
@@ -1553,7 +1584,8 @@ async def test_render_cache_reuses_content_and_uses_existing_cleanup(
 ):
     from xagent.web.api.files import _pptx_pdf_cache_path
     from xagent.web.services.uploaded_file_store import (
-        delete_legacy_preview_caches, delete_pptx_pdf_cache,
+        delete_legacy_preview_caches,
+        delete_pptx_pdf_cache,
     )
     from xagent.web.services.uploaded_file_cleanup_resources import capture_previews
 
@@ -1582,10 +1614,13 @@ async def test_render_cache_reuses_content_and_uses_existing_cleanup(
     cached = list(preview.parent.glob("*.hidden.preview.pdf"))
     assert len(cached) == 2
     if registered:
-        captured = capture_previews({
-            "roots": ["", "", str(durable_workspace.storage_root)],
-            "file_id": file_id, "generation": "render-cache-test",
-        })
+        captured = capture_previews(
+            {
+                "roots": ["", "", str(durable_workspace.storage_root)],
+                "file_id": file_id,
+                "generation": "render-cache-test",
+            }
+        )
         assert len(captured) == 3
         delete_pptx_pdf_cache(file_id)
     else:
@@ -1605,7 +1640,7 @@ async def test_cancelled_raster_stops_before_registration(
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
     events = []
     fake = _FakeFitz([(72, 54)] * page_count, events)
-    monkeypatch.setattr(render, "fitz", fake)
+    monkeypatch.setitem(sys.modules, "fitz", fake)
     loop = asyncio.get_running_loop()
     started = asyncio.Event()
     finished = asyncio.Event()
@@ -1638,3 +1673,34 @@ async def test_cancelled_raster_stops_before_registration(
     assert _output_rows(durable_workspace.session_factory) == []
     assert list(workspace.output_dir.iterdir()) == []
     assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_real_soffice_cache_reuses_hidden_export(durable_workspace, monkeypatch):
+    if shutil.which("soffice") is None:
+        pytest.skip("LibreOffice is not installed")
+    from PIL import Image
+
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    source = workspace.input_dir / "cached-hidden.pptx"
+    _write_hidden_middle_deck(source)
+    calls = []
+    convert = render.convert_pptx_to_pdf
+
+    async def observed(*args, **kwargs):
+        calls.append(kwargs)
+        return await convert(*args, **kwargs)
+
+    monkeypatch.setattr(render, "convert_pptx_to_pdf", observed)
+    for number, color in ((2, (20, 180, 60)), (3, (30, 60, 220))):
+        result = await render.render_pptx_to_images(
+            str(source), workspace, start_page=number, end_page=number
+        )
+        assert result["success"], result
+        assert result["total_pages"] == 3
+        with Image.open(result["pages"][0]["file_ref"]["file_path"]) as image:
+            assert image.convert("RGB").getpixel((10, 10)) == color
+    assert len(calls) == 1
+    assert calls[0]["include_hidden_slides"] is True
+    assert len(list(durable_workspace.storage_root.rglob("*.hidden.preview.pdf"))) == 1

@@ -7,6 +7,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -255,9 +256,8 @@ async def test_factory_build_with_sandbox_keeps_the_tool_on_the_host(
         page_numbers,
         output_dir,
         *,
-        output_fd=None,
-        scale=2.0,
-        max_pixels=4_000_000,
+        output_fd,
+        cancelled,
     ):
         output_dir = pathlib.Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -268,11 +268,15 @@ async def test_factory_build_with_sandbox_keeps_the_tool_on_the_host(
             pages.append(
                 render.RenderedPage(page_number=number, path=path, width=1, height=1)
             )
-        return len(page_numbers), pages
+        return pages
 
     monkeypatch.setattr(render, "convert_pptx_to_pdf", convert_pptx_to_pdf)
     monkeypatch.setattr(render, "render_pdf_pages_to_pngs", render_pdf_pages_to_pngs)
-    monkeypatch.setattr(render, "read_pdf_page_count", lambda _path: 1)
+    monkeypatch.setattr(
+        render,
+        "_open_pdf",
+        lambda _path: SimpleNamespace(page_count=1, close=lambda: None),
+    )
     monkeypatch.setattr(
         workspace,
         "register_delivery_file",

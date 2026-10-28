@@ -42,13 +42,17 @@ Behavior and limits:
     - Without start_page/end_page the first 20 slides are rendered; when the
       deck has more slides, truncated is true and the remaining pages are not
       rendered.
+    - With only start_page, at most 20 slides from that page are rendered;
+      truncated is true when later slides remain.
     - An explicit start_page/end_page range is rendered as requested. A range
       over 20 slides is refused instead of being silently rewritten.
     - Every PNG is capped at 4,000,000 pixels. The render scale is lowered to
       fit the cap, so very large slides are downscaled instead of producing an
       oversized raster.
-    - The deck is converted with LibreOffice (soffice) once, with a 60 second
-      conversion timeout. LibreOffice converts the whole deck; the 20 page
+    - The deck is converted with LibreOffice (soffice) on a PDF cache miss,
+      with a 60 second conversion timeout. Repeated page requests reuse a
+      content-keyed export that includes hidden slides, separate from previews.
+      LibreOffice converts the whole deck; the 20 page
       bound only limits the PNG output.
     - This tool runs in the Xagent backend process, which ships LibreOffice;
       it does not run in the sandbox. When soffice is missing the call fails

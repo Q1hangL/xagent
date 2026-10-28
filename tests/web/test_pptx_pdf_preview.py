@@ -99,18 +99,16 @@ class _FakeProcess:
         self.killed = 0
         self.waits = 0
 
-    async def communicate(self):
-        if self._write_pdf is not None:
-            self._write_pdf()
-        return b"", self._stderr
-
     def kill(self) -> None:
         self.killed += 1
 
     async def wait(self):
         self.waits += 1
-        self.returncode = -9
-        return -9
+        if self.killed:
+            self.returncode = -9
+        elif self._write_pdf is not None:
+            self._write_pdf()
+        return self.returncode
 
 
 def _install_fake_process(monkeypatch, process_factory):
@@ -118,7 +116,10 @@ def _install_fake_process(monkeypatch, process_factory):
 
     async def create_subprocess_exec(*arguments, **kwargs):
         calls.append({"arguments": list(arguments), "kwargs": dict(kwargs)})
-        return process_factory(calls)
+        process = process_factory(calls)
+        kwargs["stderr"].write(process._stderr)
+        kwargs["stderr"].flush()
+        return process
 
     monkeypatch.setattr(files.asyncio, "create_subprocess_exec", create_subprocess_exec)
     return calls
