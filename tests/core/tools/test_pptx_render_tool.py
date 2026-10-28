@@ -1583,11 +1583,11 @@ async def test_render_cache_reuses_content_and_uses_existing_cleanup(
     durable_workspace, monkeypatch, registered
 ):
     from xagent.web.api.files import _pptx_pdf_cache_path
+    from xagent.web.services.uploaded_file_cleanup_resources import capture_previews
     from xagent.web.services.uploaded_file_store import (
         delete_legacy_preview_caches,
         delete_pptx_pdf_cache,
     )
-    from xagent.web.services.uploaded_file_cleanup_resources import capture_previews
 
     render = _load_render_module()
     workspace = durable_workspace.workspace

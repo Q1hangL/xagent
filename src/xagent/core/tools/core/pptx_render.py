@@ -32,7 +32,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
 from ....config import get_max_upload_size_bytes
 from ...file_ref import build_workspace_file_ref, parse_file_id_ref
 from ...workspace import ExternalUploadSizeLimitError, TaskWorkspace
