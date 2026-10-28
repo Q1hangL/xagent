@@ -13,8 +13,8 @@ import hashlib
 import math
 import pathlib
 import shutil
-import threading
 import tempfile
+import threading
 from types import SimpleNamespace
 
 import pytest
