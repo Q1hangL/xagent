@@ -242,7 +242,10 @@ async def test_factory_build_with_sandbox_keeps_the_tool_on_the_host(
     deck = workspace.input_dir / "deck.pptx"
     deck.write_bytes(b"PK\x03\x04 synthetic")
 
-    async def convert_pptx_to_pdf(pptx_path, output_dir, *, timeout_seconds=60.0):
+    async def convert_pptx_to_pdf(
+        pptx_path, output_dir, *, timeout_seconds=60.0, include_hidden_slides=False
+    ):
+        assert include_hidden_slides is True
         pdf_path = pathlib.Path(output_dir) / (pathlib.Path(pptx_path).stem + ".pdf")
         pdf_path.write_bytes(b"%PDF-1.4 synthetic")
         return pdf_path
