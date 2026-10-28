@@ -130,6 +130,9 @@ class _FakePixelExtent:
         else:
             pathlib.Path(path).write_bytes(PNG_1X1)
 
+    def pil_save(self, stream, **kwargs) -> None:
+        self.save(stream)
+
 
 class _FakeRect:
     """Rect double that mirrors PyMuPDF's matrix/irect round trip."""
