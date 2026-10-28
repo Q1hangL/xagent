@@ -1581,6 +1581,40 @@ def test_thumbnail_transport_log_suppression_does_not_rewrite_other_threads(
     assert expected in messages
 
 
+@pytest.mark.parametrize("thread_metadata", [True, False])
+def test_thumbnail_transport_privacy_without_thread_metadata(
+    monkeypatch, real_http, caplog, thread_metadata
+):
+    original_log_threads = logging.logThreads
+    with monkeypatch.context() as logging_patch:
+        logging_patch.setattr(logging, "logThreads", thread_metadata)
+        caplog.set_level(logging.DEBUG, logger="urllib3.connectionpool")
+        target = "/log-scope?arbitrary=synthetic-thread-query"
+        api = _install_slides_api(monkeypatch)
+        api.set_thumbnail({"contentUrl": f"https://{_THUMB_HOST}{target}"})
+
+        result = _call_tool(presentation_id="pres1", slide_id="obj1")
+
+        assert result["status"] == "success"
+        assert Path(result["path"]).read_bytes() == _PNG_BYTES
+        assert [request["path"] for request in real_http.seen] == [target]
+        expected = "unrelated https://public.example/item?offset=23&search=synthetic"
+        unrelated = [
+            record for record in caplog.records if record.getMessage() == expected
+        ]
+        assert len(unrelated) == 1
+        assert unrelated[0].msg == expected
+        if thread_metadata:
+            assert isinstance(unrelated[0].thread, int)
+            assert unrelated[0].thread != threading.get_ident()
+        else:
+            assert unrelated[0].thread is None
+        assert "/log-scope" not in caplog.text
+        assert "synthetic-thread-query" not in caplog.text
+        assert "GET /" not in caplog.text
+    assert logging.logThreads is original_log_threads
+
+
 @pytest.mark.parametrize("kind", ["value", "runtime", "http"])
 def test_thumbnail_api_errors_hide_the_full_content_url(monkeypatch, kind):
     content_url = (
