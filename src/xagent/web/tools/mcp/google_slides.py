@@ -1835,14 +1835,16 @@ def _send_thumbnail_request(
     previous = vars(adapter).get("get_connection_with_tls_context")
     tracked_pools: list[tuple[Any, bool, Any]] = []
 
-    def tracked(request, verify, proxies=None, cert=None):
+    def tracked(
+        request: Any, verify: Any, proxies: Any = None, cert: Any = None
+    ) -> Any:
         pool = original(request, verify, proxies=proxies, cert=cert)
         if cancel is not None and hasattr(pool, "_make_request"):
             original_make_request = pool._make_request
             had_pool_attr = "_make_request" in vars(pool)
             previous_make_request = vars(pool).get("_make_request")
 
-            def tracked_make_request(connection, *args, **kwargs):
+            def tracked_make_request(connection: Any, *args: Any, **kwargs: Any) -> Any:
                 cancel.set_interrupter(
                     lambda connection=connection: _shutdown_thumbnail_connection(
                         connection
