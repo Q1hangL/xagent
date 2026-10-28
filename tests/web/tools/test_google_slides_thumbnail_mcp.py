@@ -1509,10 +1509,12 @@ def test_thumbnail_concurrent_downloads_are_capped(monkeypatch, tmp_path):
         thread.start()
     try:
         observed = _wait_until(
-            lambda: len(entered) >= 4
-            and any(
-                "concurrent" in str(result.get("message", ""))
-                for result in results.values()
+            lambda: (
+                len(entered) >= 4
+                and any(
+                    "concurrent" in str(result.get("message", ""))
+                    for result in results.values()
+                )
             ),
             2.0,
         )
@@ -1529,7 +1531,12 @@ def test_thumbnail_concurrent_downloads_are_capped(monkeypatch, tmp_path):
     assert len(results) == 5
     assert sum(result["status"] == "success" for result in results.values()) == 4
     assert sum(result["status"] == "error" for result in results.values()) == 1
-    assert not list((tmp_path / "output").glob("*.png")) or True
+    paths = {
+        result["path"] for result in results.values() if result["status"] == "success"
+    }
+    assert len(paths) == 4
+    assert {str(path) for path in (tmp_path / "output").glob("*.png")} == paths
+    assert all(Path(path).read_bytes() == _PNG_BYTES for path in paths)
 
 
 @pytest.mark.parametrize(
@@ -1630,3 +1637,420 @@ def test_thumbnail_rejects_a_replaced_output_directory(monkeypatch, tmp_path):
     assert result["status"] == "error"
     assert not list(outside.glob("*.png"))
     assert not list(moved_dir.glob("*.png"))
+
+
+@pytest.mark.parametrize("scheme", ["HTTPS", "hTtPs"])
+@pytest.mark.parametrize("kind", ["value", "runtime", "http"])
+def test_thumbnail_error_redaction_accepts_mixed_case_schemes(
+    monkeypatch, caplog, scheme, kind
+):
+    content_url = (
+        f"{scheme}://{_THUMB_HOST}/synthetic-case-path?arbitrary=synthetic-case-query"
+    )
+    assert _validate_thumbnail_url(content_url) == content_url
+    api = _install_slides_api(monkeypatch)
+    api.set_thumbnail(error=_signed_api_error(content_url)[kind]())
+
+    result = _call_tool(presentation_id="pres1", slide_id="obj1")
+
+    assert result["status"] == "error"
+    for secret in (_THUMB_HOST, "synthetic-case-path", "synthetic-case-query"):
+        assert secret not in json.dumps(result)
+        assert secret not in caplog.text
+
+
+def test_thumbnail_download_slots_follow_worker_lifetime(monkeypatch, tmp_path):
+    _install_slides_api(monkeypatch)
+    monkeypatch.setattr(google_slides, "_THUMBNAIL_TIMEOUT_SECONDS", 0.08)
+    monkeypatch.setattr(google_slides, "_THUMBNAIL_TIMEOUT_GRACE_SECONDS", 0.02)
+    release = threading.Event()
+    entered = []
+
+    def blocked_send(session, request, **kwargs):
+        entered.append(threading.current_thread())
+        assert release.wait(10)
+        return _http_response(_PNG_BYTES)
+
+    monkeypatch.setattr(google_slides, "_send_thumbnail_request", blocked_send)
+    observations = []
+    try:
+        for _ in range(7):
+            start = time.monotonic()
+            result = _call_tool(presentation_id="pres1", slide_id="obj1")
+            observations.append(
+                (result, len(_download_worker_threads()), time.monotonic() - start)
+            )
+        assert len(entered) == 4
+        assert [count for _, count, _ in observations] == [1, 2, 3, 4, 4, 4, 4]
+        for result, _, _ in observations[:4]:
+            assert result["status"] == "error"
+            assert "timed out" in result["message"]
+        for result, _, elapsed in observations[4:]:
+            assert result["status"] == "error"
+            assert "concurrent" in result["message"]
+            assert elapsed < 0.2
+    finally:
+        release.set()
+        for thread in entered:
+            thread.join(timeout=3)
+    assert not _download_worker_threads()
+    assert not list((tmp_path / "output").glob("*.png"))
+    _install_http(monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES))
+    assert _call_tool(presentation_id="pres1", slide_id="obj1")["status"] == "success"
+
+
+def test_thumbnail_thread_start_failure_returns_its_slot(monkeypatch):
+    original_start = threading.Thread.start
+
+    def refuse_start(thread):
+        if thread.name == "google-slides-thumbnail":
+            raise RuntimeError("synthetic thread start refusal")
+        return original_start(thread)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(threading.Thread, "start", refuse_start)
+        for _ in range(5):
+            with pytest.raises(RuntimeError, match="synthetic thread start refusal"):
+                google_slides._download_thumbnail_image(_THUMB_URL)
+    _install_http(monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES))
+    assert google_slides._download_thumbnail_image(_THUMB_URL) == _PNG_BYTES
+
+
+@pytest.fixture
+def isolated_thumbnail_resolver(monkeypatch):
+    executor = ThreadPoolExecutor(
+        max_workers=2, thread_name_prefix="thumbnail-test-dns"
+    )
+    monkeypatch.setattr(google_slides, "_THUMBNAIL_DNS_EXECUTOR", executor)
+    monkeypatch.setattr(
+        google_slides,
+        "_THUMBNAIL_DNS_SLOTS",
+        threading.BoundedSemaphore(2),
+        raising=False,
+    )
+    try:
+        yield executor
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_thumbnail_saturated_resolver_rejects_without_queueing(
+    monkeypatch, isolated_thumbnail_resolver
+):
+    release = threading.Event()
+    entered = []
+    original_getaddrinfo = socket.getaddrinfo
+
+    def blocked(host, port, *args, **kwargs):
+        entered.append(threading.current_thread())
+        assert release.wait(10)
+        return original_getaddrinfo("127.0.0.1", port, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", blocked)
+    monkeypatch.setattr(google_slides, "_THUMBNAIL_TIMEOUT_SECONDS", 0.12)
+    observations = []
+    try:
+        for _ in range(8):
+            start = time.monotonic()
+            with pytest.raises(google_slides._ThumbnailDownloadError) as caught:
+                google_slides._download_thumbnail_image(_THUMB_URL)
+            observations.append(
+                (
+                    str(caught.value),
+                    isolated_thumbnail_resolver._work_queue.qsize(),
+                    time.monotonic() - start,
+                )
+            )
+        assert len(entered) == 2
+        assert len(isolated_thumbnail_resolver._threads) == 2
+        assert [queued for _, queued, _ in observations] == [0] * 8
+        assert all("timed out" in message for message, _, _ in observations[:2])
+        for message, _, elapsed in observations[2:]:
+            assert "resolver is busy" in message
+            assert elapsed < 0.1
+        assert not _download_worker_threads()
+    finally:
+        release.set()
+
+
+def test_thumbnail_trusted_proxy_dns_has_a_bounded_lifetime(
+    monkeypatch, real_http, isolated_thumbnail_resolver, tmp_path
+):
+    proxy_host = "thumbnail-proxy.invalid"
+    monkeypatch.setenv(
+        "HTTPS_PROXY", f"http://{proxy_host}:{real_http.server.server_port}"
+    )
+    monkeypatch.setattr(
+        google_slides.requests, "get_trusted_egress_proxy_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        google_slides, "_new_thumbnail_session", google_slides.requests.Session
+    )
+    monkeypatch.setattr(google_slides, "_THUMBNAIL_TIMEOUT_SECONDS", 0.15)
+    release = threading.Event()
+    proxy_threads = []
+    original_getaddrinfo = socket.getaddrinfo
+
+    def controlled_dns(host, port, *args, **kwargs):
+        if host == _THUMB_HOST:
+            return [
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    socket.IPPROTO_TCP,
+                    "",
+                    ("93.184.216.34", port),
+                )
+            ]
+        if host == proxy_host:
+            proxy_threads.append(threading.current_thread())
+            assert release.wait(15)
+            return original_getaddrinfo("127.0.0.1", port, *args, **kwargs)
+        assert host == "127.0.0.1"
+        return original_getaddrinfo(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", controlled_dns)
+    observations = []
+    try:
+        for _ in range(6):
+            start = time.monotonic()
+            with pytest.raises(google_slides._ThumbnailDownloadError) as caught:
+                google_slides._download_thumbnail_image(_THUMB_URL)
+            observations.append(
+                (
+                    str(caught.value),
+                    len(_download_worker_threads()),
+                    time.monotonic() - start,
+                )
+            )
+        assert proxy_threads
+        assert max(count for _, count, _ in observations) <= 4
+        assert all(count == 0 for _, count, _ in observations)
+        assert len(proxy_threads) == 2
+        assert all(
+            thread in isolated_thumbnail_resolver._threads for thread in proxy_threads
+        )
+        assert all(elapsed < 0.6 for _, _, elapsed in observations)
+        assert all("resolver is busy" in message for message, _, _ in observations[2:])
+        assert isolated_thumbnail_resolver._work_queue.qsize() == 0
+    finally:
+        release.set()
+        for thread in _download_worker_threads():
+            thread.join(timeout=3)
+    assert not _download_worker_threads()
+    assert not list(tmp_path.rglob("*.png"))
+
+
+@pytest.mark.parametrize("first_fails", [False, True], ids=["success", "error"])
+def test_thumbnail_interleaved_download_exit_keeps_transport_logs_private(
+    monkeypatch, real_http, caplog, first_fails
+):
+    caplog.set_level(logging.DEBUG, logger="urllib3.connectionpool")
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    paused = threading.Event()
+    resume = threading.Event()
+    secret = "synthetic-interleaved-path"
+    query = "synthetic-interleaved-query"
+    original_filter = google_slides._ThreadScopedTransportLogSuppressor.filter
+
+    def scheduled_filter(self, record):
+        decision = original_filter(self, record)
+        if secret in record.getMessage() and not paused.is_set():
+            paused.set()
+            assert resume.wait(8)
+        return decision
+
+    class HeldAdapter(_LoopbackAdapter):
+        def send(self, request, **kwargs):
+            response = super().send(request, **kwargs)
+            if urlsplit(request.url).path == "/hold-first":
+                first_entered.set()
+                try:
+                    assert release_first.wait(8)
+                    if first_fails:
+                        raise requests.ConnectionError(
+                            "synthetic transfer interruption"
+                        )
+                except BaseException:
+                    response.close()
+                    raise
+            return response
+
+    def factory():
+        session = google_slides.requests.Session()
+        session.mount(
+            "https://", HeldAdapter(real_http.server.server_port, real_http.responses)
+        )
+        return session
+
+    monkeypatch.setattr(
+        google_slides._ThreadScopedTransportLogSuppressor, "filter", scheduled_filter
+    )
+    monkeypatch.setattr(google_slides, "_new_thumbnail_session", factory)
+    with ThreadPoolExecutor(max_workers=2) as callers:
+        first = callers.submit(
+            google_slides._download_thumbnail_image,
+            f"https://{_THUMB_HOST}/hold-first",
+        )
+        try:
+            assert first_entered.wait(3)
+            second = callers.submit(
+                google_slides._download_thumbnail_image,
+                f"https://{_THUMB_HOST}/{secret}?arbitrary={query}",
+            )
+            assert paused.wait(3)
+            unrelated = "unrelated https://public.example/item?offset=23"
+            logging.getLogger("urllib3.connectionpool").warning(unrelated)
+            release_first.set()
+            if first_fails:
+                with pytest.raises(google_slides._ThumbnailDownloadError):
+                    first.result(timeout=3)
+            else:
+                assert first.result(timeout=3) == _PNG_BYTES
+            resume.set()
+            assert second.result(timeout=3) == _PNG_BYTES
+        finally:
+            release_first.set()
+            resume.set()
+    assert len(real_http.seen) == 2
+    assert secret not in caplog.text
+    assert query not in caplog.text
+    assert unrelated in [record.getMessage() for record in caplog.records]
+    logging.getLogger("urllib3.connectionpool").warning("after transfer")
+    assert "after transfer" in caplog.text
+
+
+@pytest.mark.parametrize("instance_override", [False, True])
+@pytest.mark.parametrize("retry_fails", [False, True])
+def test_thumbnail_repeated_pool_retry_restores_initial_state(
+    monkeypatch, real_http, instance_override, retry_fails
+):
+    from urllib3.connection import HTTPConnection
+    from urllib3.exceptions import NewConnectionError
+
+    attempts = []
+
+    class FirstConnectionRefused(HTTPConnection):
+        def _new_conn(self):
+            attempts.append(len(attempts) + 1)
+            if len(attempts) == 1 or retry_fails:
+                raise NewConnectionError(self, "synthetic connection refusal")
+            return super()._new_conn()
+
+    class LocalPublicAdapter(google_slides.requests._PublicAdapter):
+        def __init__(self):
+            super().__init__()
+            self.targets = []
+            self.pool = self.poolmanager.connection_from_host(
+                "127.0.0.1", real_http.server.server_port, scheme="http"
+            )
+            self.pool.ConnectionCls = FirstConnectionRefused
+
+        def _resolve_addresses(self, url):
+            return ["93.184.216.34", "93.184.216.34"]
+
+        def get_connection_with_tls_context(
+            self, request, verify, proxies=None, cert=None
+        ):
+            self.targets.append(self._destination.get())
+            return self.pool
+
+        def cert_verify(self, *args, **kwargs):
+            pass
+
+    session = google_slides.requests.Session()
+    adapter = LocalPublicAdapter()
+    session.mount("https://", adapter)
+    if instance_override:
+        original = adapter.pool._make_request
+
+        def override(*args, **kwargs):
+            return original(*args, **kwargs)
+
+        adapter.pool._make_request = override
+    before_pool = vars(adapter.pool).copy()
+    before_adapter = vars(adapter).copy()
+    cancel = google_slides._ThumbnailCancelToken()
+    prepared = session.prepare_request(requests.Request("GET", _THUMB_URL))
+    try:
+        if retry_fails:
+            with pytest.raises(requests.ConnectionError):
+                google_slides._send_thumbnail_request(
+                    session, prepared, timeout=(2, 2), cancel=cancel
+                )
+        else:
+            response = google_slides._send_thumbnail_request(
+                session, prepared, timeout=(2, 2), cancel=cancel
+            )
+            try:
+                assert response.content == _PNG_BYTES
+            finally:
+                response.close()
+        assert attempts == [1, 2]
+        assert adapter.targets == [("93.184.216.34", False)] * 2
+        assert len(real_http.seen) == (0 if retry_fails else 1)
+        assert ("_make_request" in vars(adapter.pool)) == (
+            "_make_request" in before_pool
+        )
+        assert vars(adapter.pool).get("_make_request") is before_pool.get(
+            "_make_request"
+        )
+        assert vars(adapter).get(
+            "get_connection_with_tls_context"
+        ) is before_adapter.get("get_connection_with_tls_context")
+        assert cancel._interrupter is None
+    finally:
+        session.close()
+
+
+def test_thumbnail_moved_output_is_detected_after_write_and_removed(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_OUTPUT_DIR", str(workspace))
+    output = workspace / "output"
+    output.mkdir()
+    moved = tmp_path / "moved-output"
+    _install_slides_api(monkeypatch)
+    _install_http(monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES))
+    original_open = google_slides._open_thumbnail_output_file
+    original_fdopen = google_slides.os.fdopen
+    observed = []
+
+    def move_then_open(*args, **kwargs):
+        output.rename(moved)
+        output.mkdir()
+        return original_open(*args, **kwargs)
+
+    class ObservedWrite:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.handle.__exit__(*args)
+
+        def write(self, data):
+            count = self.handle.write(data)
+            self.handle.flush()
+            observed.append((moved / "slide_obj1.png").read_bytes())
+            return count
+
+    monkeypatch.setattr(google_slides, "_open_thumbnail_output_file", move_then_open)
+    monkeypatch.setattr(
+        google_slides.os,
+        "fdopen",
+        lambda *args, **kwargs: ObservedWrite(original_fdopen(*args, **kwargs)),
+    )
+    result = _call_tool(presentation_id="pres1", slide_id="obj1")
+
+    assert observed == [_PNG_BYTES]
+    assert not moved.is_relative_to(workspace)
+    assert result["status"] == "error"
+    assert "output directory changed" in result["message"]
+    assert not list(moved.glob("*.png"))
+    assert not list(output.glob("*.png"))
