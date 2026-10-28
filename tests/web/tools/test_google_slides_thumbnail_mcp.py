@@ -2054,3 +2054,169 @@ def test_thumbnail_moved_output_is_detected_after_write_and_removed(
     assert "output directory changed" in result["message"]
     assert not list(moved.glob("*.png"))
     assert not list(output.glob("*.png"))
+
+
+@pytest.mark.parametrize("proxy_scheme", ["http", "https"])
+def test_thumbnail_trusted_proxy_preserves_verified_tls_and_downloads_png(
+    monkeypatch, tmp_path, caplog, proxy_scheme
+):
+    import select
+    import ssl
+    from datetime import datetime, timedelta, timezone
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    proxy_host = "thumbnail-proxy.invalid"
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name(
+        [x509.NameAttribute(NameOID.COMMON_NAME, "local thumbnail fixture")]
+    )
+    now = datetime.now(timezone.utc)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(
+            x509.SubjectAlternativeName(
+                [x509.DNSName(_THUMB_HOST), x509.DNSName(proxy_host)]
+            ),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    cert_path = tmp_path / "local-cert.pem"
+    key_path = tmp_path / "local-key.pem"
+    cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_path, key_path)
+    tls_names = []
+    context.set_servername_callback(lambda sock, name, ctx: tls_names.append(name))
+    seen = []
+    tunnels = []
+    stop = threading.Event()
+
+    class ImageHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            seen.append((self.path, dict(self.headers)))
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(_PNG_BYTES)))
+            self.end_headers()
+            self.wfile.write(_PNG_BYTES)
+
+    origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ImageHandler)
+    origin.socket = context.wrap_socket(origin.socket, server_side=True)
+
+    class ProxyHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_CONNECT(self):
+            tunnels.append(self.path)
+            # The fixture only forwards to its own loopback image server.
+            with socket.create_connection(
+                ("127.0.0.1", origin.server_port), 3
+            ) as upstream:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.flush()
+                endpoints = (self.connection, upstream)
+                while not stop.is_set():
+                    ready, _, _ = select.select(endpoints, [], [], 0.1)
+                    for endpoint in ready:
+                        try:
+                            data = endpoint.recv(65536)
+                            if not data:
+                                return
+                            other = (
+                                upstream
+                                if endpoint is self.connection
+                                else self.connection
+                            )
+                            other.sendall(data)
+                        except OSError:
+                            return
+
+    proxy = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+    if proxy_scheme == "https":
+        proxy.socket = context.wrap_socket(proxy.socket, server_side=True)
+    serving = [
+        threading.Thread(target=server.serve_forever, daemon=True)
+        for server in (origin, proxy)
+    ]
+    for thread in serving:
+        thread.start()
+    real_getaddrinfo = socket.getaddrinfo
+    dns_calls = []
+
+    def controlled_dns(host, port, *args, **kwargs):
+        dns_calls.append((host, threading.current_thread().name))
+        if host == _THUMB_HOST:
+            return [
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    socket.IPPROTO_TCP,
+                    "",
+                    ("93.184.216.34", port),
+                )
+            ]
+        if host == proxy_host:
+            return real_getaddrinfo("127.0.0.1", port, *args, **kwargs)
+        assert host == "127.0.0.1"
+        return real_getaddrinfo(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", controlled_dns)
+    monkeypatch.setenv("XAGENT_TRUSTED_EGRESS_PROXY", "true")
+    monkeypatch.setenv(
+        "HTTPS_PROXY", f"{proxy_scheme}://{proxy_host}:{proxy.server_port}"
+    )
+    monkeypatch.setenv("SSL_CERT_FILE", str(cert_path))
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(cert_path))
+    monkeypatch.setattr(google_slides, "_THUMBNAIL_TIMEOUT_SECONDS", 3.0)
+    caplog.set_level(logging.DEBUG, logger="urllib3.connectionpool")
+    api = _install_slides_api(monkeypatch)
+    api.set_thumbnail({"contentUrl": f"https://{_THUMB_HOST}/synthetic-proxy-image"})
+    try:
+        result = _call_tool(presentation_id="pres1", slide_id="obj1")
+        assert result["status"] == "success", result
+        assert Path(result["path"]).read_bytes() == _PNG_BYTES
+        assert tunnels == [f"{_THUMB_HOST}:443"]
+        assert len(seen) == 1
+        assert seen[0][0] == "/synthetic-proxy-image"
+        assert seen[0][1]["Host"] == _THUMB_HOST
+        assert "Authorization" not in seen[0][1]
+        assert "Cookie" not in seen[0][1]
+        assert tls_names == (
+            [proxy_host, _THUMB_HOST] if proxy_scheme == "https" else [_THUMB_HOST]
+        )
+        for host in (_THUMB_HOST, proxy_host):
+            resolutions = [thread for resolved, thread in dns_calls if resolved == host]
+            assert len(resolutions) == 1
+            assert resolutions[0].startswith("google-slides-dns")
+        assert "synthetic-proxy-image" not in caplog.text
+        assert not _download_worker_threads()
+    finally:
+        stop.set()
+        for server in (proxy, origin):
+            server.shutdown()
+            server.server_close()
+        for thread in serving:
+            thread.join(timeout=3)
