@@ -1505,7 +1505,6 @@ def test_thumbnail_concurrent_downloads_are_capped(monkeypatch, tmp_path):
             results[index] = {"status": "exception", "message": str(exc)}
 
     threads = [threading.Thread(target=_call, args=(index,)) for index in range(5)]
-    started = time.monotonic()
     for thread in threads:
         thread.start()
     try:
