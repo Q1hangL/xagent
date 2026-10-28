@@ -2072,3 +2072,211 @@ async def test_delegated_registration_exception_keeps_uncertain_images(
     assert result["unverified_pages"] == [1, 2]
     assert all(page.path.is_file() for batch in batches for page in batch)
     assert len(_output_rows(durable_workspace.session_factory)) == int(commit_first)
+
+
+_REGISTRATION_SHUTDOWN_CHILD = r"""
+import asyncio
+import json
+import os
+import threading
+from pathlib import Path
+
+from pytest import MonkeyPatch
+
+from xagent.core.tools.core import pptx_render as render
+from tests.core.tools.test_pptx_render_tool import (
+    durable_workspace,
+    _write_deck,
+    _install_conversion,
+    _install_rasterizer,
+    _output_rows,
+)
+
+root = Path(os.environ["REGISTRATION_TEST_ROOT"])
+mode = os.environ["REGISTRATION_TEST_MODE"]
+fail_after_commit = os.environ["REGISTRATION_TEST_FAILURE"] == "true"
+patch = MonkeyPatch()
+fixture_generator = durable_workspace.__wrapped__(monkeypatch=patch, tmp_path=root)
+fixture = next(fixture_generator)
+workspace = fixture.workspace
+started = threading.Event()
+release = threading.Event()
+committed = threading.Event()
+worker_finished = threading.Event()
+observed = {}
+tasks = []
+release_timer = None
+
+_install_conversion(patch, render, calls=[], timeout_records=[])
+_install_rasterizer(patch, render, page_count=2, requested=[], rendered=[])
+deck = _write_deck(workspace.input_dir)
+original_apply = workspace._apply_prepared_file_registrations
+original_register = render._register_rendered_pages
+original_delete = render._delete_unregistered_outputs
+
+
+def row_snapshot():
+    return [
+        {
+            "id": str(row.file_id),
+            "path": row.storage_path,
+            "exists": Path(row.storage_path).is_file(),
+            "status": row.storage_status,
+        }
+        for row in _output_rows(fixture.session_factory)
+    ]
+
+
+def delayed_apply(prepared, **kwargs):
+    started.set()
+    assert release.wait(10), "registration was never released"
+    result = original_apply(prepared, **kwargs)
+    committed.set()
+    if fail_after_commit:
+        raise OSError("registration acknowledgement failed after commit")
+    return result
+
+
+def observed_registration(*args, **kwargs):
+    try:
+        return original_register(*args, **kwargs)
+    finally:
+        worker_finished.set()
+
+
+def observed_delete(pages, unregistered):
+    observed["worker_finished_before_cleanup"] = worker_finished.is_set()
+    release.set()
+    assert committed.wait(10), "registration did not commit before deletion"
+    assert worker_finished.wait(10), "registration thread did not finish"
+    observed["before_delete"] = row_snapshot()
+    observed["delete_pages"] = sorted(unregistered)
+    original_delete(pages, unregistered)
+
+
+patch.setattr(workspace, "_apply_prepared_file_registrations", delayed_apply)
+patch.setattr(render, "_register_rendered_pages", observed_registration)
+patch.setattr(render, "_delete_unregistered_outputs", observed_delete)
+
+
+async def main():
+    global release_timer
+    task = asyncio.create_task(render.render_pptx_to_images(str(deck), workspace))
+    tasks.append(task)
+    for _ in range(1000):
+        if started.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert started.is_set(), "the real registration stage was not reached"
+    assert not task.done()
+    release_timer = threading.Timer(1, release.set)
+    release_timer.start()
+    if mode == "cancel_await":
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    # In shutdown mode asyncio.run cancels every pending Task itself.
+
+
+try:
+    asyncio.run(main())
+    observed["cancelled"] = tasks[0].cancelled()
+    observed["worker_finished"] = worker_finished.is_set()
+    observed["after_shutdown"] = row_snapshot()
+    (root / "observations.json").write_text(json.dumps(observed, indent=2))
+finally:
+    release.set()
+    if release_timer is not None:
+        release_timer.join()
+    try:
+        next(fixture_generator)
+    except StopIteration:
+        pass
+    patch.undo()
+"""
+
+
+@pytest.mark.parametrize("mode", ["shutdown", "cancel_await"])
+@pytest.mark.parametrize("fail_after_commit", [False, True])
+def test_registration_shutdown_keeps_committed_local_pngs(
+    tmp_path, mode, fail_after_commit
+):
+    import json
+    import sqlite3
+
+    environment = dict(os.environ)
+    source_root = _render_lifecycle_source_root()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        part for part in (source_root, os.environ.get("PYTHONPATH", "")) if part
+    )
+    environment.update(
+        REGISTRATION_TEST_ROOT=str(tmp_path),
+        REGISTRATION_TEST_MODE=mode,
+        REGISTRATION_TEST_FAILURE=str(fail_after_commit).lower(),
+        HOME=str(tmp_path / "home"),
+        TMPDIR=str(tmp_path / "tmp"),
+        XAGENT_STORAGE_ROOT=str(tmp_path / "storage"),
+    )
+    (tmp_path / "home").mkdir()
+    (tmp_path / "tmp").mkdir()
+    for key in list(environment):
+        if key.lower().endswith("_proxy") or key in {
+            "XAGENT_TEST_REDIS_URL",
+            "MILVUS_URI",
+        }:
+            environment.pop(key)
+    completed = subprocess.run(
+        [sys.executable, "-B", "-c", _REGISTRATION_SHUTDOWN_CHILD],
+        cwd=str(pathlib.Path(source_root).parent),
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    combined = completed.stdout + completed.stderr
+    assert completed.returncode == 0, combined
+    observed = json.loads((tmp_path / "observations.json").read_text())
+    assert observed["cancelled"] and observed["worker_finished"], observed
+    assert len(observed["before_delete"]) == 2, observed
+    assert all(
+        row["exists"] and row["status"] == "available"
+        for row in observed["before_delete"]
+    ), observed
+    with sqlite3.connect(tmp_path / "metadata.db") as database:
+        rows = database.execute(
+            "SELECT file_id, storage_path, storage_status FROM uploaded_files"
+        ).fetchall()
+    assert len(rows) == 2, observed
+    assert all(status == "available" for _, _, status in rows), rows
+    assert all(pathlib.Path(path).is_file() for _, path, _ in rows), (
+        "normal shutdown deleted local PNGs after their records committed",
+        observed,
+    )
+    assert observed["worker_finished_before_cleanup"], observed
+    assert observed["delete_pages"] == [], observed
+    for warning in (
+        "Task was destroyed but it is pending",
+        "Task exception was never retrieved",
+        "Future exception was never retrieved",
+    ):
+        assert warning not in combined, combined
+
+
+@pytest.mark.asyncio
+async def test_blocking_operation_preserves_context_and_runs_off_loop():
+    from contextvars import ContextVar
+
+    render = _load_render_module()
+    value = ContextVar("render_context", default="missing")
+    token = value.set("workspace-context")
+    loop_thread = threading.get_ident()
+    try:
+        observed = await render._run_blocking(
+            lambda: (value.get(), threading.get_ident())
+        )
+    finally:
+        value.reset(token)
+    assert observed[0] == "workspace-context"
+    assert observed[1] != loop_thread
