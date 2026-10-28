@@ -767,3 +767,27 @@ async def test_converter_group_teardown_is_bounded_with_inherited_pipes(
         if not task.done():
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+def test_hidden_slide_export_is_an_explicit_impress_filter_option(tmp_path):
+    import inspect
+
+    conversion = _load_conversion_module()
+    assert (
+        "include_hidden_slides"
+        in inspect.signature(conversion.build_soffice_arguments).parameters
+    )
+    default = conversion.build_soffice_arguments(
+        tmp_path / "deck.pptx", tmp_path, tmp_path
+    )
+    assert default[default.index("--convert-to") + 1] == "pdf"
+    enabled = conversion.build_soffice_arguments(
+        tmp_path / "deck.pptx", tmp_path, tmp_path, include_hidden_slides=True
+    )
+    extension, filter_name, options = enabled[enabled.index("--convert-to") + 1].split(
+        ":", 2
+    )
+    assert (extension, filter_name) == ("pdf", "impress_pdf_Export")
+    assert json.loads(options) == {
+        "ExportHiddenSlides": {"type": "boolean", "value": "true"}
+    }

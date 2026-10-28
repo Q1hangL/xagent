@@ -195,7 +195,9 @@ class _FakeFitz:
 
 
 def _install_conversion(monkeypatch, render, *, calls, timeout_records):
-    async def convert_pptx_to_pdf(pptx_path, output_dir, *, timeout_seconds=60.0):
+    async def convert_pptx_to_pdf(
+        pptx_path, output_dir, *, timeout_seconds=60.0, include_hidden_slides=False
+    ):
         calls.append(pathlib.Path(pptx_path))
         timeout_records.append(timeout_seconds)
         pdf_path = output_dir / (pathlib.Path(pptx_path).stem + ".pdf")
@@ -864,7 +866,9 @@ async def test_render_cancellation_reclaims_the_subprocess_and_cleans_up(
     started = asyncio.Event()
     seen: dict[str, pathlib.Path] = {}
 
-    async def convert_pptx_to_pdf(pptx_path, output_dir, *, timeout_seconds=60.0):
+    async def convert_pptx_to_pdf(
+        pptx_path, output_dir, *, timeout_seconds=60.0, include_hidden_slides=False
+    ):
         seen["temp_root"] = pathlib.Path(output_dir).parent
         seen["pdf_dir"] = pathlib.Path(output_dir)
         started.set()
@@ -901,7 +905,9 @@ async def test_concurrent_renders_use_isolated_directories(
     arrived = asyncio.Event()
     in_flight = 0
 
-    async def convert_pptx_to_pdf(pptx_path, output_dir, *, timeout_seconds=60.0):
+    async def convert_pptx_to_pdf(
+        pptx_path, output_dir, *, timeout_seconds=60.0, include_hidden_slides=False
+    ):
         nonlocal in_flight
         in_flight += 1
         if in_flight == 2:
@@ -952,7 +958,9 @@ async def test_render_fails_clearly_when_libreoffice_is_missing(
     conversion = _load_conversion_module()
     deck = _write_deck(durable_workspace.workspace.input_dir)
 
-    async def convert_pptx_to_pdf(pptx_path, output_dir, *, timeout_seconds=60.0):
+    async def convert_pptx_to_pdf(
+        pptx_path, output_dir, *, timeout_seconds=60.0, include_hidden_slides=False
+    ):
         raise conversion.PptxConverterUnavailableError(
             "LibreOffice is not installed or not on PATH"
         )
@@ -976,7 +984,9 @@ async def test_render_reports_conversion_timeout_and_cleans_up(
     conversion = _load_conversion_module()
     deck = _write_deck(durable_workspace.workspace.input_dir)
 
-    async def convert_pptx_to_pdf(pptx_path, output_dir, *, timeout_seconds=60.0):
+    async def convert_pptx_to_pdf(
+        pptx_path, output_dir, *, timeout_seconds=60.0, include_hidden_slides=False
+    ):
         raise conversion.PptxConversionTimeoutError(
             "LibreOffice conversion timed out after 60 seconds"
         )
@@ -998,7 +1008,9 @@ async def test_render_reports_conversion_failure_and_cleans_up(
     conversion = _load_conversion_module()
     deck = _write_deck(durable_workspace.workspace.input_dir)
 
-    async def convert_pptx_to_pdf(pptx_path, output_dir, *, timeout_seconds=60.0):
+    async def convert_pptx_to_pdf(
+        pptx_path, output_dir, *, timeout_seconds=60.0, include_hidden_slides=False
+    ):
         raise conversion.PptxConversionFailedError("soffice exited 1")
 
     monkeypatch.setattr(render, "convert_pptx_to_pdf", convert_pptx_to_pdf)
@@ -1017,7 +1029,9 @@ async def test_render_reports_a_bad_pdf_and_cleans_up(
     render = _load_render_module()
     deck = _write_deck(durable_workspace.workspace.input_dir)
 
-    async def convert_pptx_to_pdf(pptx_path, output_dir, *, timeout_seconds=60.0):
+    async def convert_pptx_to_pdf(
+        pptx_path, output_dir, *, timeout_seconds=60.0, include_hidden_slides=False
+    ):
         pdf_path = pathlib.Path(output_dir) / (pathlib.Path(pptx_path).stem + ".pdf")
         pdf_path.write_bytes(b"this is not a pdf")
         return pdf_path
@@ -2348,3 +2362,86 @@ async def test_replaced_render_directory_never_modifies_outside_files(
     if stage == "registration":
         assert (moved / "slide_001.png").read_bytes() == PNG_1X1
         assert len(_output_rows(durable_workspace.session_factory)) == 1
+
+
+@pytest.mark.asyncio
+async def test_render_enables_hidden_slides_for_pdf_export(
+    durable_workspace, monkeypatch
+):
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    source = _write_deck(workspace.input_dir)
+    options = []
+
+    async def convert(source, output, **kwargs):
+        options.append(kwargs)
+        pdf = output / "deck.pdf"
+        pdf.write_bytes(b"%PDF synthetic")
+        return pdf
+
+    monkeypatch.setattr(render, "convert_pptx_to_pdf", convert)
+    _install_rasterizer(monkeypatch, render, page_count=3, requested=[], rendered=[])
+    result = await render.render_pptx_to_images(str(source), workspace)
+    assert result["success"] is True, result
+    assert options[0].get("include_hidden_slides") is True
+
+
+def _write_hidden_middle_deck(path):
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.util import Inches
+
+    presentation = Presentation()
+    for number, color in enumerate([(220, 30, 40), (20, 180, 60), (30, 60, 220)], 1):
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        slide.background.fill.solid()
+        slide.background.fill.fore_color.rgb = RGBColor(*color)
+        text = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(4), Inches(1))
+        text.text_frame.text = f"Source slide {number}"
+        if number == 2:
+            slide._element.set("show", "0")
+    presentation.save(str(path))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page_number, color", [(2, (20, 180, 60)), (3, (30, 60, 220))])
+async def test_real_soffice_preserves_hidden_source_slide_numbers(
+    durable_workspace, page_number, color
+):
+    if shutil.which("soffice") is None:
+        pytest.skip("LibreOffice is not installed")
+    from PIL import Image
+
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    source = workspace.input_dir / "hidden-middle.pptx"
+    _write_hidden_middle_deck(source)
+    original = hashlib.sha256(source.read_bytes()).hexdigest()
+    result = await render.render_pptx_to_images(
+        str(source), workspace, start_page=page_number, end_page=page_number
+    )
+    assert result["success"] is True, result
+    assert result["total_pages"] == 3
+    assert result["page_numbers"] == [page_number]
+    rows = _output_rows(durable_workspace.session_factory)
+    assert len(rows) == 1 and rows[0].storage_status == "available"
+    with Image.open(rows[0].storage_path) as image:
+        assert image.convert("RGB").getpixel((10, 10)) == color
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == original
+
+
+@pytest.mark.asyncio
+async def test_real_soffice_preview_keeps_default_hidden_slide_behavior(tmp_path):
+    if shutil.which("soffice") is None:
+        pytest.skip("LibreOffice is not installed")
+    import fitz
+
+    conversion = _load_conversion_module()
+    source = tmp_path / "hidden-middle.pptx"
+    _write_hidden_middle_deck(source)
+    output = tmp_path / "pdf"
+    output.mkdir()
+    pdf = await conversion.convert_pptx_to_pdf(source, output)
+    with fitz.open(pdf) as document:
+        assert document.page_count == 2
+        assert "Source slide 3" in document[1].get_text()

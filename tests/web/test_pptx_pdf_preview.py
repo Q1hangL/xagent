@@ -315,6 +315,7 @@ async def test_preview_uses_the_shared_conversion_helper(tmp_path, monkeypatch):
         records["source"] = pathlib.Path(pptx_path)
         records["output_dir"] = pathlib.Path(output_dir)
         records["timeout_seconds"] = timeout_seconds
+        assert not kwargs.get("include_hidden_slides", False)
         pdf_path = pathlib.Path(output_dir) / (pathlib.Path(pptx_path).stem + ".pdf")
         pdf_path.write_bytes(b"%PDF-1.4 shared helper")
         return pdf_path
