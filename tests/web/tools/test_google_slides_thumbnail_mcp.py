@@ -2254,3 +2254,11 @@ def test_thumbnail_trusted_proxy_preserves_verified_tls_and_downloads_png(
             server.server_close()
         for thread in serving:
             thread.join(timeout=3)
+
+
+def test_thumbnail_requests_identity_encoding(monkeypatch):
+    _install_slides_api(monkeypatch)
+    http = _install_http(monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES))
+    result = _call_tool(presentation_id="pres1", slide_id="obj1")
+    assert result["status"] == "success"
+    assert http["calls"][0][0].headers["Accept-Encoding"] == "identity"
