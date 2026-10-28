@@ -152,19 +152,29 @@ class PageGeometry:
 class _RenderDirectory:
     """Anchor image writes and cleanup to the exclusively created directory."""
 
-    def __init__(self, path: Path):
+    def __init__(
+        self,
+        path: Path,
+        *,
+        parent_fd: int | None = None,
+        created_identity: tuple[int, int] | None = None,
+    ):
         self.path = path
         self.fd = -1
         self.parent_fd = -1
         self.identity: tuple[int, int] | None = None
         try:
             flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-            self.parent_fd = os.open(path.parent, flags)
+            self.parent_fd = (
+                os.dup(parent_fd)
+                if parent_fd is not None
+                else os.open(path.parent, flags)
+            )
             created = os.stat(path.name, dir_fd=self.parent_fd, follow_symlinks=False)
             self.fd = os.open(path.name, flags, dir_fd=self.parent_fd)
             opened = os.fstat(self.fd)
             self.identity = (opened.st_dev, opened.st_ino)
-            if self.identity != (created.st_dev, created.st_ino):
+            if self.identity != (created_identity or (created.st_dev, created.st_ino)):
                 raise PptxRenderOutputError(
                     "The render directory changed during opening."
                 )
@@ -1060,7 +1070,7 @@ def _delete_unregistered_outputs(
             )
 
 
-def _create_output_directory(output_root: Path) -> Path:
+def _create_output_directory(output_root: Path, *, parent_fd: int) -> Path:
     """Exclusively create this call's unique PNG directory under ``output_root``.
 
     ``mkdir`` without ``exist_ok`` makes ownership unambiguous: the directory
@@ -1070,7 +1080,7 @@ def _create_output_directory(output_root: Path) -> Path:
     for _attempt in range(8):
         candidate = output_root / (f"{RENDER_OUTPUT_DIR_PREFIX}{uuid.uuid4().hex[:12]}")
         try:
-            candidate.mkdir()
+            os.mkdir(candidate.name, dir_fd=parent_fd)
         except FileExistsError:
             continue
         except OSError as exc:
@@ -1109,9 +1119,19 @@ def _prepare_output_directory(workspace: TaskWorkspace) -> _RenderDirectory:
         raise PptxRenderOutputError(
             "The workspace output directory is not a directory."
         )
-    created = _create_output_directory(resolved_output_root)
-    directory = _RenderDirectory(created)
+    parent_fd = os.open(
+        resolved_output_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    created: Path | None = None
+    directory: _RenderDirectory | None = None
     try:
+        created = _create_output_directory(resolved_output_root, parent_fd=parent_fd)
+        created_stat = os.stat(created.name, dir_fd=parent_fd, follow_symlinks=False)
+        directory = _RenderDirectory(
+            created,
+            parent_fd=parent_fd,
+            created_identity=(created_stat.st_dev, created_stat.st_ino),
+        )
         try:
             resolved_created = created.resolve(True)
         except OSError as exc:
@@ -1129,8 +1149,19 @@ def _prepare_output_directory(workspace: TaskWorkspace) -> _RenderDirectory:
         directory.verify_path()
         return directory
     except BaseException:
-        directory.abandon()
+        if directory is not None:
+            directory.abandon()
+        elif created is not None:
+            # Opening can fail before a directory handle is available. The
+            # held parent still permits removing the empty child without
+            # following a replaced parent or a symlink at the child name.
+            try:
+                os.rmdir(created.name, dir_fd=parent_fd)
+            except OSError:
+                pass
         raise
+    finally:
+        os.close(parent_fd)
 
 
 async def _create_render_output_directory(workspace: TaskWorkspace) -> _RenderDirectory:
