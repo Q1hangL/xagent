@@ -2445,3 +2445,27 @@ async def test_real_soffice_preview_keeps_default_hidden_slide_behavior(tmp_path
     with fitz.open(pdf) as document:
         assert document.page_count == 2
         assert "Source slide 3" in document[1].get_text()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_point", ["parent", "child"])
+async def test_output_handle_open_failure_removes_created_directory(
+    durable_workspace, monkeypatch, failure_point
+):
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    open_file = os.open
+
+    def fail_open(path, flags, *args, **kwargs):
+        parent = pathlib.Path(path) == workspace.output_dir
+        child = pathlib.Path(path).name.startswith("pptx_render_")
+        if (failure_point == "parent" and parent) or (
+            failure_point == "child" and child
+        ):
+            raise OSError("synthetic directory handle failure")
+        return open_file(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", fail_open)
+    with pytest.raises(render.PptxRenderOutputError):
+        await render._create_render_output_directory(workspace)
+    assert list(workspace.output_dir.iterdir()) == []
