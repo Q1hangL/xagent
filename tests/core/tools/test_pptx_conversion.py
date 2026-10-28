@@ -697,6 +697,12 @@ async def test_converter_group_teardown_is_bounded_with_inherited_pipes(
     async def spawn(*arguments, **kwargs):
         profile_paths.append(_profile_dir_from_arguments(arguments))
         process = await create_process(*arguments, **kwargs)
+        ready_deadline = time.monotonic() + 5
+        while (
+            not source.with_suffix(".pids").exists()
+            and time.monotonic() < ready_deadline
+        ):
+            await asyncio.sleep(0.01)
         if mode == "exception":
 
             async def broken_pipe():
