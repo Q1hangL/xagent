@@ -280,10 +280,24 @@ async def test_factory_build_with_sandbox_keeps_the_tool_on_the_host(
         register_files,
     )
     monkeypatch.setattr(
-        workspace,
-        "get_registered_file_id",
-        lambda path: file_ids.get(str(path)),
+        render, "_expected_registration_owner", lambda _workspace: (1, 4242)
     )
+
+    def lookup_record(file_id):
+        path = next(
+            path for path, registered_id in file_ids.items() if registered_id == file_id
+        )
+        return render._PersistedFileRecord(
+            file_id=file_id,
+            user_id=1,
+            task_id=4242,
+            storage_status="available",
+            storage_path=path,
+            storage_key=None,
+            detached_reason=None,
+        )
+
+    monkeypatch.setattr(render, "_lookup_uploaded_file_record", lookup_record)
 
     result = await tool.run_json_async({"pptx_path": str(deck)})
 
