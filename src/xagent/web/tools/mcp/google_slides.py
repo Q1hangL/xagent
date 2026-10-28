@@ -1536,8 +1536,9 @@ class _ThreadScopedTransportLogSuppressor(logging.Filter):
         self.threads: set[int] = set()
 
     def filter(self, record: logging.LogRecord) -> bool:
+        # Logging may omit record.thread; filters run in the emitting thread.
         with self.lock:
-            return record.thread not in self.threads
+            return threading.get_ident() not in self.threads
 
 
 # Keep one filter attached for the module's lifetime. Removing filters while
