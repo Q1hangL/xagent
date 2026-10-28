@@ -672,56 +672,60 @@ def _expected_registration_owner(workspace: TaskWorkspace) -> tuple[int, int]:
     return int(row.user_id), int(expected_task_id)
 
 
-def _authorized_record_roots(workspace: TaskWorkspace) -> list[Path]:
-    """Roots a persisted canonical path may live under for this workspace."""
-    roots: list[Path] = []
-    candidates: list[Any] = [
-        workspace.workspace_dir,
-        workspace.output_dir,
-        getattr(workspace, "base_dir", None),
-        *(getattr(workspace, "allowed_external_dirs", ()) or ()),
-    ]
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        try:
-            roots.append(Path(candidate).resolve())
-        except (OSError, RuntimeError):
-            continue
-    return roots
-
-
 def _persisted_record_problem(
     record: _PersistedFileRecord,
     *,
+    workspace: TaskWorkspace,
+    page: RenderedPage,
     expected_user_id: int,
     expected_task_id: int,
-    authorized_roots: list[Path],
 ) -> str | None:
-    """Return why a record does not authorize this call, or None when it does."""
+    """Validate ownership and the page's local or delegated canonical path."""
     if record.detached_reason is not None:
         return "the file record is detached"
-    if record.storage_status not in {None, "available", "legacy"}:
+    if record.storage_status not in {"available", "legacy"}:
         return f"the file storage status is {record.storage_status!r}"
     if record.user_id != expected_user_id:
         return "the file record belongs to another owner"
     if record.task_id != expected_task_id:
         return "the file record belongs to another task"
-    if record.storage_path:
-        try:
-            stored_path = Path(record.storage_path).resolve()
-        except (OSError, RuntimeError):
-            stored_path = None
-        if stored_path is not None and any(
-            stored_path == root or stored_path.is_relative_to(root)
-            for root in authorized_roots
-        ):
-            return None
-    if record.storage_key:
-        # A durable object key is canonical even when the local materialised
-        # copy lives in the parent task's directory (delegated workspaces).
-        return None
-    return "the file record has no authorized canonical path"
+    if not record.storage_path:
+        return "the file record has no canonical local path"
+    try:
+        stored_path = Path(record.storage_path).resolve(strict=True)
+        if not stored_path.is_file():
+            return "the canonical path is not a file"
+        source = page.path.resolve(strict=True)
+        if not _workspace_is_delegated(workspace):
+            if stored_path == source:
+                return None
+        else:
+            # Match the existing workspace materialization layout, including
+            # its numeric filename suffix when a canonical file already exists.
+            parent_root = (
+                workspace._user_workspace_base_dir(expected_user_id)
+                / f"web_task_{expected_task_id}"
+                / "output"
+            ).resolve(strict=True)
+            relative = source.relative_to(workspace.output_dir.resolve(strict=True))
+            expected = parent_root / relative
+            suffix = stored_path.stem.removeprefix(f"{source.stem}_")
+            matching_name = stored_path.name == source.name or (
+                stored_path.stem.startswith(f"{source.stem}_")
+                and suffix.isascii()
+                and suffix.isdecimal()
+                and int(suffix) > 0
+                and stored_path.suffix == source.suffix
+            )
+            if (
+                stored_path.is_relative_to(parent_root)
+                and stored_path.parent == expected.parent
+                and matching_name
+            ):
+                return None
+    except (OSError, RuntimeError, ValueError):
+        return "the canonical path could not be verified"
+    return "the file record does not point to this slide's canonical path"
 
 
 def _verify_registrations_by_path(
@@ -788,62 +792,46 @@ def _verify_returned_registrations(
     unverified: set[int] = set()
     problems: dict[int, str] = {}
 
-    def api_confirms(page: RenderedPage, returned_id: str) -> bool:
-        try:
-            api_file_id = workspace.get_registered_file_id(str(page.path))
-        except Exception:  # noqa: BLE001 - metadata fault, kept unverified below
-            return False
-        return bool(api_file_id) and str(api_file_id) == returned_id
-
     try:
         expected_user_id, expected_task_id = _expected_registration_owner(workspace)
-        authorized_roots = _authorized_record_roots(workspace)
-        can_validate = True
     except Exception:  # noqa: BLE001 - metadata lookup fault on the owner task
         logger.warning(
             "Could not load the owning task for registration verification",
             exc_info=True,
         )
-        expected_user_id = 0
-        expected_task_id = 0
-        authorized_roots = []
-        can_validate = False
+        return (
+            _RegistrationState({}, set(), {page.page_number for page in rendered}),
+            problems,
+        )
 
     for page, registered_id in zip(rendered, registered_ids):
         returned_id = str(registered_id)
-        confirms = api_confirms(page, returned_id)
         try:
             record = _lookup_uploaded_file_record(returned_id)
         except Exception:  # noqa: BLE001 - explicit tri-state classification
-            if confirms:
-                registered[page.page_number] = returned_id
-            else:
-                unverified.add(page.page_number)
+            unverified.add(page.page_number)
             continue
         if record is None:
-            unregistered.add(page.page_number)
-            continue
-        if can_validate:
-            problem = _persisted_record_problem(
-                record,
-                expected_user_id=expected_user_id,
-                expected_task_id=expected_task_id,
-                authorized_roots=authorized_roots,
-            )
-            if problem is None:
-                registered[page.page_number] = returned_id
-            elif confirms and record.storage_status in {"available", "legacy"}:
-                # The workspace API resolves the returned id to this path; the
-                # record shape is unusual but the registration is real, so keep
-                # it undelivered rather than deleting the image.
-                registered[page.page_number] = returned_id
+            # A missing returned id does not prove that registration did not
+            # commit under a different id or a delegated canonical path.
+            fallback = _verify_registrations_by_path(workspace, [page])
+            if page.page_number in fallback.unregistered:
+                unregistered.add(page.page_number)
             else:
                 unverified.add(page.page_number)
-                problems[page.page_number] = problem
-        elif confirms:
+            continue
+        problem = _persisted_record_problem(
+            record,
+            workspace=workspace,
+            page=page,
+            expected_user_id=expected_user_id,
+            expected_task_id=expected_task_id,
+        )
+        if problem is None:
             registered[page.page_number] = returned_id
         else:
             unverified.add(page.page_number)
+            problems[page.page_number] = problem
     return (
         _RegistrationState(
             registered=registered,

@@ -88,14 +88,11 @@ def _produced_pdf_exists(pdf_path: Path) -> bool:
 
 
 class _OwnedDirectoryCreation:
-    """One directory creation whose cleanup ownership lives on its thread.
+    """Keep cleanup on the creating thread until the caller accepts the path.
 
-    The creating thread holds the cleanup responsibility until the waiting
-    coroutine accepts the result. If the coroutine is cancelled (including when
-    the event loop is shut down by ``asyncio.run``), it marks the creation
-    abandoned; the thread removes the directory once it exists. Because this
-    uses a plain non-daemon thread and no asyncio task, event-loop shutdown
-    cannot cancel the cleanup and cannot leave a pending task behind.
+    A thread event acknowledges ownership transfer without an asyncio cleanup
+    task. Cancellation or loop shutdown leaves ownership with the thread, which
+    removes the directory before exiting.
     """
 
     def __init__(
@@ -106,9 +103,8 @@ class _OwnedDirectoryCreation:
         self._create = create
         self._loop = loop
         self._future: asyncio.Future[Path] = loop.create_future()
-        self._lock = threading.Lock()
-        self._path: Path | None = None
-        self._abandoned = False
+        self._handoff_done = threading.Event()
+        self._accepted = False
         self._thread = threading.Thread(
             target=self._run,
             name="xagent-owned-directory",
@@ -120,18 +116,13 @@ class _OwnedDirectoryCreation:
 
     async def wait(self) -> Path:
         try:
-            return await self._future
-        except asyncio.CancelledError:
-            self.abandon()
+            path = await self._future
+        except BaseException:
+            self._handoff_done.set()
             raise
-
-    def abandon(self) -> None:
-        """Hand cleanup back to the creating thread (never leaves the loop)."""
-        with self._lock:
-            self._abandoned = True
-            path = self._path
-        if path is not None:
-            shutil.rmtree(path, ignore_errors=True)
+        self._accepted = True
+        self._handoff_done.set()
+        return path
 
     def _run(self) -> None:
         try:
@@ -139,36 +130,24 @@ class _OwnedDirectoryCreation:
         except BaseException as exc:  # noqa: BLE001 - report to the waiter
             self._deliver(exc=exc)
             return
-        with self._lock:
-            self._path = path
-            abandoned = self._abandoned
-        if abandoned:
+        if self._deliver(path=path):
+            while not self._handoff_done.wait(0.1):
+                if self._loop.is_closed():
+                    break
+        if not self._accepted:
             shutil.rmtree(path, ignore_errors=True)
-            return
-        self._deliver(path=path)
 
     def _deliver(
         self, *, path: Path | None = None, exc: BaseException | None = None
-    ) -> None:
+    ) -> bool:
         try:
             self._loop.call_soon_threadsafe(self._settle, path, exc)
         except RuntimeError:
-            # The loop is already closed: no coroutine can take ownership, so
-            # the creating thread removes the directory itself.
-            if path is not None:
-                shutil.rmtree(path, ignore_errors=True)
+            return False
+        return True
 
     def _settle(self, path: Path | None, exc: BaseException | None) -> None:
         if self._future.done():
-            if path is not None:
-                shutil.rmtree(path, ignore_errors=True)
-            return
-        if self._abandoned:
-            if path is not None:
-                shutil.rmtree(path, ignore_errors=True)
-            # The waiter is gone; resolve quietly so no exception is left
-            # unretrieved when the future is collected.
-            self._future.cancel()
             return
         if exc is not None:
             self._future.set_exception(exc)
