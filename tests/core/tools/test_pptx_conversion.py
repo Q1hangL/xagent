@@ -588,3 +588,46 @@ def test_cancelled_creation_cleanup_survives_asyncio_run_exit(tmp_path):
         f"{[str(path) for path in leftover]}"
     )
     _assert_no_pending_task_warnings(completed)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_handoff_removes_directory_off_event_loop(
+    tmp_path, monkeypatch
+):
+    conversion = _load_conversion_module()
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    scheduled = threading.Event()
+    removed = threading.Event()
+    observed: list[int] = []
+    path = tmp_path / "owned"
+    real_schedule = loop.call_soon_threadsafe
+    real_remove = conversion.shutil.rmtree
+    task = None
+
+    def schedule(callback, *args, **kwargs):
+        if threading.get_ident() != loop_thread and not scheduled.is_set():
+            scheduled.set()
+            real_schedule(task.cancel)
+        return real_schedule(callback, *args, **kwargs)
+
+    def remove(directory, *args, **kwargs):
+        if pathlib.Path(directory) == path:
+            observed.append(threading.get_ident())
+        try:
+            return real_remove(directory, *args, **kwargs)
+        finally:
+            removed.set()
+
+    def create():
+        path.mkdir()
+        return path
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", schedule)
+    monkeypatch.setattr(conversion.shutil, "rmtree", remove)
+    task = asyncio.create_task(conversion.create_owned_directory(create))
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await asyncio.to_thread(removed.wait, 5)
+    assert not path.exists()
+    assert observed and all(thread != loop_thread for thread in observed)

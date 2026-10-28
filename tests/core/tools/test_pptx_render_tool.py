@@ -1716,7 +1716,6 @@ async def test_fake_registration_ids_are_reported_as_unregistered(
     _install_rasterizer(
         monkeypatch, render, page_count=2, requested=[], rendered=rendered
     )
-    originals = [page.path for batch in rendered for page in batch]
 
     def fake_registration(files, *, db_session=None):
         del db_session
@@ -1731,6 +1730,8 @@ async def test_fake_registration_ids_are_reported_as_unregistered(
     assert result["registered_pages"] == []
     assert result["unregistered_pages"] == [1, 2]
     assert _output_rows(durable_workspace.session_factory) == []
+    originals = [page.path for batch in rendered for page in batch]
+    assert len(originals) == 2
     assert not any(path.exists() for path in originals)
 
 
@@ -1744,6 +1745,7 @@ _RENDER_OUTPUT_CREATION_CHILD = r"""
 import asyncio
 import os
 import pathlib
+import threading
 import time
 from pathlib import Path
 
@@ -1755,6 +1757,7 @@ workspace = TaskWorkspace(id="web_task_1", base_dir=str(root / "uploads"))
 deck = workspace.input_dir / "deck.pptx"
 deck.write_bytes(b"PK\x03\x04 synthetic")
 original_resolve = pathlib.Path.resolve
+started = threading.Event()
 
 
 def delayed_resolve(path, *args, **kwargs):
@@ -1763,6 +1766,7 @@ def delayed_resolve(path, *args, **kwargs):
         and path.parent == workspace.output_dir
         and args == (True,)
     ):
+        started.set()
         time.sleep(0.3)
     return original_resolve(path, *args, **kwargs)
 
@@ -1772,7 +1776,8 @@ pathlib.Path.resolve = delayed_resolve
 
 async def main():
     task = asyncio.create_task(render.render_pptx_to_images(str(deck), workspace))
-    await asyncio.sleep(0.15)
+    while not started.is_set():
+        await asyncio.sleep(0.01)
     task.cancel()
     try:
         await task
@@ -1807,6 +1812,7 @@ def test_output_creation_cleanup_survives_asyncio_run_exit(tmp_path):
     lifecycle_root = tmp_path / "lifecycle"
     lifecycle_root.mkdir(parents=True, exist_ok=True)
     environment["LIFECYCLE_DIR"] = str(lifecycle_root)
+    environment["XAGENT_STORAGE_ROOT"] = str(tmp_path / "storage")
     environment["HOME"] = str(tmp_path / "home")
     (tmp_path / "home").mkdir(exist_ok=True)
 
@@ -1834,3 +1840,235 @@ def test_output_creation_cleanup_survives_asyncio_run_exit(tmp_path):
         "Task exception was never retrieved",
     ):
         assert marker not in combined, combined
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delegated", [False, True])
+@pytest.mark.parametrize(
+    "problem", ["owner", "task", "detached", "status", "outside", "sibling", "swapped"]
+)
+async def test_registration_rejects_invalid_persisted_records(
+    durable_workspace, monkeypatch, tmp_path, delegated, problem
+):
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    if delegated:
+        workspace = TaskWorkspace(
+            id="synthetic_delegated_render",
+            base_dir=str(durable_workspace.base_dir),
+            db_task_id=4242,
+        )
+    deck = _write_deck(workspace.input_dir)
+    batches: list[list] = []
+    _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
+    _install_rasterizer(
+        monkeypatch, render, page_count=2, requested=[], rendered=batches
+    )
+    register = workspace.register_files
+
+    def register_then_change_record(files, *, db_session=None):
+        ids = register(files, db_session=db_session)
+        with durable_workspace.session_factory() as db:
+            record = db.query(UploadedFile).filter(UploadedFile.file_id == ids[0]).one()
+            if problem == "owner":
+                record.user_id += 1
+            elif problem == "task":
+                record.task_id += 1
+            elif problem == "detached":
+                record.detached_reason = "synthetic retained file"
+            elif problem == "status":
+                record.storage_status = "compensating"
+            elif problem in {"outside", "sibling"}:
+                root = tmp_path if problem == "outside" else durable_workspace.base_dir
+                other = root / "unrelated" / "slide_001.png"
+                other.parent.mkdir(parents=True)
+                other.write_bytes(PNG_1X1)
+                record.storage_path = str(other)
+            db.commit()
+        return tuple(reversed(ids)) if problem == "swapped" else ids
+
+    monkeypatch.setattr(workspace, "register_files", register_then_change_record)
+    result = await render.render_pptx_to_images(str(deck), workspace)
+
+    assert result["success"] is False, result
+    assert result["error_code"] == "registration_failed"
+    assert result["unverified_pages"] == ([1, 2] if problem == "swapped" else [1])
+    assert result["unregistered_pages"] == []
+    originals = [page.path for batch in batches for page in batch]
+    assert len(originals) == 2
+    assert all(path.is_file() for path in originals)
+    assert len(_output_rows(durable_workspace.session_factory)) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delegated", [False, True])
+@pytest.mark.parametrize("lookup", ["record", "owner"])
+async def test_registration_lookup_outage_cannot_be_overridden_by_path_hit(
+    durable_workspace, monkeypatch, delegated, lookup
+):
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    if delegated:
+        workspace = TaskWorkspace(
+            id="synthetic_delegated_render",
+            base_dir=str(durable_workspace.base_dir),
+            db_task_id=4242,
+        )
+    deck = _write_deck(workspace.input_dir)
+    batches: list[list] = []
+    _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
+    _install_rasterizer(
+        monkeypatch, render, page_count=2, requested=[], rendered=batches
+    )
+
+    def unavailable(*args):
+        raise RuntimeError("synthetic metadata lookup outage")
+
+    target = (
+        "_lookup_uploaded_file_record"
+        if lookup == "record"
+        else "_expected_registration_owner"
+    )
+    monkeypatch.setattr(render, target, unavailable)
+    result = await render.render_pptx_to_images(str(deck), workspace)
+
+    assert result["success"] is False, result
+    assert result["error_code"] == "registration_failed"
+    assert result["unverified_pages"] == [1, 2]
+    assert result["unregistered_pages"] == []
+    assert all(page.path.is_file() for batch in batches for page in batch)
+    assert len(_output_rows(durable_workspace.session_factory)) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delegated", [False, True])
+async def test_committed_images_survive_missing_returned_ids(
+    durable_workspace, monkeypatch, delegated
+):
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    if delegated:
+        workspace = TaskWorkspace(
+            id="synthetic_delegated_render",
+            base_dir=str(durable_workspace.base_dir),
+            db_task_id=4242,
+        )
+    deck = _write_deck(workspace.input_dir)
+    batches: list[list] = []
+    _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
+    _install_rasterizer(
+        monkeypatch, render, page_count=2, requested=[], rendered=batches
+    )
+    register = workspace.register_files
+
+    def commit_with_wrong_ids(files, *, db_session=None):
+        register(files, db_session=db_session)
+        return (str(uuid.uuid4()), str(uuid.uuid4()))
+
+    monkeypatch.setattr(workspace, "register_files", commit_with_wrong_ids)
+    result = await render.render_pptx_to_images(str(deck), workspace)
+
+    assert result["success"] is False
+    assert result["error_code"] == "registration_failed"
+    assert result["unverified_pages"] == [1, 2]
+    assert result["unregistered_pages"] == []
+    originals = [page.path for batch in batches for page in batch]
+    assert len(originals) == 2 and all(path.is_file() for path in originals)
+    rows = _output_rows(durable_workspace.session_factory)
+    assert len(rows) == 2
+    assert all(pathlib.Path(str(row.storage_path)).is_file() for row in rows)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [OSError, RuntimeError])
+async def test_created_output_is_removed_when_validation_raises(
+    durable_workspace, monkeypatch, failure
+):
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    original_resolve = pathlib.Path.resolve
+    created: list[pathlib.Path] = []
+
+    def invalid(path, *args, **kwargs):
+        if path.name.startswith("pptx_render_") and args == (True,):
+            created.append(path)
+            raise failure("synthetic directory validation failure")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "resolve", invalid)
+    with pytest.raises((render.PptxRenderOutputError, RuntimeError)):
+        await render._create_render_output_directory(workspace)
+    assert len(created) == 1
+    assert not created[0].exists()
+
+
+@pytest.mark.asyncio
+async def test_delegated_registration_accepts_canonical_collision_rename(
+    durable_workspace, monkeypatch
+):
+    render = _load_render_module()
+    workspace = TaskWorkspace(
+        id="synthetic_delegated_render",
+        base_dir=str(durable_workspace.base_dir),
+        db_task_id=4242,
+    )
+    deck = _write_deck(workspace.input_dir)
+    _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
+    _install_rasterizer(monkeypatch, render, page_count=2, requested=[], rendered=[])
+    register = workspace.register_files
+    collisions: list[pathlib.Path] = []
+
+    def register_after_collision(files, *, db_session=None):
+        for path, _file_id in files:
+            relative = pathlib.Path(path).relative_to(workspace.output_dir)
+            occupied = durable_workspace.workspace.output_dir / relative
+            occupied.parent.mkdir(parents=True, exist_ok=True)
+            occupied.write_bytes(b"existing image")
+            collisions.append(occupied)
+        return register(files, db_session=db_session)
+
+    monkeypatch.setattr(workspace, "register_files", register_after_collision)
+    result = await render.render_pptx_to_images(str(deck), workspace)
+
+    assert result["success"] is True, result
+    assert [path.read_bytes() for path in collisions] == [b"existing image"] * 2
+    rows = _output_rows(durable_workspace.session_factory)
+    assert sorted(pathlib.Path(str(row.storage_path)).name for row in rows) == [
+        "slide_001_1.png",
+        "slide_002_1.png",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("commit_first", [False, True])
+async def test_delegated_registration_exception_keeps_uncertain_images(
+    durable_workspace, monkeypatch, commit_first
+):
+    render = _load_render_module()
+    workspace = TaskWorkspace(
+        id="synthetic_delegated_render",
+        base_dir=str(durable_workspace.base_dir),
+        db_task_id=4242,
+    )
+    deck = _write_deck(workspace.input_dir)
+    batches: list[list] = []
+    _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
+    _install_rasterizer(
+        monkeypatch, render, page_count=2, requested=[], rendered=batches
+    )
+    register = workspace.register_files
+
+    def interrupted(files, *, db_session=None):
+        if commit_first:
+            register(files[:1], db_session=db_session)
+        raise RuntimeError("synthetic interrupted registration")
+
+    monkeypatch.setattr(workspace, "register_files", interrupted)
+    result = await render.render_pptx_to_images(str(deck), workspace)
+
+    assert result["success"] is False
+    assert result["error_code"] == "registration_failed"
+    assert result["unregistered_pages"] == []
+    assert result["unverified_pages"] == [1, 2]
+    assert all(page.path.is_file() for batch in batches for page in batch)
+    assert len(_output_rows(durable_workspace.session_factory)) == int(commit_first)
