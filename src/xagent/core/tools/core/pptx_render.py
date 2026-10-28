@@ -614,7 +614,11 @@ def _lookup_uploaded_file_record(file_id: str) -> _PersistedFileRecord | None:
             file_id=str(record.file_id),
             user_id=int(record.user_id) if record.user_id is not None else None,
             task_id=int(record.task_id) if record.task_id is not None else None,
-            storage_status=record.storage_status,
+            storage_status=(
+                str(record.storage_status)
+                if record.storage_status is not None
+                else None
+            ),
             storage_path=str(record.storage_path) if record.storage_path else None,
             storage_key=str(record.storage_key) if record.storage_key else None,
             detached_reason=getattr(record, "detached_reason", None),
