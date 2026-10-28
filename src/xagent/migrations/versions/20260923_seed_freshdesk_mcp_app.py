@@ -74,16 +74,36 @@ def upgrade() -> None:
         return
 
     columns = {c["name"] for c in inspector.get_columns("public_mcp_apps")}
+
+    # is_visible_in_connector is load-bearing for the release gate this row
+    # ships behind: without it the column filter below would drop the key and
+    # the table default (TRUE) would seed the row visible. Same guard as the
+    # zendesk/chrome seeds.
+    if "is_visible_in_connector" not in columns:
+        raise RuntimeError(
+            "public_mcp_apps.is_visible_in_connector is missing; the freshdesk "
+            "row must not seed visible"
+        )
+
     existing = set(bind.execute(sa.select(PUBLIC_MCP_APPS_TABLE.c.app_id)).scalars())
     if APP_ID in existing:
+        # A pre-existing row (e.g. hand-created by an operator) keeps its own
+        # visibility, and the builtin registry overlays the real launch_config
+        # onto any row with this app_id, so a visible one would become a
+        # working connector. Force it hidden; its other fields are left alone.
+        bind.execute(
+            sa.update(PUBLIC_MCP_APPS_TABLE)
+            .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
+            .values(is_visible_in_connector=False)
+        )
         return
 
-    # Silently degrades rather than failing outright (this table is never
-    # expected to be missing a column that predates this migration by
-    # months), but the app_id-exists guard above means a row seeded here
-    # while a column was missing can never self-heal on a later re-run --
-    # so at least surface which keys were dropped instead of leaving no
-    # trace at all.
+    # Any other missing column degrades rather than failing outright (this
+    # table is never expected to be missing a column that predates this
+    # migration by months), but the app_id-exists guard above means a row
+    # seeded here while a column was missing can never self-heal on a later
+    # re-run -- so at least surface which keys were dropped instead of
+    # leaving no trace at all.
     dropped_keys = sorted(set(ROW) - columns)
     if dropped_keys:
         logger.warning(
