@@ -23,7 +23,7 @@ import shutil
 import tempfile
 import threading
 from pathlib import Path
-from typing import Callable, Final
+from typing import Callable, Final, Generic, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +87,10 @@ def _produced_pdf_exists(pdf_path: Path) -> bool:
     return Path(pdf_path).is_file()
 
 
-class _OwnedDirectoryCreation:
+_Resource = TypeVar("_Resource")
+
+
+class _OwnedDirectoryCreation(Generic[_Resource]):
     """Keep cleanup on the creating thread until the caller accepts the path.
 
     A thread event acknowledges ownership transfer without an asyncio cleanup
@@ -97,12 +100,14 @@ class _OwnedDirectoryCreation:
 
     def __init__(
         self,
-        create: Callable[[], Path],
+        create: Callable[[], _Resource],
+        cleanup: Callable[[_Resource], None],
         loop: asyncio.AbstractEventLoop,
     ) -> None:
         self._create = create
+        self._cleanup = cleanup
         self._loop = loop
-        self._future: asyncio.Future[Path] = loop.create_future()
+        self._future: asyncio.Future[_Resource] = loop.create_future()
         self._handoff_done = threading.Event()
         self._accepted = False
         self._thread = threading.Thread(
@@ -114,7 +119,7 @@ class _OwnedDirectoryCreation:
     def start(self) -> None:
         self._thread.start()
 
-    async def wait(self) -> Path:
+    async def wait(self) -> _Resource:
         try:
             path = await self._future
         except BaseException:
@@ -135,10 +140,10 @@ class _OwnedDirectoryCreation:
                 if self._loop.is_closed():
                     break
         if not self._accepted:
-            shutil.rmtree(path, ignore_errors=True)
+            self._cleanup(path)
 
     def _deliver(
-        self, *, path: Path | None = None, exc: BaseException | None = None
+        self, *, path: _Resource | None = None, exc: BaseException | None = None
     ) -> bool:
         try:
             self._loop.call_soon_threadsafe(self._settle, path, exc)
@@ -146,7 +151,7 @@ class _OwnedDirectoryCreation:
             return False
         return True
 
-    def _settle(self, path: Path | None, exc: BaseException | None) -> None:
+    def _settle(self, path: _Resource | None, exc: BaseException | None) -> None:
         if self._future.done():
             return
         if exc is not None:
@@ -162,7 +167,16 @@ async def create_owned_directory(create: Callable[[], Path]) -> Path:
     cancelled, the creating thread removes the directory itself, so cleanup
     survives cancellation of the event loop that started the call.
     """
-    creation = _OwnedDirectoryCreation(create, asyncio.get_running_loop())
+    return await create_owned_resource(
+        create, lambda path: shutil.rmtree(path, ignore_errors=True)
+    )
+
+
+async def create_owned_resource(
+    create: Callable[[], _Resource], cleanup: Callable[[_Resource], None]
+) -> _Resource:
+    """Transfer a worker-created resource, keeping abandoned cleanup on its worker."""
+    creation = _OwnedDirectoryCreation(create, cleanup, asyncio.get_running_loop())
     creation.start()
     return await creation.wait()
 

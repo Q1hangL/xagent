@@ -24,12 +24,14 @@ import asyncio
 import contextvars
 import logging
 import math
+import os
+import stat
 import shutil
 import struct
 import tempfile
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
@@ -44,6 +46,7 @@ from .pptx_conversion import (
     PptxConverterUnavailableError,
     convert_pptx_to_pdf,
     create_owned_directory,
+    create_owned_resource,
 )
 
 logger = logging.getLogger(__name__)
@@ -145,6 +148,111 @@ class PageGeometry:
     height: int
 
 
+class _RenderDirectory:
+    """Anchor image writes and cleanup to the exclusively created directory."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.fd = -1
+        self.parent_fd = -1
+        self.identity: tuple[int, int] | None = None
+        try:
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            self.parent_fd = os.open(path.parent, flags)
+            created = os.stat(path.name, dir_fd=self.parent_fd, follow_symlinks=False)
+            self.fd = os.open(path.name, flags, dir_fd=self.parent_fd)
+            opened = os.fstat(self.fd)
+            self.identity = (opened.st_dev, opened.st_ino)
+            if self.identity != (created.st_dev, created.st_ino):
+                raise PptxRenderOutputError(
+                    "The render directory changed during opening."
+                )
+        except BaseException:
+            self.close()
+            raise
+
+    def verify_path(self) -> None:
+        try:
+            current = self.path.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino) != self.identity
+            ):
+                raise PptxRenderOutputError(
+                    "The render directory was moved or replaced."
+                )
+        except OSError as exc:
+            raise PptxRenderOutputError(
+                "The render directory is no longer available."
+            ) from exc
+
+    def file_identity(self, name: str) -> tuple[int, int]:
+        current = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+        if not stat.S_ISREG(current.st_mode):
+            raise PptxRenderOutputError(
+                "A rendered image was replaced with a non-file."
+            )
+        return current.st_dev, current.st_ino
+
+    def verify_file(self, page: RenderedPage) -> None:
+        self.verify_path()
+        if self.file_identity(page.path.name) != page.identity:
+            raise PptxRenderOutputError("A rendered image was replaced.")
+        current = page.path.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino) != page.identity
+        ):
+            raise PptxRenderOutputError(
+                "The image path no longer names the rendered file."
+            )
+
+    def verify_files(self, rendered: list[RenderedPage]) -> None:
+        for page in rendered:
+            self.verify_file(page)
+
+    def unlink(self, page: RenderedPage) -> None:
+        try:
+            if self.file_identity(page.path.name) == page.identity:
+                os.unlink(page.path.name, dir_fd=self.fd)
+        except FileNotFoundError:
+            pass
+
+    def remove(self) -> None:
+        # Unlink entries through the held directory, never through its old path.
+        # Do not recurse into unexpected subdirectories or follow symlinks.
+        for name in os.listdir(self.fd):
+            try:
+                os.unlink(name, dir_fd=self.fd)
+            except (FileNotFoundError, IsADirectoryError):
+                pass
+        try:
+            current = os.stat(
+                self.path.name, dir_fd=self.parent_fd, follow_symlinks=False
+            )
+            if (current.st_dev, current.st_ino) == self.identity:
+                os.rmdir(self.path.name, dir_fd=self.parent_fd)
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        for descriptor in (self.fd, self.parent_fd):
+            if descriptor >= 0:
+                os.close(descriptor)
+        self.fd = self.parent_fd = -1
+
+    def abandon(self) -> None:
+        try:
+            self.remove()
+        finally:
+            self.close()
+
+
+_active_render_directory: contextvars.ContextVar[_RenderDirectory | None] = (
+    contextvars.ContextVar("render_directory", default=None)
+)
+
+
 @dataclass(frozen=True)
 class RenderedPage:
     """One PNG produced from a PDF page."""
@@ -153,6 +261,8 @@ class RenderedPage:
     path: Path
     width: int
     height: int
+    directory: _RenderDirectory | None = None
+    identity: tuple[int, int] | None = None
 
 
 def page_file_name(page_number: int) -> str:
@@ -448,7 +558,11 @@ def render_pdf_pages_to_pngs(
         raise PptxRenderRasterError(f"Output directory {output_dir} does not exist.")
     document = _open_pdf(Path(pdf_path))
     rendered: list[RenderedPage] = []
+    directory = _active_render_directory.get()
+    owned_directory = directory is None
+    directory = directory or _RenderDirectory(output_dir)
     try:
+        directory.verify_path()
         total_pages = int(document.page_count)
         for page_number in page_numbers:
             page = document[page_number - 1]
@@ -472,7 +586,16 @@ def render_pdf_pages_to_pngs(
                 )
             target = output_dir / page_file_name(page_number)
             try:
-                pixmap.save(str(target))
+                descriptor = os.open(
+                    target.name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=directory.fd,
+                )
+                with os.fdopen(descriptor, "wb") as image_file:
+                    opened = os.fstat(image_file.fileno())
+                    identity = (opened.st_dev, opened.st_ino)
+                    pixmap.pil_save(image_file, format="PNG")
             except OSError as exc:
                 raise PptxRenderRasterError(
                     f"Could not write slide image {target.name}: {exc}"
@@ -483,11 +606,17 @@ def render_pdf_pages_to_pngs(
                     path=target,
                     width=int(pixmap.width),
                     height=int(pixmap.height),
+                    directory=directory,
+                    identity=identity,
                 )
             )
+        for rendered_page in rendered:
+            directory.verify_file(rendered_page)
         return total_pages, rendered
     finally:
         document.close()
+        if owned_directory:
+            directory.close()
 
 
 def _looks_like_file_id(value: str) -> bool:
@@ -918,7 +1047,8 @@ def _delete_unregistered_outputs(
         if page.page_number not in unregistered_pages:
             continue
         try:
-            page.path.unlink()
+            if page.directory is not None:
+                page.directory.unlink(page)
         except FileNotFoundError:
             pass
         except OSError:
@@ -953,7 +1083,7 @@ def _create_output_directory(output_root: Path) -> Path:
     )
 
 
-def _prepare_output_directory(workspace: TaskWorkspace) -> Path:
+def _prepare_output_directory(workspace: TaskWorkspace) -> _RenderDirectory:
     """Resolve, create and validate this call's output directory.
 
     This is blocking filesystem work and runs on a worker thread. The exclusive
@@ -979,6 +1109,7 @@ def _prepare_output_directory(workspace: TaskWorkspace) -> Path:
             "The workspace output directory is not a directory."
         )
     created = _create_output_directory(resolved_output_root)
+    directory = _RenderDirectory(created)
     try:
         try:
             resolved_created = created.resolve(True)
@@ -994,17 +1125,19 @@ def _prepare_output_directory(workspace: TaskWorkspace) -> Path:
                 "The created slide image directory is not directly inside the "
                 "workspace output directory."
             )
-        return resolved_created
+        directory.verify_path()
+        return directory
     except BaseException:
-        shutil.rmtree(created, ignore_errors=True)
+        directory.abandon()
         raise
 
 
-async def _create_render_output_directory(workspace: TaskWorkspace) -> Path:
+async def _create_render_output_directory(workspace: TaskWorkspace) -> _RenderDirectory:
     """Create this call's output directory without doing filesystem I/O on the loop."""
     try:
-        return await create_owned_directory(
-            lambda: _prepare_output_directory(workspace)
+        return await create_owned_resource(
+            lambda: _prepare_output_directory(workspace),
+            lambda directory: directory.abandon(),
         )
     except PptxRenderError:
         raise
@@ -1085,7 +1218,7 @@ def _selection_payload(selection: PageSelection) -> dict[str, Any]:
 
 async def _cleanup_failed_render(
     workspace: TaskWorkspace,
-    output_dir: Path,
+    directory: _RenderDirectory,
     rendered: list[RenderedPage],
     registration_state: _RegistrationState | None,
 ) -> None:
@@ -1097,7 +1230,7 @@ async def _cleanup_failed_render(
     """
     if not rendered:
         try:
-            await asyncio.to_thread(_remove_tree, output_dir)
+            await asyncio.to_thread(directory.remove)
         except BaseException:  # pragma: no cover - never mask the outcome
             logger.warning(
                 "Could not remove the empty render output directory",
@@ -1105,6 +1238,11 @@ async def _cleanup_failed_render(
             )
         return
     state = registration_state
+    if state is None:
+        try:
+            await _run_blocking(lambda: directory.verify_files(rendered))
+        except (OSError, PptxRenderError):
+            return
     if state is None:
         try:
             state = await _run_blocking(
@@ -1126,7 +1264,7 @@ async def _cleanup_failed_render(
     kept_pages = len(rendered) - len(state.unregistered)
     if kept_pages == 0:
         try:
-            await asyncio.to_thread(_remove_tree, output_dir)
+            await asyncio.to_thread(directory.remove)
         except BaseException:  # pragma: no cover - never mask the outcome
             logger.warning(
                 "Could not remove the empty render output directory",
@@ -1142,6 +1280,8 @@ def _build_pages_payload(
     """Build FileRefs and inline artifacts; runs in a worker thread."""
     pages: list[dict[str, Any]] = []
     for page in rendered:
+        if page.directory is not None:
+            page.directory.verify_file(page)
         file_id = persisted[page.page_number]
         file_ref = build_workspace_file_ref(
             workspace=workspace,
@@ -1149,6 +1289,8 @@ def _build_pages_payload(
             file_id=file_id,
             mime_type=PNG_MIME_TYPE,
         )
+        if page.directory is not None:
+            page.directory.verify_file(page)
         pages.append(
             {
                 "page_number": page.page_number,
@@ -1207,7 +1349,7 @@ async def render_pptx_to_images(
 
     temp_root: Path | None = None
     output_dir: Path | None = None
-    output_owned = False
+    directory: _RenderDirectory | None = None
     rendered: list[RenderedPage] = []
     persisted: dict[int, str] = {}
     registration_state: _RegistrationState | None = None
@@ -1226,7 +1368,8 @@ async def render_pptx_to_images(
             )
 
         try:
-            output_dir = await _create_render_output_directory(workspace)
+            directory = await _create_render_output_directory(workspace)
+            output_dir = directory.path
         except PptxRenderError as exc:
             return _error(exc.error_code, str(exc))
         except OSError as exc:  # pragma: no cover - defensive fallback
@@ -1234,7 +1377,6 @@ async def render_pptx_to_images(
                 "output_unavailable",
                 f"Could not create the slide image directory: {exc}",
             )
-        output_owned = True
 
         try:
             pdf_path = await convert_pptx_to_pdf(
@@ -1260,11 +1402,17 @@ async def render_pptx_to_images(
             return _error(exc.error_code, str(exc))
 
         try:
-            _total, rendered = await _run_blocking(
-                lambda: render_pdf_pages_to_pngs(
-                    pdf_path, selection.page_numbers, output_dir
-                )
-            )
+
+            def rasterize() -> tuple[int, list[RenderedPage]]:
+                token = _active_render_directory.set(directory)
+                try:
+                    return render_pdf_pages_to_pngs(
+                        pdf_path, selection.page_numbers, output_dir
+                    )
+                finally:
+                    _active_render_directory.reset(token)
+
+            _total, rendered = await _run_blocking(rasterize)
         except PptxRenderError as exc:
             return _error(exc.error_code, str(exc))
         except Exception as exc:  # pragma: no cover - defensive fallback
@@ -1272,9 +1420,30 @@ async def render_pptx_to_images(
             return _error("raster_failed", f"Rendering the slides failed: {exc}")
 
         try:
-            persisted = await _run_blocking(
-                lambda: _register_rendered_pages(workspace, rendered)
-            )
+
+            def register() -> dict[int, str]:
+                assert directory is not None
+                rendered[:] = [
+                    page
+                    if page.identity is not None
+                    else replace(
+                        page,
+                        directory=directory,
+                        identity=directory.file_identity(page.path.name),
+                    )
+                    for page in rendered
+                ]
+                for page in rendered:
+                    directory.verify_file(page)
+                try:
+                    return _register_rendered_pages(workspace, rendered)
+                finally:
+                    for page in rendered:
+                        directory.verify_file(page)
+
+            persisted = await _run_blocking(register)
+        except (PptxRenderOutputError, OSError) as exc:
+            return _error("output_unavailable", str(exc))
         except PptxRenderRegistrationError as exc:
             registration_state = _RegistrationState(
                 registered=dict(exc.registered_file_ids),
@@ -1327,13 +1496,15 @@ async def render_pptx_to_images(
             await asyncio.to_thread(_remove_tree, temp_root)
         except BaseException:  # pragma: no cover - never mask the outcome
             logger.warning("Could not remove the render temp directory", exc_info=True)
-        if not succeeded and output_owned and output_dir is not None:
+        if not succeeded and directory is not None:
             try:
                 await _cleanup_failed_render(
-                    workspace, output_dir, rendered, registration_state
+                    workspace, directory, rendered, registration_state
                 )
             except BaseException:  # pragma: no cover - never mask the outcome
                 logger.warning(
                     "Could not clean up the failed render output",
                     exc_info=True,
                 )
+        if directory is not None:
+            directory.close()
