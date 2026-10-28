@@ -11,7 +11,6 @@ import os
 import re
 import uuid
 from collections import Counter
-from contextvars import ContextVar
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
@@ -21,7 +20,7 @@ import httpx
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-not-found]
 from googleapiclient.http import MediaIoBaseUpload  # type: ignore[import-not-found]
-from pydantic import BeforeValidator
+from pydantic import BeforeValidator, StrictInt
 
 from mcp.server.fastmcp import FastMCP
 
@@ -36,6 +35,8 @@ from .utils import (
 )
 
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("google-slides-mcp")
 
 # Ensure standard proxy environment variables are set to prevent hanging requests
@@ -1442,59 +1443,18 @@ _THUMBNAIL_MAX_BYTES = 10 * 1024 * 1024
 _THUMBNAIL_TIMEOUT_SECONDS = 30.0
 _THUMBNAIL_HOST_SUFFIX = "googleusercontent.com"
 _THUMBNAIL_PNG_MIME_TYPE = "image/png"
-_THUMBNAIL_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-_THUMBNAIL_SIZES = ("SMALL", "MEDIUM", "LARGE")
 _THUMBNAIL_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]")
 _THUMBNAIL_FILENAME_STEM_LENGTH = 120
 _THUMBNAIL_OUTPUT_DIR_ENV_VAR = "XAGENT_GOOGLE_DRIVE_OUTPUT_DIR"
-_THUMBNAIL_MAX_PIXEL_COUNT = 40_000_000
 _THUMBNAIL_MAX_NAME_ATTEMPTS = 10_000
-_URL_IN_TEXT = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
-_SECRET_TOKEN_PARAMETER = re.compile(
-    r"(?i)\b(access_token|token|signature|sig|opaque|x-goog-[a-z0-9-]+)="
-    r"([^&\s\"'<>]+)"
-)
-
-
-def _redact_thumbnail_secrets(text: str) -> str:
-    """Remove whole URLs from download exceptions, including mixed-case schemes."""
-    redacted = _URL_IN_TEXT.sub("<redacted URL>", text)
-    return _SECRET_TOKEN_PARAMETER.sub(
-        lambda match: f"{match.group(1)}=<redacted>", redacted
-    )
-
-
-# HTTPX logs the complete request URL at INFO, including the pinned-IP URL.
-# Only records emitted in this connector's download context are suppressed.
-_THUMBNAIL_DOWNLOAD_LOG_CONTEXT: ContextVar[bool] = ContextVar(
-    "slide_thumbnail_download", default=False
-)
-
-
-class _ThumbnailHttpLogFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        return not _THUMBNAIL_DOWNLOAD_LOG_CONTEXT.get()
-
-
-logging.getLogger("httpx").addFilter(_ThumbnailHttpLogFilter())
 
 
 class _ThumbnailDownloadError(RuntimeError):
     """A thumbnail transfer or output failure safe to show to the caller."""
 
 
-def _normalize_thumbnail_size(value: object) -> str:
-    """Validate ``size`` inside FastMCP's schema layer as well.
-
-    The function body repeats this check for direct Python callers, which
-    bypass FastMCP validation.
-    """
-    if not isinstance(value, str):
-        raise ValueError("'size' must be one of SMALL, MEDIUM, LARGE")
-    normalized = value.strip().upper()
-    if normalized not in _THUMBNAIL_SIZES:
-        raise ValueError("'size' must be one of SMALL, MEDIUM, LARGE")
-    return normalized
+def _normalize_thumbnail_size(value: object) -> object:
+    return value.strip().upper() if isinstance(value, str) else value
 
 
 _ThumbnailSize = Annotated[
@@ -1502,49 +1462,12 @@ _ThumbnailSize = Annotated[
 ]
 
 
-def _strict_page_number(value: object) -> int | None:
-    """Refuse every value that is not an actual integer.
-
-    Pydantic's lax mode would otherwise accept a JSON ``true`` or ``"2"`` as a
-    valid page and silently change which slide is returned.
-    """
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError("'page_number' must be an integer")
-    return value
-
-
-_PageNumber = Annotated[int | None, BeforeValidator(_strict_page_number)]
-
-
 def _validate_thumbnail_host(hostname: str) -> None:
     if not host_matches_suffix(hostname, _THUMBNAIL_HOST_SUFFIX):
         raise ValueError("thumbnail image URL host is not a Google image host")
 
 
-def _validate_thumbnail_url(url: object) -> str:
-    """Check the initial HTTPS image URL; the shared fetcher validates every hop."""
-    if not isinstance(url, str) or not url.strip():
-        raise ValueError("thumbnail image URL is missing")
-    if "\\" in url or any(c.isspace() or ord(c) < 32 for c in url):
-        raise ValueError("thumbnail image URL contains invalid characters")
-    parsed = urlsplit(url)
-    if parsed.scheme.lower() != "https":
-        raise ValueError("thumbnail image URL must use HTTPS")
-    if parsed.username is not None or parsed.password is not None:
-        raise ValueError("thumbnail image URL must not include user information")
-    if not parsed.hostname:
-        raise ValueError("thumbnail image URL has no host")
-    if parsed.port not in (None, 443):
-        raise ValueError("thumbnail image URL must not use a non-standard port")
-    _validate_thumbnail_host(parsed.hostname.rstrip("."))
-    return url
-
-
 async def _prepare_thumbnail_request(request: httpx.Request) -> None:
-    if request.url.scheme != "https" or request.url.port not in (None, 443):
-        raise ValueError("thumbnail image URL must use standard HTTPS")
     # A redirect can set cookies on the isolated client; never replay them.
     request.headers.pop("Cookie", None)
     request.headers.pop("Authorization", None)
@@ -1557,10 +1480,10 @@ async def _check_thumbnail_length(response: httpx.Response) -> None:
 
 
 async def _download_thumbnail_image(url: str) -> bytes:
-    token = _THUMBNAIL_DOWNLOAD_LOG_CONTEXT.set(True)
     try:
         async with asyncio.timeout(_THUMBNAIL_TIMEOUT_SECONDS):
-            _validate_thumbnail_url(url)
+            if urlsplit(url).scheme != "https":
+                raise ValueError("thumbnail image URL must use HTTPS")
             proxy_url = get_trusted_proxy_url()
             async with public_fetch_client(
                 proxy_url, timeout=_THUMBNAIL_TIMEOUT_SECONDS
@@ -1585,59 +1508,32 @@ async def _download_thumbnail_image(url: str) -> bytes:
         return response.content
     except (TimeoutError, httpx.TimeoutException):
         raise _ThumbnailDownloadError("thumbnail image download timed out") from None
-    except Exception as exc:
-        raise _ThumbnailDownloadError(_redact_thumbnail_secrets(str(exc))) from None
-    finally:
-        _THUMBNAIL_DOWNLOAD_LOG_CONTEXT.reset(token)
+    except httpx.HTTPStatusError as exc:
+        raise _ThumbnailDownloadError(
+            f"thumbnail image download failed: HTTP {exc.response.status_code}"
+        ) from None
+    except httpx.HTTPError:
+        raise _ThumbnailDownloadError(
+            "thumbnail image download failed: network error"
+        ) from None
 
 
 def _validate_thumbnail_png(data: bytes) -> None:
-    """Refuse a body that is only PNG-shaped unless it decodes as a PNG image.
+    """Check PNG format and integrity using the shared asset-download pattern."""
+    from PIL import Image
 
-    The URL can be served by an arbitrary host inside the allowed domain, so a
-    signature prefix alone does not make the bytes a deliverable image.  Pillow
-    is an existing dependency; decoding is bounded by a pixel-count cap first.
-    """
-    if not data.startswith(_THUMBNAIL_PNG_SIGNATURE):
-        raise _ThumbnailDownloadError("downloaded thumbnail image is not a PNG image")
-    try:
-        from PIL import Image
-    except Exception:
-        raise _ThumbnailDownloadError(
-            "downloaded thumbnail image is not a valid PNG image"
-        ) from None
     try:
         with Image.open(io.BytesIO(data)) as image:
             if image.format != "PNG":
-                raise _ThumbnailDownloadError(
-                    "downloaded thumbnail image is not a PNG image"
-                )
-            width, height = image.size
-            if width <= 0 or height <= 0 or width * height > _THUMBNAIL_MAX_PIXEL_COUNT:
-                raise _ThumbnailDownloadError(
-                    "downloaded thumbnail image has an unsupported size"
-                )
+                raise ValueError("not a PNG image")
             image.verify()
-        with Image.open(io.BytesIO(data)) as image:
-            image.load()
-    except _ThumbnailDownloadError:
-        raise
     except Exception:
         raise _ThumbnailDownloadError(
             "downloaded thumbnail image is not a valid PNG image"
         ) from None
 
 
-def _open_thumbnail_output_directory() -> tuple[Path, Path, str, int]:
-    """Anchor the task's output directory without following a directory link.
-
-    The workspace base is host-injected and trusted, so it is resolved once;
-    the child ``output`` path itself must be a real directory opened with
-    ``O_NOFOLLOW`` and directory semantics.  Writes then go through that
-    descriptor. A concurrent rename can move that directory; the post-write
-    check detects a changed visible path and deletes the file before reporting
-    an error.
-    """
+def _require_thumbnail_output_directory() -> str:
     base = os.environ.get(_THUMBNAIL_OUTPUT_DIR_ENV_VAR, "").strip()
     if not base:
         raise RuntimeError(
@@ -1646,40 +1542,22 @@ def _open_thumbnail_output_directory() -> tuple[Path, Path, str, int]:
             "google_slides_get_slide_thumbnail needs a task workspace to "
             "write into."
         )
-    workspace_root = Path(base).expanduser().resolve()
-    output_dir = workspace_root / "output"
-    try:
-        os.mkdir(output_dir)
-    except FileExistsError:
-        pass
-    except OSError:
-        raise _ThumbnailDownloadError(
-            "the task output directory is not usable"
-        ) from None
-    directory_flags = (
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    return base
+
+
+def _open_thumbnail_output_directory() -> tuple[Path, int]:
+    """Open the output directory without following a sandbox-created link."""
+    output_dir = (
+        Path(_require_thumbnail_output_directory()).expanduser().resolve() / "output"
     )
     try:
-        directory_fd = os.open(output_dir, directory_flags)
+        output_dir.mkdir(exist_ok=True)
+        directory_fd = os.open(output_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError:
         raise _ThumbnailDownloadError(
             "the task output directory is not usable"
         ) from None
-    try:
-        canonical_output_dir = os.path.realpath(output_dir)
-        if os.path.commonpath([canonical_output_dir, str(workspace_root)]) != str(
-            workspace_root
-        ):
-            raise _ThumbnailDownloadError("the task output directory is not usable")
-    except BaseException:
-        os.close(directory_fd)
-        raise
-    return workspace_root, output_dir, canonical_output_dir, directory_fd
-
-
-def _require_thumbnail_output_directory() -> None:
-    _, _, _, directory_fd = _open_thumbnail_output_directory()
-    os.close(directory_fd)
+    return output_dir, directory_fd
 
 
 def _thumbnail_filename(*, page_number: int | None, slide_object_id: str) -> str:
@@ -1694,10 +1572,10 @@ def _thumbnail_filename(*, page_number: int | None, slide_object_id: str) -> str
 
 
 def _open_thumbnail_output_file(directory_fd: int, filename: str) -> tuple[str, int]:
-    """Create a private staging file relative to the anchored output directory."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    for _ in range(_THUMBNAIL_MAX_NAME_ATTEMPTS):
-        name = f".{filename}.{uuid.uuid4().hex}.tmp"
+    """Create a uniquely named file exclusively in the anchored directory."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    for counter in range(_THUMBNAIL_MAX_NAME_ATTEMPTS):
+        name = filename if counter == 0 else f"{Path(filename).stem} ({counter}).png"
         try:
             return name, os.open(name, flags, 0o600, dir_fd=directory_fd)
         except FileExistsError:
@@ -1706,77 +1584,25 @@ def _open_thumbnail_output_file(directory_fd: int, filename: str) -> tuple[str, 
 
 
 def _write_thumbnail_png(
-    data: bytes,
-    *,
-    output_dir: Path,
-    canonical_output_dir: str,
-    dir_fd: int,
-    filename: str,
+    data: bytes, *, output_dir: Path, dir_fd: int, filename: str
 ) -> Path:
-    temporary_name: str | None = None
-    published_name: str | None = None
-    complete = False
+    name, descriptor = _open_thumbnail_output_file(dir_fd, filename)
     try:
-        temporary_name, descriptor = _open_thumbnail_output_file(dir_fd, filename)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(data)
-        # Linking publishes the complete file atomically and refuses collisions.
-        # Both names are relative to the same directory descriptor.
-        for counter in range(_THUMBNAIL_MAX_NAME_ATTEMPTS):
-            candidate = (
-                filename if counter == 0 else f"{Path(filename).stem} ({counter}).png"
-            )
-            try:
-                os.link(
-                    temporary_name,
-                    candidate,
-                    src_dir_fd=dir_fd,
-                    dst_dir_fd=dir_fd,
-                    follow_symlinks=False,
-                )
-            except FileExistsError:
-                continue
-            published_name = candidate
-            break
-        if published_name is None:
-            raise _ThumbnailDownloadError(
-                "could not choose a unique thumbnail image file name"
-            )
-        final_path = output_dir / published_name
-        try:
-            created = os.stat(published_name, dir_fd=dir_fd, follow_symlinks=False)
-            visible = os.stat(final_path, follow_symlinks=False)
-            expected = os.path.join(canonical_output_dir, published_name)
-            unchanged = os.path.samestat(created, visible) and (
-                os.path.normcase(os.path.realpath(final_path))
-                == os.path.normcase(expected)
-            )
-        except OSError:
-            unchanged = False
-        if not unchanged:
-            raise _ThumbnailDownloadError(
-                "the task output directory changed while saving the thumbnail image"
-            )
-        complete = True
-        return final_path
     except OSError:
+        os.unlink(name, dir_fd=dir_fd)
         raise _ThumbnailDownloadError(
             "could not save the thumbnail image in the task workspace"
         ) from None
-    finally:
-        for name in (temporary_name, published_name if not complete else None):
-            if name is not None:
-                try:
-                    os.unlink(name, dir_fd=dir_fd)
-                except FileNotFoundError:
-                    pass
+    return output_dir / name
 
 
 @mcp.tool()
 async def google_slides_get_slide_thumbnail(
     presentation_id: str,
     slide_id: str | None = None,
-    page_number: _PageNumber = None,
+    page_number: StrictInt | None = None,
     size: _ThumbnailSize = "LARGE",
 ) -> str:
     """
@@ -1796,18 +1622,15 @@ async def google_slides_get_slide_thumbnail(
         and a page outside the deck's slide count is rejected.
 
     size selects the image size Google renders: "LARGE" (the default),
-    "MEDIUM", or "SMALL". The bytes are decoded as a PNG image before this tool
-    reports success, so a body that only starts with the PNG signature is
-    rejected instead of being saved as a deliverable.
+    "MEDIUM", or "SMALL". PNG format and integrity are checked before saving.
 
     The result reports the saved PNG's path in the current task workspace
     output directory, its mime_type ("image/png"), its byte size, and the
-    presentation and slide ids. A temporary file is written completely before
-    an atomic, non-overwriting link publishes the PNG. Temporary names are
-    cleaned on success and handled failures; an abrupt process termination
-    can leave a hidden .tmp file, but not a partially published PNG. The successful result omits the short-lived thumbnail link
-    Google returns, and the image download
-    sends no cookie or Google credentials on any hop.
+    presentation and slide ids. The file is created exclusively, so an existing
+    file is never overwritten. A handled write failure removes the new file;
+    abrupt termination can leave a partial file that was not reported as a
+    successful result. The result omits the short-lived thumbnail link, and
+    the image download sends no cookie or Google credentials on any hop.
 
     The host attaches a durable file_ref (file_id) to a successful result
     after registering the saved file. Only a successful result with a
@@ -1822,30 +1645,10 @@ async def google_slides_get_slide_thumbnail(
     """
     opened = False
     try:
-        if not isinstance(presentation_id, str) or not presentation_id.strip():
-            return _error("'presentation_id' must be a non-empty string.")
-        if slide_id is not None and not isinstance(slide_id, str):
-            return _error("'slide_id' must be a string.")
-        if page_number is not None and (
-            isinstance(page_number, bool) or not isinstance(page_number, int)
-        ):
-            return _error("'page_number' must be an integer.")
-        if not isinstance(size, str):
-            return _error("'size' must be one of SMALL, MEDIUM, LARGE.")
-        if slide_id is None and page_number is None:
+        if (slide_id is None) == (page_number is None):
             return _error(
                 "Provide exactly one of slide_id (a slide object id) or "
-                "page_number (1-based); neither was given."
-            )
-        if slide_id is not None and page_number is not None:
-            return _error(
-                "Provide exactly one of slide_id (a slide object id) or "
-                "page_number (1-based); both were given."
-            )
-        normalized_size = size.strip().upper()
-        if normalized_size not in _THUMBNAIL_SIZES:
-            return _error(
-                f"Unknown size '{size}'. Supported sizes: SMALL, MEDIUM, LARGE."
+                "page_number (1-based)."
             )
         if slide_id is not None:
             slide_id = slide_id.strip()
@@ -1866,16 +1669,7 @@ async def google_slides_get_slide_thumbnail(
             .execute()
         )
         opened = True
-        slide_entries = (
-            presentation.get("slides", []) if isinstance(presentation, dict) else []
-        )
-        object_ids = [
-            slide["objectId"]
-            for slide in slide_entries
-            if isinstance(slide, dict)
-            and isinstance(slide.get("objectId"), str)
-            and slide["objectId"]
-        ]
+        object_ids = [slide["objectId"] for slide in presentation.get("slides", [])]
         if not object_ids:
             return _error("The presentation has no slides to render.")
         if page_number is not None:
@@ -1899,37 +1693,29 @@ async def google_slides_get_slide_thumbnail(
                 presentationId=pres_id,
                 pageObjectId=target_slide_id,
                 thumbnailProperties_mimeType="PNG",
-                thumbnailProperties_thumbnailSize=normalized_size,
+                thumbnailProperties_thumbnailSize=size,
             )
             .execute()
         )
-        content_url = (
-            thumbnail.get("contentUrl") if isinstance(thumbnail, dict) else None
-        )
-        if not isinstance(content_url, str) or not content_url.strip():
+        content_url = thumbnail.get("contentUrl")
+        if not content_url:
             return _error(
                 "Google Slides did not return a thumbnail image URL for this slide."
             )
 
         data = await _download_thumbnail_image(content_url)
-        _, output_dir, canonical_output_dir, output_dir_fd = (
-            _open_thumbnail_output_directory()
-        )
+        output_dir, output_dir_fd = _open_thumbnail_output_directory()
         try:
             output_path = _write_thumbnail_png(
                 data,
                 output_dir=output_dir,
-                canonical_output_dir=canonical_output_dir,
                 dir_fd=output_dir_fd,
                 filename=_thumbnail_filename(
                     page_number=page_number, slide_object_id=target_slide_id
                 ),
             )
         finally:
-            try:
-                os.close(output_dir_fd)
-            except OSError:
-                pass
+            os.close(output_dir_fd)
         width = thumbnail.get("width")
         height = thumbnail.get("height")
         return json.dumps(
@@ -1947,10 +1733,10 @@ async def google_slides_get_slide_thumbnail(
             ensure_ascii=False,
         )
     except (ValueError, _ThumbnailDownloadError) as e:
-        logger.error("Could not render slide thumbnail: %s", type(e).__name__)
+        logger.error("Could not render slide thumbnail: %s", str(e))
         return _error(str(e))
     except Exception as e:
-        logger.error("Error rendering slide thumbnail: %s", type(e).__name__)
+        logger.error("Error rendering slide thumbnail: %s", str(e))
         return _presentation_error(e, presentation_id, opened=opened)
 
 

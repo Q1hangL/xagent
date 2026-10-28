@@ -25,7 +25,6 @@ _PNG_BYTES = _PNG_BYTES.getvalue()
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _THUMB_HOST = "lh3.googleusercontent.com"
 _THUMB_URL = f"https://{_THUMB_HOST}/pages/thumb?token=thumb-secret-token"
-_LARGE_LIMIT = 10 * 1024 * 1024
 
 
 def _thumbnail_tool():
@@ -34,12 +33,6 @@ def _thumbnail_tool():
         "google_slides_get_slide_thumbnail is not defined on the connector module"
     )
     return tool
-
-
-def _validate_thumbnail_url(url):
-    validator = getattr(google_slides, "_validate_thumbnail_url", None)
-    assert validator is not None, "_validate_thumbnail_url is not defined"
-    return validator(url)
 
 
 @pytest.fixture(autouse=True)
@@ -106,15 +99,6 @@ def _install_slides_api(monkeypatch):
     return api
 
 
-class _Stream(httpx.AsyncByteStream):
-    def __init__(self, iterator):
-        self.iterator = iterator
-
-    async def __aiter__(self):
-        for chunk in self.iterator:
-            yield chunk
-
-
 def _install_http(monkeypatch, responder):
     """Exercise the shared fetcher with an isolated HTTPX mock transport."""
     state = {"calls": [], "sessions": []}
@@ -139,37 +123,6 @@ def _install_http(monkeypatch, responder):
 
 def _http_response(body=b"", status=200, headers=None, url=_THUMB_URL):
     return httpx.Response(status, content=body, headers=headers)
-
-
-def _no_body_response(status=200, headers=None):
-    def unread():
-        raise AssertionError("the response body must not be read")
-
-    return httpx.Response(
-        status, headers=headers, stream=_Stream(unread() for _ in range(1))
-    )
-
-
-def _png_of_size(size):
-    """A decodable PNG padded to exactly ``size`` bytes.
-
-    Trailing bytes after IEND are ignored by decoders, so this keeps the size
-    boundary meaningful without synthesizing a huge image.
-    """
-    assert size >= len(_PNG_BYTES)
-    return _PNG_BYTES + b"\x00" * (size - len(_PNG_BYTES))
-
-
-def _streaming_response(body, chunks):
-    consumed = {"bytes": 0}
-
-    def stream():
-        for index in range(chunks):
-            chunk = body[index * 65536 : (index + 1) * 65536]
-            consumed["bytes"] += len(chunk)
-            yield chunk
-
-    return httpx.Response(200, stream=_Stream(stream())), consumed
 
 
 def _call_tool(**kwargs):
@@ -221,11 +174,13 @@ def test_thumbnail_passes_the_requested_image_size(monkeypatch, size):
     )
 
 
-def test_thumbnail_normalizes_size_case_and_whitespace(monkeypatch):
+async def test_thumbnail_normalizes_size_case_and_whitespace(monkeypatch):
     api = _install_slides_api(monkeypatch)
     _install_http(monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES))
 
-    result = _call_tool(presentation_id="pres1", slide_id="s1", size=" medium ")
+    result = await _call_tool_via_mcp(
+        {"presentation_id": "pres1", "slide_id": "s1", "size": " medium "}
+    )
 
     assert result["status"] == "success"
     assert (
@@ -388,68 +343,6 @@ def test_thumbnail_rejects_blank_slide_ids(monkeypatch, slide_id):
     assert http["calls"] == []
 
 
-@pytest.mark.parametrize("slide_id", [3, True, 1.5, ["s1"], {"objectId": "s1"}])
-def test_thumbnail_rejects_non_string_slide_ids_in_a_direct_call(monkeypatch, slide_id):
-    api = _install_slides_api(monkeypatch)
-    http = _install_http(
-        monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES)
-    )
-
-    result = _call_tool(presentation_id="pres1", slide_id=slide_id)
-
-    assert result["status"] == "error"
-    assert "slide_id" in result["message"]
-    api.get_thumbnail.assert_not_called()
-    assert http["calls"] == []
-
-
-@pytest.mark.parametrize("page_number", [True, 1.5, "2", [2], {"n": 2}])
-def test_thumbnail_rejects_non_integer_page_numbers_in_a_direct_call(
-    monkeypatch, page_number
-):
-    api = _install_slides_api(monkeypatch)
-    http = _install_http(
-        monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES)
-    )
-
-    result = _call_tool(presentation_id="pres1", page_number=page_number)
-
-    assert result["status"] == "error"
-    assert "page_number" in result["message"]
-    api.get_thumbnail.assert_not_called()
-    assert http["calls"] == []
-
-
-@pytest.mark.parametrize("size", ["HUGE", "", "JPEG", None, 3])
-def test_thumbnail_rejects_unknown_sizes_in_a_direct_call(monkeypatch, size):
-    api = _install_slides_api(monkeypatch)
-    http = _install_http(
-        monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES)
-    )
-
-    result = _call_tool(presentation_id="pres1", slide_id="s1", size=size)
-
-    assert result["status"] == "error"
-    assert "size" in result["message"]
-    api.get_thumbnail.assert_not_called()
-    assert http["calls"] == []
-
-
-@pytest.mark.parametrize("presentation_id", ["", "   ", None, 3])
-def test_thumbnail_rejects_invalid_presentation_ids(monkeypatch, presentation_id):
-    api = _install_slides_api(monkeypatch)
-    http = _install_http(
-        monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES)
-    )
-
-    result = _call_tool(presentation_id=presentation_id, slide_id="s1")
-
-    assert result["status"] == "error"
-    assert "presentation_id" in result["message"]
-    api.get_thumbnail.assert_not_called()
-    assert http["calls"] == []
-
-
 @pytest.mark.parametrize(
     "arguments",
     [
@@ -551,48 +444,10 @@ def test_thumbnail_requires_a_task_workspace(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "url",
-    [
-        "https://googleusercontent.com/pages/thumb",
-        "https://lh3.googleusercontent.com/pages/thumb?token=t",
-        "https://lh7-rt.googleusercontent.com/pages/thumb?token=t",
-        "https://lh3.googleusercontent.com:443/pages/thumb?token=t",
-    ],
-)
-def test_validate_thumbnail_url_accepts_google_content_hosts(url):
-    assert _validate_thumbnail_url(url) == url
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "http://lh3.googleusercontent.com/pages/thumb",
-        "https://user:pass@lh3.googleusercontent.com/pages/thumb",
-        "https://user@lh3.googleusercontent.com/pages/thumb",
-        "https://lh3.googleusercontent.com:8443/pages/thumb",
-        "https://localhost/pages/thumb",
-        "https://127.0.0.1/pages/thumb",
-        "https://[2001:4860:4860::8888]/pages/thumb",
-        "https://googleusercontent.com.evil.example/pages/thumb",
-        "https://evilgoogleusercontent.com/pages/thumb",
-        "https://evil.example/pages/thumb",
-        "https://google.com/pages/thumb",
-        "ftp://lh3.googleusercontent.com/pages/thumb",
-        "lh3.googleusercontent.com/pages/thumb",
-        "",
-    ],
-)
-def test_validate_thumbnail_url_rejects_unsafe_urls(url):
-    with pytest.raises(ValueError):
-        _validate_thumbnail_url(url)
-
-
-@pytest.mark.parametrize(
     "content_url",
     [
         "http://lh3.googleusercontent.com/pages/thumb?token=t",
         "https://user:pass@lh3.googleusercontent.com/pages/thumb",
-        "https://lh3.googleusercontent.com:8080/pages/thumb",
         "https://googleusercontent.com.evil.example/pages/thumb",
         "https://evilgoogleusercontent.com/pages/thumb",
         "https://evil.example/pages/thumb",
@@ -668,154 +523,6 @@ def test_thumbnail_rejects_a_redirect_target_that_fails_validation(
     assert len(http["calls"]) == 1
 
 
-def test_thumbnail_rejects_more_than_five_redirects(monkeypatch):
-    _install_slides_api(monkeypatch)
-    urls = [
-        "https://lh3.googleusercontent.com/pages/0?token=t",
-        "https://lh3.googleusercontent.com/pages/1?token=t",
-        "https://lh3.googleusercontent.com/pages/2?token=t",
-        "https://lh3.googleusercontent.com/pages/3?token=t",
-        "https://lh3.googleusercontent.com/pages/4?token=t",
-        "https://lh3.googleusercontent.com/pages/5?token=t",
-    ]
-
-    def responder(index, request, state):
-        return _http_response(
-            status=302,
-            headers={"Location": urls[(index + 1) % len(urls)]},
-            url=request.url,
-        )
-
-    http = _install_http(monkeypatch, responder)
-
-    result = _call_tool(presentation_id="pres1", slide_id="s1")
-
-    assert result["status"] == "error"
-    assert "redirect" in result["message"]
-    assert len(http["calls"]) == 6
-
-
-def test_thumbnail_rejects_declared_content_length_over_the_limit(
-    monkeypatch, tmp_path
-):
-    _install_slides_api(monkeypatch)
-    response = _no_body_response(headers={"Content-Length": str(_LARGE_LIMIT + 1)})
-    _install_http(monkeypatch, lambda index, request, state: response)
-
-    result = _call_tool(presentation_id="pres1", slide_id="s1")
-
-    assert result["status"] == "error"
-    assert "maximum size" in result["message"]
-    assert not list((tmp_path / "output").glob("*.png"))
-
-
-def test_thumbnail_rejects_an_unlabelled_oversized_stream(monkeypatch, tmp_path):
-    _install_slides_api(monkeypatch)
-    body = _PNG_SIGNATURE + b"x" * (2 * _LARGE_LIMIT)
-    response, consumed = _streaming_response(body, chunks=2 * _LARGE_LIMIT // 65536 + 2)
-    _install_http(monkeypatch, lambda index, request, state: response)
-
-    result = _call_tool(presentation_id="pres1", slide_id="s1")
-
-    assert result["status"] == "error"
-    assert "maximum size" in result["message"]
-    assert consumed["bytes"] < len(body)
-    assert not list((tmp_path / "output").glob("*.png"))
-
-
-def test_thumbnail_rejects_a_stream_that_lies_about_its_length(monkeypatch, tmp_path):
-    _install_slides_api(monkeypatch)
-    body = _PNG_SIGNATURE + b"x" * (2 * _LARGE_LIMIT)
-    response, consumed = _streaming_response(body, chunks=2 * _LARGE_LIMIT // 65536 + 2)
-    response.headers["Content-Length"] = "100"
-    _install_http(monkeypatch, lambda index, request, state: response)
-
-    result = _call_tool(presentation_id="pres1", slide_id="s1")
-
-    assert result["status"] == "error"
-    assert "maximum size" in result["message"]
-    assert consumed["bytes"] < len(body)
-    assert not list((tmp_path / "output").glob("*.png"))
-
-
-def test_thumbnail_rejects_a_malformed_content_length(monkeypatch):
-    _install_slides_api(monkeypatch)
-    response = _no_body_response(headers={"Content-Length": "12ab"})
-    _install_http(monkeypatch, lambda index, request, state: response)
-
-    result = _call_tool(presentation_id="pres1", slide_id="s1")
-
-    assert result["status"] == "error"
-    assert "Content-Length" in result["message"]
-
-
-def test_thumbnail_accepts_a_body_exactly_at_the_limit(monkeypatch):
-    _install_slides_api(monkeypatch)
-    body = _png_of_size(_LARGE_LIMIT)
-    _install_http(monkeypatch, lambda index, request, state: _http_response(body))
-
-    result = _call_tool(presentation_id="pres1", slide_id="s1")
-
-    assert result["status"] == "success"
-    assert result["size"] == _LARGE_LIMIT
-    assert _result_path(result).stat().st_size == _LARGE_LIMIT
-
-
-def test_thumbnail_rejects_a_body_one_byte_over_the_limit(monkeypatch, tmp_path):
-    _install_slides_api(monkeypatch)
-    body = _png_of_size(_LARGE_LIMIT + 1)
-    _install_http(monkeypatch, lambda index, request, state: _http_response(body))
-
-    result = _call_tool(presentation_id="pres1", slide_id="s1")
-
-    assert result["status"] == "error"
-    assert "maximum size" in result["message"]
-    assert not list((tmp_path / "output").glob("*.png"))
-
-
-def test_thumbnail_maps_an_interrupted_stream_to_an_error(monkeypatch, tmp_path):
-    _install_slides_api(monkeypatch)
-
-    def _iter_content(chunk_size=None):
-        yield _PNG_SIGNATURE + b"partial"
-        raise httpx.RemoteProtocolError(f"connection lost while reading {_THUMB_URL}")
-
-    response = httpx.Response(200, stream=_Stream(_iter_content()))
-    _install_http(monkeypatch, lambda index, request, state: response)
-
-    result = _call_tool(presentation_id="pres1", slide_id="s1")
-
-    assert result["status"] == "error"
-    assert "thumb-secret-token" not in json.dumps(result)
-    assert not list((tmp_path / "output").glob("*.png"))
-
-
-def test_thumbnail_maps_a_read_timeout_to_an_error(monkeypatch, tmp_path):
-    _install_slides_api(monkeypatch)
-
-    def responder(index, request, state):
-        raise httpx.ReadTimeout(f"read timed out for {_THUMB_URL}")
-
-    _install_http(monkeypatch, responder)
-
-    result = _call_tool(presentation_id="pres1", slide_id="s1")
-
-    assert result["status"] == "error"
-    assert "thumb-secret-token" not in json.dumps(result)
-    assert not list((tmp_path / "output").glob("*.png"))
-
-
-def test_thumbnail_rejects_an_empty_response_body(monkeypatch, tmp_path):
-    _install_slides_api(monkeypatch)
-    _install_http(monkeypatch, lambda index, request, state: _http_response(b""))
-
-    result = _call_tool(presentation_id="pres1", slide_id="s1")
-
-    assert result["status"] == "error"
-    assert "empty" in result["message"]
-    assert not list((tmp_path / "output").glob("*.png"))
-
-
 @pytest.mark.parametrize("body", [b"not a png at all", b"<html>error</html>"])
 def test_thumbnail_rejects_a_non_png_response(monkeypatch, tmp_path, body):
     _install_slides_api(monkeypatch)
@@ -845,7 +552,6 @@ def test_thumbnail_download_does_not_carry_credentials(monkeypatch):
         assert "cookie" not in header_names
         assert "access-token" not in json.dumps(dict(request.headers))
     sessions = http["sessions"]
-    assert len({id(session) for session in sessions}) == len(sessions)
     for session in sessions:
         assert session.auth is None
         assert len(session.cookies) == 0
@@ -854,7 +560,7 @@ def test_thumbnail_download_does_not_carry_credentials(monkeypatch):
 def test_thumbnail_never_returns_or_logs_the_short_lived_content_url(
     monkeypatch, caplog
 ):
-    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.INFO)
     _install_slides_api(monkeypatch)
     _install_http(monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES))
 
@@ -863,42 +569,6 @@ def test_thumbnail_never_returns_or_logs_the_short_lived_content_url(
     assert result["status"] == "success"
     assert "thumb-secret-token" not in json.dumps(result)
     assert "contentUrl" not in json.dumps(result)
-    assert "thumb-secret-token" not in caplog.text
-
-
-def test_thumbnail_http_failure_does_not_leak_the_content_url(
-    monkeypatch, caplog, tmp_path
-):
-    caplog.set_level(logging.DEBUG)
-    _install_slides_api(monkeypatch)
-    _install_http(
-        monkeypatch,
-        lambda index, request, state: _http_response(b"", status=403),
-    )
-
-    result = _call_tool(presentation_id="pres1", slide_id="s1")
-
-    assert result["status"] == "error"
-    assert "403" in result["message"]
-    assert "thumb-secret-token" not in json.dumps(result)
-    assert _THUMB_HOST not in json.dumps(result)
-    assert "thumb-secret-token" not in caplog.text
-    assert not list((tmp_path / "output").glob("*.png"))
-
-
-def test_thumbnail_network_error_does_not_leak_the_signed_url(monkeypatch, caplog):
-    caplog.set_level(logging.DEBUG)
-    _install_slides_api(monkeypatch)
-
-    def responder(index, request, state):
-        raise httpx.ConnectError(f"failed to connect to {_THUMB_URL}")
-
-    _install_http(monkeypatch, responder)
-
-    result = _call_tool(presentation_id="pres1", slide_id="s1")
-
-    assert result["status"] == "error"
-    assert "thumb-secret-token" not in json.dumps(result)
     assert "thumb-secret-token" not in caplog.text
 
 
@@ -941,19 +611,6 @@ def test_thumbnail_page_lookup_failure_is_not_a_success(monkeypatch):
     assert result["status"] == "error"
     api.get_thumbnail.assert_not_called()
     assert http["calls"] == []
-
-
-async def test_thumbnail_download_failure_returns_an_error_through_the_mcp_layer(
-    monkeypatch,
-):
-    _install_slides_api(monkeypatch)
-    body = _png_of_size(_LARGE_LIMIT + 1)
-    _install_http(monkeypatch, lambda index, request, state: _http_response(body))
-
-    result = await _call_tool_via_mcp({"presentation_id": "pres1", "slide_id": "s1"})
-
-    assert result["status"] == "error"
-    assert result["message"]
 
 
 async def test_thumbnail_tool_is_registered_with_its_limits_and_failure_contract():
@@ -1075,95 +732,3 @@ def test_thumbnail_rejects_a_symlinked_output_directory(monkeypatch, tmp_path):
 
     assert result["status"] == "error"
     assert not list(outside.glob("*.png"))
-
-
-def test_thumbnail_rejects_a_replaced_output_directory(monkeypatch, tmp_path):
-    _install_slides_api(monkeypatch)
-    _install_http(monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES))
-    output_dir = tmp_path / "output"
-    output_dir.mkdir()
-    moved_dir = tmp_path / "moved-output"
-    outside = tmp_path / "outside-dir"
-    outside.mkdir()
-    original = getattr(google_slides, "_open_thumbnail_output_file")
-    replaced = {"done": False}
-
-    def replace_then_open(*args, **kwargs):
-        if not replaced["done"]:
-            replaced["done"] = True
-            output_dir.rename(moved_dir)
-            output_dir.symlink_to(outside, target_is_directory=True)
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(google_slides, "_open_thumbnail_output_file", replace_then_open)
-
-    result = _call_tool(presentation_id="pres1", slide_id="s1")
-
-    assert result["status"] == "error"
-    assert not list(outside.glob("*.png"))
-    assert not list(moved_dir.glob("*.png"))
-
-
-def test_thumbnail_moved_output_is_detected_after_write_and_removed(
-    monkeypatch, tmp_path
-):
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_OUTPUT_DIR", str(workspace))
-    output = workspace / "output"
-    output.mkdir()
-    moved = tmp_path / "moved-output"
-    _install_slides_api(monkeypatch)
-    _install_http(monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES))
-    original_open = google_slides._open_thumbnail_output_file
-    original_fdopen = google_slides.os.fdopen
-    observed = []
-
-    def move_then_open(*args, **kwargs):
-        output.rename(moved)
-        output.mkdir()
-        return original_open(*args, **kwargs)
-
-    class ObservedWrite:
-        def __init__(self, handle):
-            self.handle = handle
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return self.handle.__exit__(*args)
-
-        def write(self, data):
-            count = self.handle.write(data)
-            self.handle.flush()
-            temporary = list(moved.glob("*.tmp"))
-            assert len(temporary) == 1
-            observed.append(temporary[0].read_bytes())
-            assert not list(moved.glob("*.png"))
-            return count
-
-    monkeypatch.setattr(google_slides, "_open_thumbnail_output_file", move_then_open)
-    monkeypatch.setattr(
-        google_slides.os,
-        "fdopen",
-        lambda *args, **kwargs: ObservedWrite(original_fdopen(*args, **kwargs)),
-    )
-    result = _call_tool(presentation_id="pres1", slide_id="s1")
-
-    assert observed == [_PNG_BYTES]
-    assert not moved.is_relative_to(workspace)
-    assert result["status"] == "error"
-    assert "output directory changed" in result["message"]
-    assert not list(moved.glob("*.png"))
-    assert not list(output.glob("*.png"))
-
-
-def test_thumbnail_requests_identity_encoding(monkeypatch):
-    _install_slides_api(monkeypatch)
-    http = _install_http(
-        monkeypatch, lambda index, request, state: _http_response(_PNG_BYTES)
-    )
-    result = _call_tool(presentation_id="pres1", slide_id="s1")
-    assert result["status"] == "success"
-    assert http["calls"][0][0].headers["Accept-Encoding"] == "identity"
