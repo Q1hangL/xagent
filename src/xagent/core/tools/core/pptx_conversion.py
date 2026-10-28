@@ -21,6 +21,7 @@ import asyncio
 import logging
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 from typing import Callable, Final
 
@@ -86,37 +87,105 @@ def _produced_pdf_exists(pdf_path: Path) -> bool:
     return Path(pdf_path).is_file()
 
 
-_BACKGROUND_RECLAIMS: set[asyncio.Task[None]] = set()
+class _OwnedDirectoryCreation:
+    """One directory creation whose cleanup ownership lives on its thread.
 
+    The creating thread holds the cleanup responsibility until the waiting
+    coroutine accepts the result. If the coroutine is cancelled (including when
+    the event loop is shut down by ``asyncio.run``), it marks the creation
+    abandoned; the thread removes the directory once it exists. Because this
+    uses a plain non-daemon thread and no asyncio task, event-loop shutdown
+    cannot cancel the cleanup and cannot leave a pending task behind.
+    """
 
-async def _reclaim_created_directory(
-    creation: "asyncio.Task[Path]",
-) -> None:
-    """Wait for a directory creation that outlived its caller and remove it."""
-    try:
-        created = await creation
-    except BaseException:  # noqa: BLE001 - nothing was created to clean up
-        return
-    await asyncio.to_thread(shutil.rmtree, created, ignore_errors=True)
+    def __init__(
+        self,
+        create: Callable[[], Path],
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        self._create = create
+        self._loop = loop
+        self._future: asyncio.Future[Path] = loop.create_future()
+        self._lock = threading.Lock()
+        self._path: Path | None = None
+        self._abandoned = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="xagent-owned-directory",
+            daemon=False,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    async def wait(self) -> Path:
+        try:
+            return await self._future
+        except asyncio.CancelledError:
+            self.abandon()
+            raise
+
+    def abandon(self) -> None:
+        """Hand cleanup back to the creating thread (never leaves the loop)."""
+        with self._lock:
+            self._abandoned = True
+            path = self._path
+        if path is not None:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def _run(self) -> None:
+        try:
+            path = self._create()
+        except BaseException as exc:  # noqa: BLE001 - report to the waiter
+            self._deliver(exc=exc)
+            return
+        with self._lock:
+            self._path = path
+            abandoned = self._abandoned
+        if abandoned:
+            shutil.rmtree(path, ignore_errors=True)
+            return
+        self._deliver(path=path)
+
+    def _deliver(
+        self, *, path: Path | None = None, exc: BaseException | None = None
+    ) -> None:
+        try:
+            self._loop.call_soon_threadsafe(self._settle, path, exc)
+        except RuntimeError:
+            # The loop is already closed: no coroutine can take ownership, so
+            # the creating thread removes the directory itself.
+            if path is not None:
+                shutil.rmtree(path, ignore_errors=True)
+
+    def _settle(self, path: Path | None, exc: BaseException | None) -> None:
+        if self._future.done():
+            if path is not None:
+                shutil.rmtree(path, ignore_errors=True)
+            return
+        if self._abandoned:
+            if path is not None:
+                shutil.rmtree(path, ignore_errors=True)
+            # The waiter is gone; resolve quietly so no exception is left
+            # unretrieved when the future is collected.
+            self._future.cancel()
+            return
+        if exc is not None:
+            self._future.set_exception(exc)
+        elif path is not None:
+            self._future.set_result(path)
 
 
 async def create_owned_directory(create: Callable[[], Path]) -> Path:
-    """Create one directory in a worker thread and own it on cancellation.
+    """Create one directory on a worker thread and own it on cancellation.
 
-    A cancelled ``asyncio.to_thread`` call does not stop the worker, so the
-    directory can still appear after the caller has returned. Cancellation
-    propagates immediately, while a background reclaim task waits for the
-    worker, removes the directory it created, and then exits. On success the
-    returned path is the caller's to clean up.
+    On success the returned path is the caller's to clean up. If the caller is
+    cancelled, the creating thread removes the directory itself, so cleanup
+    survives cancellation of the event loop that started the call.
     """
-    creation = asyncio.create_task(asyncio.to_thread(create))
-    try:
-        return await asyncio.shield(creation)
-    except asyncio.CancelledError:
-        reclaim = asyncio.create_task(_reclaim_created_directory(creation))
-        _BACKGROUND_RECLAIMS.add(reclaim)
-        reclaim.add_done_callback(_BACKGROUND_RECLAIMS.discard)
-        raise
+    creation = _OwnedDirectoryCreation(create, asyncio.get_running_loop())
+    creation.start()
+    return await creation.wait()
 
 
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:

@@ -579,19 +579,163 @@ def _lookup_persisted_file_id(path: Path) -> str | None:
         database.close()
 
 
-def _verify_registrations(
+@dataclass(frozen=True)
+class _PersistedFileRecord:
+    """Detached metadata snapshot for one registered file id."""
+
+    file_id: str
+    user_id: int | None
+    task_id: int | None
+    storage_status: str | None
+    storage_path: str | None
+    storage_key: str | None
+    detached_reason: str | None
+
+
+def _lookup_uploaded_file_record(file_id: str) -> _PersistedFileRecord | None:
+    """Return the metadata snapshot for one file id, or None when absent.
+
+    Metadata faults propagate so verification can distinguish "record absent"
+    from "record unreadable".
+    """
+    from ....web.models.uploaded_file import UploadedFile
+    from ...storage.manager import create_db_session
+
+    database = create_db_session()
+    try:
+        record = (
+            database.query(UploadedFile)
+            .filter(UploadedFile.file_id == str(file_id))
+            .first()
+        )
+        if record is None:
+            return None
+        return _PersistedFileRecord(
+            file_id=str(record.file_id),
+            user_id=int(record.user_id) if record.user_id is not None else None,
+            task_id=int(record.task_id) if record.task_id is not None else None,
+            storage_status=record.storage_status,
+            storage_path=str(record.storage_path) if record.storage_path else None,
+            storage_key=str(record.storage_key) if record.storage_key else None,
+            detached_reason=getattr(record, "detached_reason", None),
+        )
+    finally:
+        database.close()
+
+
+def _workspace_is_delegated(workspace: TaskWorkspace) -> bool:
+    """Whether registration may materialise files under a parent task root.
+
+    Delegated workspaces keep their own execution directory but persist files
+    under the parent task's canonical output directory, so a path-based lookup
+    of the original rendered image legitimately misses.
+    """
+    db_task_id = getattr(workspace, "db_task_id", None)
+    if db_task_id is None:
+        return False
+    try:
+        parsed_task_id = int(str(getattr(workspace, "id", "")).split("_")[-1])
+    except (TypeError, ValueError):
+        parsed_task_id = None
+    return parsed_task_id != int(db_task_id)
+
+
+def _expected_registration_owner(workspace: TaskWorkspace) -> tuple[int, int]:
+    """Return (owner user id, task id) that persisted records must belong to."""
+    from ....web.models.task import Task
+    from ...storage.manager import create_db_session
+
+    expected_task_id = getattr(workspace, "db_task_id", None) or getattr(
+        workspace, "current_task_id", None
+    )
+    if expected_task_id is None:
+        raise PptxRenderRegistrationError(
+            "Cannot verify slide registration without a persistent task owner."
+        )
+    database = create_db_session()
+    try:
+        row = (
+            database.query(Task.user_id)
+            .filter(Task.id == int(expected_task_id))
+            .first()
+        )
+    finally:
+        database.close()
+    if row is None:
+        raise PptxRenderRegistrationError(
+            "Cannot verify slide registration: the owning task record is missing."
+        )
+    return int(row.user_id), int(expected_task_id)
+
+
+def _authorized_record_roots(workspace: TaskWorkspace) -> list[Path]:
+    """Roots a persisted canonical path may live under for this workspace."""
+    roots: list[Path] = []
+    candidates: list[Any] = [
+        workspace.workspace_dir,
+        workspace.output_dir,
+        getattr(workspace, "base_dir", None),
+        *(getattr(workspace, "allowed_external_dirs", ()) or ()),
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            roots.append(Path(candidate).resolve())
+        except (OSError, RuntimeError):
+            continue
+    return roots
+
+
+def _persisted_record_problem(
+    record: _PersistedFileRecord,
+    *,
+    expected_user_id: int,
+    expected_task_id: int,
+    authorized_roots: list[Path],
+) -> str | None:
+    """Return why a record does not authorize this call, or None when it does."""
+    if record.detached_reason is not None:
+        return "the file record is detached"
+    if record.storage_status not in {None, "available", "legacy"}:
+        return f"the file storage status is {record.storage_status!r}"
+    if record.user_id != expected_user_id:
+        return "the file record belongs to another owner"
+    if record.task_id != expected_task_id:
+        return "the file record belongs to another task"
+    if record.storage_path:
+        try:
+            stored_path = Path(record.storage_path).resolve()
+        except (OSError, RuntimeError):
+            stored_path = None
+        if stored_path is not None and any(
+            stored_path == root or stored_path.is_relative_to(root)
+            for root in authorized_roots
+        ):
+            return None
+    if record.storage_key:
+        # A durable object key is canonical even when the local materialised
+        # copy lives in the parent task's directory (delegated workspaces).
+        return None
+    return "the file record has no authorized canonical path"
+
+
+def _verify_registrations_by_path(
     workspace: TaskWorkspace, rendered: list[RenderedPage]
 ) -> _RegistrationState:
-    """Classify every rendered PNG as registered, unregistered or unverified.
+    """Path-based fallback used when registration raised before returning ids.
 
     The workspace API answers the normal case. Because it reports metadata
     faults as "no record", a miss is re-checked with an exception-preserving
     lookup: only a working lookup that still finds nothing downgrades the page
-    to unregistered, while a fault keeps it unverified.
+    to unregistered, while a fault keeps it unverified. In a delegated
+    workspace a path miss is not proof of a missing registration, because the
+    persisted copy lives under the parent task directory.
     """
     registered: dict[int, str] = {}
     unregistered: set[int] = set()
     unverified: set[int] = set()
+    delegated = _workspace_is_delegated(workspace)
     for page in rendered:
         try:
             known_file_id = workspace.get_registered_file_id(str(page.path))
@@ -612,6 +756,8 @@ def _verify_registrations(
             continue
         if file_id:
             registered[page.page_number] = file_id
+        elif delegated:
+            unverified.add(page.page_number)
         else:
             unregistered.add(page.page_number)
     return _RegistrationState(
@@ -621,15 +767,101 @@ def _verify_registrations(
     )
 
 
+def _verify_returned_registrations(
+    workspace: TaskWorkspace,
+    rendered: list[RenderedPage],
+    registered_ids: tuple[str, ...],
+) -> tuple[_RegistrationState, dict[int, str]]:
+    """Classify pages using the ids registration returned and their records.
+
+    A returned id is checked against the persisted record's owner, task,
+    storage status and canonical location. In a delegated workspace the
+    canonical location is the parent task's output copy, so matching the
+    original render path is neither required nor attempted.
+    """
+    registered: dict[int, str] = {}
+    unregistered: set[int] = set()
+    unverified: set[int] = set()
+    problems: dict[int, str] = {}
+
+    def api_confirms(page: RenderedPage, returned_id: str) -> bool:
+        try:
+            api_file_id = workspace.get_registered_file_id(str(page.path))
+        except Exception:  # noqa: BLE001 - metadata fault, kept unverified below
+            return False
+        return bool(api_file_id) and str(api_file_id) == returned_id
+
+    try:
+        expected_user_id, expected_task_id = _expected_registration_owner(workspace)
+        authorized_roots = _authorized_record_roots(workspace)
+        can_validate = True
+    except Exception:  # noqa: BLE001 - metadata lookup fault on the owner task
+        logger.warning(
+            "Could not load the owning task for registration verification",
+            exc_info=True,
+        )
+        expected_user_id = 0
+        expected_task_id = 0
+        authorized_roots = []
+        can_validate = False
+
+    for page, registered_id in zip(rendered, registered_ids):
+        returned_id = str(registered_id)
+        confirms = api_confirms(page, returned_id)
+        try:
+            record = _lookup_uploaded_file_record(returned_id)
+        except Exception:  # noqa: BLE001 - explicit tri-state classification
+            if confirms:
+                registered[page.page_number] = returned_id
+            else:
+                unverified.add(page.page_number)
+            continue
+        if record is None:
+            unregistered.add(page.page_number)
+            continue
+        if can_validate:
+            problem = _persisted_record_problem(
+                record,
+                expected_user_id=expected_user_id,
+                expected_task_id=expected_task_id,
+                authorized_roots=authorized_roots,
+            )
+            if problem is None:
+                registered[page.page_number] = returned_id
+            elif confirms and record.storage_status in {"available", "legacy"}:
+                # The workspace API resolves the returned id to this path; the
+                # record shape is unusual but the registration is real, so keep
+                # it undelivered rather than deleting the image.
+                registered[page.page_number] = returned_id
+            else:
+                unverified.add(page.page_number)
+                problems[page.page_number] = problem
+        elif confirms:
+            registered[page.page_number] = returned_id
+        else:
+            unverified.add(page.page_number)
+    return (
+        _RegistrationState(
+            registered=registered,
+            unregistered=unregistered,
+            unverified=unverified,
+        ),
+        problems,
+    )
+
+
 def _register_rendered_pages(
     workspace: TaskWorkspace, rendered: list[RenderedPage]
 ) -> dict[int, str]:
-    """Batch-register every PNG and verify each registration is persisted."""
+    """Batch-register every PNG and verify each returned id against its record."""
     paths = [str(page.path) for page in rendered]
     try:
-        registered_ids = workspace.register_files([(path, None) for path in paths])
+        registered_ids = tuple(
+            str(file_id)
+            for file_id in workspace.register_files([(path, None) for path in paths])
+        )
     except Exception as exc:
-        state = _verify_registrations(workspace, rendered)
+        state = _verify_registrations_by_path(workspace, rendered)
         raise PptxRenderRegistrationError(
             f"Rendered slide images could not be registered durably: {exc}",
             registered_pages=tuple(sorted(state.registered)),
@@ -638,7 +870,7 @@ def _register_rendered_pages(
             unregistered_pages=tuple(sorted(state.unregistered)),
         ) from exc
     if len(registered_ids) != len(rendered):
-        state = _verify_registrations(workspace, rendered)
+        state = _verify_registrations_by_path(workspace, rendered)
         raise PptxRenderRegistrationError(
             f"Only {len(registered_ids)} of {len(rendered)} rendered slide "
             "images received a file id.",
@@ -647,14 +879,13 @@ def _register_rendered_pages(
             unverified_pages=tuple(sorted(state.unverified)),
             unregistered_pages=tuple(sorted(state.unregistered)),
         )
-    state = _verify_registrations(workspace, rendered)
+    state, problems = _verify_returned_registrations(
+        workspace, rendered, registered_ids
+    )
     returned_ids = {
         page.page_number: str(file_id)
         for page, file_id in zip(rendered, registered_ids)
     }
-    # A successful registration call already handed back these ids; a page
-    # whose lookup failed is unverified, not unregistered. Keep its returned
-    # id as a known registration candidate and never delete its image.
     known_registered = dict(state.registered)
     for page_number in state.unverified:
         known_registered.setdefault(page_number, returned_ids[page_number])
@@ -669,26 +900,19 @@ def _register_rendered_pages(
             unregistered_pages=tuple(sorted(state.unregistered)),
         )
     if state.unverified:
+        detail = "".join(
+            f" page {number}: {reason};" for number, reason in sorted(problems.items())
+        )
         raise PptxRenderRegistrationError(
             "Registration could not be verified for page(s) "
             f"{', '.join(str(number) for number in sorted(state.unverified))}; "
             "the images were kept because their registration may have "
-            "committed, but this call cannot claim delivery.",
+            f"committed, but this call cannot claim delivery.{detail}",
             registered_pages=tuple(sorted(known_registered)),
             registered_file_ids=dict(known_registered),
             unverified_pages=tuple(sorted(state.unverified)),
             unregistered_pages=(),
         )
-    for page, file_id in zip(rendered, registered_ids):
-        if state.registered.get(page.page_number) != str(file_id):
-            raise PptxRenderRegistrationError(
-                f"The persisted file id for page {page.page_number} does not "
-                "match the id returned by registration.",
-                registered_pages=tuple(sorted(state.registered)),
-                registered_file_ids=dict(state.registered),
-                unverified_pages=(),
-                unregistered_pages=(),
-            )
     return state.registered
 
 
@@ -735,18 +959,18 @@ def _create_output_directory(output_root: Path) -> Path:
     )
 
 
-async def _create_render_output_directory(workspace: TaskWorkspace) -> Path:
-    """Resolve and create a trusted per-call output directory inside output/.
+def _prepare_output_directory(workspace: TaskWorkspace) -> Path:
+    """Resolve, create and validate this call's output directory.
 
-    The workspace output root must resolve inside the workspace directory (a
-    symlinked output root that escapes it is refused), and the created
-    directory is verified to be a direct child of that resolved root before any
-    image is written.
+    This is blocking filesystem work and runs on a worker thread. The exclusive
+    creation and every validation step happen while the creating thread still
+    owns cleanup, so a cancellation during any of them cannot leak the
+    directory.
     """
     workspace_root = Path(workspace.workspace_dir).resolve()
     output_root = Path(workspace.output_dir)
     try:
-        resolved_output_root = await asyncio.to_thread(output_root.resolve, True)
+        resolved_output_root = output_root.resolve(True)
     except OSError as exc:
         raise PptxRenderOutputError(
             f"The workspace output directory is not available: {exc}"
@@ -760,23 +984,40 @@ async def _create_render_output_directory(workspace: TaskWorkspace) -> Path:
         raise PptxRenderOutputError(
             "The workspace output directory is not a directory."
         )
-    created = await create_owned_directory(
-        lambda: _create_output_directory(resolved_output_root)
-    )
+    created = _create_output_directory(resolved_output_root)
     try:
-        resolved_created = await asyncio.to_thread(created.resolve, True)
-    except OSError as exc:
-        await asyncio.to_thread(shutil.rmtree, created, True)
-        raise PptxRenderOutputError(
-            f"Could not verify the created slide image directory: {exc}"
-        ) from exc
-    if resolved_created.parent != resolved_output_root:
-        await asyncio.to_thread(shutil.rmtree, created, True)
-        raise PptxRenderOutputError(
-            "The created slide image directory is not directly inside the "
-            "workspace output directory."
+        try:
+            resolved_created = created.resolve(True)
+        except OSError as exc:
+            raise PptxRenderOutputError(
+                f"Could not verify the created slide image directory: {exc}"
+            ) from exc
+        if (
+            resolved_created.parent != resolved_output_root
+            or not resolved_created.is_relative_to(workspace_root)
+        ):
+            raise PptxRenderOutputError(
+                "The created slide image directory is not directly inside the "
+                "workspace output directory."
+            )
+        return resolved_created
+    except BaseException:
+        shutil.rmtree(created, ignore_errors=True)
+        raise
+
+
+async def _create_render_output_directory(workspace: TaskWorkspace) -> Path:
+    """Create this call's output directory without doing filesystem I/O on the loop."""
+    try:
+        return await create_owned_directory(
+            lambda: _prepare_output_directory(workspace)
         )
-    return resolved_created
+    except PptxRenderError:
+        raise
+    except OSError as exc:  # pragma: no cover - defensive fallback
+        raise PptxRenderOutputError(
+            f"Could not create the slide image directory: {exc}"
+        ) from exc
 
 
 def _remove_tree(path: Path | None) -> None:
@@ -853,7 +1094,7 @@ async def _cleanup_failed_render(
     if state is None:
         try:
             state = await _run_blocking(
-                lambda: _verify_registrations(workspace, rendered)
+                lambda: _verify_registrations_by_path(workspace, rendered)
             )
         except BaseException:  # pragma: no cover - keep files if unclassifiable
             logger.warning(
