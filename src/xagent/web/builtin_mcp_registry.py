@@ -617,7 +617,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "google-slides",
             "name": "Google Slides",
-            "description": "Connect to Google Slides to create presentations, add slides, and read slide content.",
+            "description": "Connect to Google Slides to create presentations, add slides, read slide content, and download single-slide thumbnails.",
             "icon": "https://www.google.com/s2/favicons?domain=slides.google.com&sz=128",
             "transport": "oauth",
             "provider_name": "google",

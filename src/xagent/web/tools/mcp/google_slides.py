@@ -3,22 +3,20 @@
 # isort: skip_file
 
 import asyncio
-import concurrent.futures
 import errno
 import io
-import ipaddress
 import json
 import logging
 import os
 import re
-import socket
-import threading
-import time
 import uuid
 from collections import Counter
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Annotated, Any, Literal
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlsplit
+
+import httpx
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-not-found]
@@ -27,8 +25,8 @@ from pydantic import BeforeValidator
 
 from mcp.server.fastmcp import FastMCP
 
-from ....core.utils import public_requests as requests
-from ....core.utils.security import public_http_destination, reject_private_network_host
+from ....core.tools.core.web_content import get_trusted_proxy_url, public_fetch_client
+from ....core.utils.security import fetch_public_http_bytes, host_matches_suffix
 from .utils import (
     GoogleFileKind,
     allowed_dirs_from_env,
@@ -1438,64 +1436,19 @@ def google_slides_batch_update(presentation_id: str, requests_json: str) -> str:
         return _presentation_error(e, presentation_id, editing=True)
 
 
-# Rendering one slide produces a short-lived signed image URL that is served
-# by Google's user-content host, not by the Slides API.  Downloading it must
-# therefore not reuse the OAuth transport, and the product bounds the transfer
-# (10 MiB, 30 s, 3 redirects) so a malformed response cannot exhaust a task.
+# Download signed image URLs separately from the Google API credentials.
+# The shared fetcher supplies public-IP pinning and its five-redirect limit.
 _THUMBNAIL_MAX_BYTES = 10 * 1024 * 1024
 _THUMBNAIL_TIMEOUT_SECONDS = 30.0
-_THUMBNAIL_MAX_REDIRECTS = 3
-_THUMBNAIL_CHUNK_BYTES = 64 * 1024
-# Google's getThumbnail documentation does not promise one fixed subdomain;
-# the images are served from Google's user-content domain (lh3, lh7-rt, ...).
 _THUMBNAIL_HOST_SUFFIX = "googleusercontent.com"
 _THUMBNAIL_PNG_MIME_TYPE = "image/png"
 _THUMBNAIL_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _THUMBNAIL_SIZES = ("SMALL", "MEDIUM", "LARGE")
-_THUMBNAIL_REQUEST_HEADERS = {
-    "Accept": "image/png",
-    "User-Agent": "Xagent-Google-Slides-Thumbnail/1.0",
-}
 _THUMBNAIL_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]")
 _THUMBNAIL_FILENAME_STEM_LENGTH = 120
-# The current task workspace, injected by the host exactly as for
-# google_drive_download_file; a thumbnail is another generated deliverable
-# under the same output directory.
 _THUMBNAIL_OUTPUT_DIR_ENV_VAR = "XAGENT_GOOGLE_DRIVE_OUTPUT_DIR"
-# The whole transfer (connect, headers, every redirect hop and the body) has
-# one absolute deadline. Cancellation interrupts connected sockets; the short
-# join grace also bounds the caller's wait for cleanup.
-_THUMBNAIL_TIMEOUT_GRACE_SECONDS = 1.0
-# Per socket operation caps; the absolute deadline above still shortens these.
-_THUMBNAIL_SOCKET_TIMEOUT_SECONDS = 10.0
-# A decoded thumbnail image is a small rendered page, not an arbitrary image
-# file; the cap stops a crafted PNG header from making Pillow allocate hugely.
 _THUMBNAIL_MAX_PIXEL_COUNT = 40_000_000
 _THUMBNAIL_MAX_NAME_ATTEMPTS = 10_000
-# Every download runs in one worker thread and holds one of a fixed number of
-# slots; DNS runs in a small fixed pool.  These are hard resource caps, not
-# per-call hints, so a burst cannot grow threads without bound.
-_THUMBNAIL_MAX_CONCURRENT_DOWNLOADS = 4
-_THUMBNAIL_MAX_DNS_RESOLVERS = 2
-_THUMBNAIL_DOWNLOAD_LOCK = threading.Lock()
-_THUMBNAIL_DOWNLOAD_WORKERS: set[threading.Thread] = set()
-_THUMBNAIL_DNS_SLOTS = threading.BoundedSemaphore(_THUMBNAIL_MAX_DNS_RESOLVERS)
-_THUMBNAIL_DNS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=_THUMBNAIL_MAX_DNS_RESOLVERS,
-    thread_name_prefix="google-slides-dns",
-)
-_THUMBNAIL_TRANSPORT_LOGGERS = (
-    "urllib3",
-    "urllib3.connection",
-    "urllib3.connectionpool",
-    "urllib3.poolmanager",
-    "requests",
-)
-
-# The signed image URL is short-lived access material.  It must never be
-# returned, logged by this tool's own request, or embedded in an exception
-# message.  Errors replace the whole URL so neither its path nor its parameters
-# can be observed.
 _URL_IN_TEXT = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 _SECRET_TOKEN_PARAMETER = re.compile(
     r"(?i)\b(access_token|token|signature|sig|opaque|x-goog-[a-z0-9-]+)="
@@ -1503,240 +1456,31 @@ _SECRET_TOKEN_PARAMETER = re.compile(
 )
 
 
-def _redact_thumbnail_secrets(text: object) -> str:
-    """Replace every signed image URL and token parameter in ``text``."""
-    if not isinstance(text, str):
-        return ""
+def _redact_thumbnail_secrets(text: str) -> str:
+    """Remove whole URLs from download exceptions, including mixed-case schemes."""
     redacted = _URL_IN_TEXT.sub("<redacted URL>", text)
     return _SECRET_TOKEN_PARAMETER.sub(
         lambda match: f"{match.group(1)}=<redacted>", redacted
     )
 
 
-def _redact_error_payload(payload: str) -> str:
-    """Apply URL redaction to the message of a connector error payload."""
-    try:
-        parsed = json.loads(payload)
-    except (TypeError, ValueError):
-        return _error(_redact_thumbnail_secrets(payload))
-    if not isinstance(parsed, dict):
-        return _error(_redact_thumbnail_secrets(payload))
-    message = parsed.get("message")
-    if isinstance(message, str):
-        parsed["message"] = _redact_thumbnail_secrets(message)
-    return json.dumps(parsed, ensure_ascii=False)
+# HTTPX logs the complete request URL at INFO, including the pinned-IP URL.
+# Only records emitted in this connector's download context are suppressed.
+_THUMBNAIL_DOWNLOAD_LOG_CONTEXT: ContextVar[bool] = ContextVar(
+    "slide_thumbnail_download", default=False
+)
 
 
-class _ThreadScopedTransportLogSuppressor(logging.Filter):
-    """Suppress transport records from the set of active download threads."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.lock = threading.Lock()
-        self.threads: set[int] = set()
-
+class _ThumbnailHttpLogFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        # Logging may omit record.thread; filters run in the emitting thread.
-        with self.lock:
-            return threading.get_ident() not in self.threads
+        return not _THUMBNAIL_DOWNLOAD_LOG_CONTEXT.get()
 
 
-# Keep one filter attached for the module's lifetime. Removing filters while
-# logging iterates its live list can skip a different download's filter.
-_THUMBNAIL_TRANSPORT_FILTER = _ThreadScopedTransportLogSuppressor()
-for _transport_logger_name in _THUMBNAIL_TRANSPORT_LOGGERS:
-    logging.getLogger(_transport_logger_name).addFilter(_THUMBNAIL_TRANSPORT_FILTER)
-
-
-def _suppress_transport_logs_for_current_thread() -> int:
-    thread_id = threading.get_ident()
-    with _THUMBNAIL_TRANSPORT_FILTER.lock:
-        _THUMBNAIL_TRANSPORT_FILTER.threads.add(thread_id)
-    return thread_id
-
-
-def _restore_transport_logs(thread_id: int) -> None:
-    with _THUMBNAIL_TRANSPORT_FILTER.lock:
-        _THUMBNAIL_TRANSPORT_FILTER.threads.discard(thread_id)
-
-
-def _thumbnail_getaddrinfo(
-    hostname: str, port: int, deadline: float, cancel: Any
-) -> list[Any]:
-    """Bound outstanding resolver work as well as the caller's DNS wait."""
-    if cancel.stopped:
-        raise _ThumbnailDownloadError("thumbnail image download timed out")
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise _ThumbnailDownloadError("thumbnail image download timed out")
-    if not _THUMBNAIL_DNS_SLOTS.acquire(blocking=False):
-        raise _ThumbnailDownloadError(
-            "thumbnail image resolver is busy; try again shortly"
-        )
-    try:
-        future = _THUMBNAIL_DNS_EXECUTOR.submit(
-            socket.getaddrinfo, hostname, port, socket.AF_UNSPEC, socket.SOCK_STREAM
-        )
-    except BaseException:
-        _THUMBNAIL_DNS_SLOTS.release()
-        raise
-    # A timeout does not cancel queued work or return its admission slot.
-    # Only actual completion releases it, so retained work cannot accumulate.
-    future.add_done_callback(lambda _future: _THUMBNAIL_DNS_SLOTS.release())
-    try:
-        return future.result(timeout=min(remaining, _THUMBNAIL_TIMEOUT_SECONDS))
-    except concurrent.futures.TimeoutError:
-        cancel.stop()
-        raise socket.timeout("thumbnail image download timed out") from None
-    except OSError:
-        raise OSError("thumbnail image host did not resolve") from None
-
-
-def _resolve_thumbnail_addresses(
-    hostname: str, port: int, deadline: float, cancel: Any
-) -> list[str]:
-    """Resolve and validate a public target under the download deadline."""
-    infos = _thumbnail_getaddrinfo(hostname, port, deadline, cancel)
-    addresses: list[str] = []
-    for info in infos:
-        try:
-            address = str(info[4][0])
-            reject_private_network_host(address)
-        except (IndexError, TypeError, ValueError):
-            raise ValueError("thumbnail image host resolved to an invalid address")
-        addresses.append(address)
-    if not addresses:
-        raise OSError("thumbnail image host did not resolve")
-    return addresses
-
-
-class _BoundedThumbnailDestinationPolicy:
-    """Public-only destination policy with a deadline-bounded DNS lookup."""
-
-    def __init__(self, deadline: float, cancel: Any) -> None:
-        self._deadline = deadline
-        self._cancel = cancel
-
-    def destination(self, url: str) -> tuple[str, int]:
-        return public_http_destination(url)
-
-    def validate_resolved(self, url: str, addresses: list[str]) -> None:
-        if not addresses:
-            raise ValueError("thumbnail image host did not resolve")
-        for address in addresses:
-            reject_private_network_host(address)
-
-    def resolve_sync(self, url: str) -> list[str]:
-        hostname, port = public_http_destination(url)
-        return _resolve_thumbnail_addresses(
-            hostname, port, self._deadline, self._cancel
-        )
-
-    async def resolve(self, url: str) -> list[str]:
-        return await asyncio.to_thread(self.resolve_sync, url)
-
-
-def _install_thumbnail_destination_policy(
-    session: Any, deadline: float, cancel: Any
-) -> None:
-    policy = _BoundedThumbnailDestinationPolicy(deadline, cancel)
-    for prefix in ("https://", "http://"):
-        adapter = session.get_adapter(prefix)
-        if hasattr(adapter, "_policy"):
-            adapter._policy = policy
-
-
-class _ThumbnailCancelToken:
-    """Lets the waiting caller interrupt a blocked transfer at its deadline."""
-
-    def __init__(self) -> None:
-        self._stopped = threading.Event()
-        self._lock = threading.Lock()
-        self._interrupter: Any = None
-
-    @property
-    def stopped(self) -> bool:
-        return self._stopped.is_set()
-
-    def set_interrupter(self, interrupter: Any) -> None:
-        with self._lock:
-            self._interrupter = interrupter
-            stopped = self._stopped.is_set()
-        if stopped:
-            _run_interrupter(interrupter)
-
-    def clear_interrupter(self) -> None:
-        with self._lock:
-            self._interrupter = None
-
-    def stop(self) -> None:
-        with self._lock:
-            self._stopped.set()
-            interrupter = self._interrupter
-        if interrupter is not None:
-            _run_interrupter(interrupter)
-
-
-def _run_interrupter(interrupter: Any) -> None:
-    try:
-        interrupter()
-    except Exception:
-        pass
-
-
-def _thumbnail_response_socket(response: Any) -> Any:
-    """Return the socket a streaming response is reading from, if reachable."""
-    raw = getattr(response, "raw", None)
-    if raw is None:
-        return None
-    connection = getattr(raw, "_connection", None)
-    sock = getattr(connection, "sock", None)
-    if sock is not None:
-        return sock
-    file_object = getattr(getattr(getattr(raw, "_fp", None), "fp", None), "raw", None)
-    return getattr(file_object, "_sock", None)
-
-
-def _shutdown_thumbnail_response(response: Any) -> None:
-    """Interrupt a read that is blocked on the response's socket."""
-    sock = _thumbnail_response_socket(response)
-    if sock is not None:
-        try:
-            sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        return
-    try:
-        response.close()
-    except Exception:
-        pass
-
-
-def _shutdown_thumbnail_connection(connection: Any) -> None:
-    """Interrupt DNS-independent connection phases: connect and headers.
-
-    The response object does not exist while the socket is connecting or while
-    response headers are being parsed, so cancel must be able to reach the
-    connection itself.
-    """
-    sock = getattr(connection, "sock", None)
-    if sock is not None:
-        try:
-            sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-    try:
-        connection.close()
-    except Exception:
-        pass
+logging.getLogger("httpx").addFilter(_ThumbnailHttpLogFilter())
 
 
 class _ThumbnailDownloadError(RuntimeError):
-    """A failure while fetching a thumbnail image.
-
-    The message is deliberately generic: the signed image URL must never reach
-    the caller, a log line, or an exception's text.
-    """
+    """A thumbnail transfer or output failure safe to show to the caller."""
 
 
 def _normalize_thumbnail_size(value: object) -> str:
@@ -1774,210 +1518,77 @@ def _strict_page_number(value: object) -> int | None:
 _PageNumber = Annotated[int | None, BeforeValidator(_strict_page_number)]
 
 
-def _is_allowed_thumbnail_host(hostname: str) -> bool:
-    return hostname == _THUMBNAIL_HOST_SUFFIX or hostname.endswith(
-        "." + _THUMBNAIL_HOST_SUFFIX
-    )
+def _validate_thumbnail_host(hostname: str) -> None:
+    if not host_matches_suffix(hostname, _THUMBNAIL_HOST_SUFFIX):
+        raise ValueError("thumbnail image URL host is not a Google image host")
 
 
 def _validate_thumbnail_url(url: object) -> str:
-    """Return ``url`` when it is an HTTPS Google user-content image URL.
-
-    Every redirect hop is passed through this function, so a permitted first
-    URL cannot hand the next hop to a plain client.
-    """
+    """Check the initial HTTPS image URL; the shared fetcher validates every hop."""
     if not isinstance(url, str) or not url.strip():
         raise ValueError("thumbnail image URL is missing")
-    if "\\" in url or any(
-        character.isspace() or ord(character) < 32 for character in url
-    ):
+    if "\\" in url or any(c.isspace() or ord(c) < 32 for c in url):
         raise ValueError("thumbnail image URL contains invalid characters")
-    try:
-        parsed = urlsplit(url)
-    except ValueError:
-        raise ValueError("thumbnail image URL could not be parsed") from None
+    parsed = urlsplit(url)
     if parsed.scheme.lower() != "https":
         raise ValueError("thumbnail image URL must use HTTPS")
-    if (
-        parsed.username is not None
-        or parsed.password is not None
-        or "@" in parsed.netloc
-    ):
+    if parsed.username is not None or parsed.password is not None:
         raise ValueError("thumbnail image URL must not include user information")
-    hostname = parsed.hostname
-    if not hostname:
+    if not parsed.hostname:
         raise ValueError("thumbnail image URL has no host")
-    try:
-        port = parsed.port
-    except ValueError:
-        raise ValueError("thumbnail image URL has an invalid port") from None
-    if port not in (None, 443):
+    if parsed.port not in (None, 443):
         raise ValueError("thumbnail image URL must not use a non-standard port")
-    host = hostname.rstrip(".").lower()
-    try:
-        ipaddress.ip_address(host)
-    except ValueError:
-        pass
-    else:
-        raise ValueError("thumbnail image URL host is not a Google image host")
-    if host in {"localhost", "ip6-localhost"} or host.endswith(".localhost"):
-        raise ValueError("thumbnail image URL host is not a Google image host")
-    if not _is_allowed_thumbnail_host(host):
-        raise ValueError("thumbnail image URL host is not a Google image host")
+    _validate_thumbnail_host(parsed.hostname.rstrip("."))
     return url
 
 
-def _new_thumbnail_session() -> requests.Session:
-    """A fresh public-only client for the image host.
-
-    It carries no connector credentials, authorization or cookies, and it is
-    separate from the Google API client's OAuth transport.
-    """
-    return requests.Session()
-
-
-def _open_thumbnail_proxy_socket(
-    connection: Any, deadline: float, cancel: Any
-) -> socket.socket:
-    """Connect to the configured trusted proxy without unbounded DNS.
-
-    The adapter has already checked the proxy against the operator's opt-in.
-    Its addresses may be private. Keep the logical hostname on the connection
-    for proxy TLS verification, SNI and the target CONNECT handshake.
-    """
-    infos = _thumbnail_getaddrinfo(
-        connection._dns_host, connection.port, deadline, cancel
-    )
-    for family, socktype, protocol, _, address in infos:
-        operation_timeout, _ = _thumbnail_hop_timeouts(deadline, cancel)
-        sock = socket.socket(family, socktype, protocol)
-        connection.sock = sock
-        try:
-            if cancel.stopped:
-                raise _ThumbnailDownloadError("thumbnail image download timed out")
-            sock.settimeout(operation_timeout)
-            for option in connection.socket_options or ():
-                sock.setsockopt(*option)
-            if connection.source_address:
-                sock.bind(connection.source_address)
-            sock.connect(address)
-            if cancel.stopped:
-                raise _ThumbnailDownloadError("thumbnail image download timed out")
-            return sock
-        except OSError:
-            sock.close()
-            connection.sock = None
-        except BaseException:
-            sock.close()
-            connection.sock = None
-            raise
-    _thumbnail_hop_timeouts(deadline, cancel)
-    raise _ThumbnailDownloadError("thumbnail image proxy connection failed")
+async def _prepare_thumbnail_request(request: httpx.Request) -> None:
+    if request.url.scheme != "https" or request.url.port not in (None, 443):
+        raise ValueError("thumbnail image URL must use standard HTTPS")
+    # A redirect can set cookies on the isolated client; never replay them.
+    request.headers.pop("Cookie", None)
+    request.headers.pop("Authorization", None)
 
 
-def _send_thumbnail_request(
-    session: Any,
-    prepared_request: Any,
-    *,
-    timeout: Any,
-    cancel: Any = None,
-    deadline: float | None = None,
-) -> Any:
-    """Send one handled hop without requests' redirect-body pre-read.
+async def _check_thumbnail_length(response: httpx.Response) -> None:
+    length = response.headers.get("Content-Length")
+    if length is not None and not (length.isascii() and length.isdigit()):
+        raise ValueError("thumbnail image has an invalid Content-Length")
 
-    ``requests.Session.send`` resolves ``allow_redirects=False`` by consuming
-    the redirect response body to build ``Response.next``; that would buffer an
-    unbounded body before the Location is validated.  Calling the mounted
-    adapter directly keeps the streaming response unread and keeps the
-    public-host checks of the shared client.  The adapter's connection is
-    exposed to the cancel token so a deadline can interrupt connect and header
-    reads, not just body reads on an existing response.
-    """
-    adapter = session.get_adapter(prepared_request.url)
-    original = adapter.get_connection_with_tls_context
-    had_instance_attr = "get_connection_with_tls_context" in vars(adapter)
-    previous = vars(adapter).get("get_connection_with_tls_context")
-    tracked_pools: set[int] = set()
-    tracked_connections: set[int] = set()
-    saved_attributes: list[tuple[Any, str, bool, Any]] = []
 
-    def replace_attribute(obj: Any, name: str, value: Any) -> None:
-        saved_attributes.append((obj, name, name in vars(obj), vars(obj).get(name)))
-        setattr(obj, name, value)
-
-    def tracked(
-        request: Any, verify: Any, proxies: Any = None, cert: Any = None
-    ) -> Any:
-        pool = original(request, verify, proxies=proxies, cert=cert)
-        if (
-            cancel is not None
-            and hasattr(pool, "_make_request")
-            and id(pool) not in tracked_pools
-        ):
-            tracked_pools.add(id(pool))
-            original_make_request = pool._make_request
-
-            def tracked_make_request(connection: Any, *args: Any, **kwargs: Any) -> Any:
-                cancel.set_interrupter(
-                    lambda connection=connection: _shutdown_thumbnail_connection(
-                        connection
-                    )
-                )
-                return original_make_request(connection, *args, **kwargs)
-
-            replace_attribute(pool, "_make_request", tracked_make_request)
-            if any((proxies or {}).values()) and deadline is not None:
-                original_get_conn = pool._get_conn
-
-                def tracked_get_conn(*args: Any, **kwargs: Any) -> Any:
-                    connection = original_get_conn(*args, **kwargs)
-                    cancel.set_interrupter(
-                        lambda: _shutdown_thumbnail_connection(connection)
-                    )
-                    if id(connection) not in tracked_connections:
-                        tracked_connections.add(id(connection))
-                        replace_attribute(
-                            connection,
-                            "_new_conn",
-                            lambda: _open_thumbnail_proxy_socket(
-                                connection, deadline, cancel
-                            ),
-                        )
-                    return connection
-
-                # HTTPS proxy preparation can connect before _make_request.
-                # Capture the connection as soon as it leaves the pool.
-                replace_attribute(pool, "_get_conn", tracked_get_conn)
-        return pool
-
-    setattr(adapter, "get_connection_with_tls_context", tracked)
+async def _download_thumbnail_image(url: str) -> bytes:
+    token = _THUMBNAIL_DOWNLOAD_LOG_CONTEXT.set(True)
     try:
-        settings = session.merge_environment_settings(
-            prepared_request.url, {}, True, None, None
-        )
-        return adapter.send(prepared_request, timeout=timeout, **settings)
+        async with asyncio.timeout(_THUMBNAIL_TIMEOUT_SECONDS):
+            _validate_thumbnail_url(url)
+            proxy_url = get_trusted_proxy_url()
+            async with public_fetch_client(
+                proxy_url, timeout=_THUMBNAIL_TIMEOUT_SECONDS
+            ) as client:
+                client.event_hooks["request"].append(_prepare_thumbnail_request)
+                client.event_hooks["response"].append(_check_thumbnail_length)
+                response = await fetch_public_http_bytes(
+                    client,
+                    url,
+                    max_content_bytes=_THUMBNAIL_MAX_BYTES,
+                    timeout=_THUMBNAIL_TIMEOUT_SECONDS,
+                    headers={"Accept": "image/png"},
+                    resource_name="thumbnail image",
+                    require_non_empty=True,
+                    via_proxy=bool(proxy_url),
+                    allow_https_downgrade=False,
+                    require_identity_encoding=True,
+                    required_status_code=200,
+                    host_validator=_validate_thumbnail_host,
+                )
+        _validate_thumbnail_png(response.content)
+        return response.content
+    except (TimeoutError, httpx.TimeoutException):
+        raise _ThumbnailDownloadError("thumbnail image download timed out") from None
+    except Exception as exc:
+        raise _ThumbnailDownloadError(_redact_thumbnail_secrets(str(exc))) from None
     finally:
-        for obj, name, had_attr, previous_value in saved_attributes:
-            if had_attr:
-                setattr(obj, name, previous_value)
-            else:
-                obj.__dict__.pop(name, None)
-        if had_instance_attr:
-            setattr(adapter, "get_connection_with_tls_context", previous)
-        else:
-            adapter.__dict__.pop("get_connection_with_tls_context", None)
-        if cancel is not None:
-            cancel.clear_interrupter()
-
-
-def _thumbnail_hop_timeouts(deadline: float, cancel: _ThumbnailCancelToken) -> Any:
-    if cancel.stopped:
-        raise _ThumbnailDownloadError("thumbnail image download timed out")
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise _ThumbnailDownloadError("thumbnail image download timed out")
-    operation_timeout = min(remaining, _THUMBNAIL_SOCKET_TIMEOUT_SECONDS)
-    return operation_timeout, operation_timeout
+        _THUMBNAIL_DOWNLOAD_LOG_CONTEXT.reset(token)
 
 
 def _validate_thumbnail_png(data: bytes) -> None:
@@ -2015,210 +1626,6 @@ def _validate_thumbnail_png(data: bytes) -> None:
         raise _ThumbnailDownloadError(
             "downloaded thumbnail image is not a valid PNG image"
         ) from None
-
-
-def _read_thumbnail_body(
-    response: Any, deadline: float, cancel: _ThumbnailCancelToken
-) -> bytes:
-    """Read a bounded body, then decode it as a PNG without trusting its name."""
-    declared_length = response.headers.get("Content-Length")
-    if declared_length is not None:
-        trimmed_length = str(declared_length).strip()
-        if not trimmed_length.isdigit():
-            raise _ThumbnailDownloadError(
-                "thumbnail image download returned an invalid Content-Length header"
-            )
-        if int(trimmed_length) > _THUMBNAIL_MAX_BYTES:
-            raise _ThumbnailDownloadError("thumbnail image is too large to download")
-    content_encoding = (
-        str(response.headers.get("Content-Encoding", "identity")).strip().lower()
-    )
-    if content_encoding not in ("", "identity"):
-        raise _ThumbnailDownloadError(
-            "thumbnail image download used an unsupported content encoding"
-        )
-    chunks: list[bytes] = []
-    total = 0
-    try:
-        for chunk in response.iter_content(_THUMBNAIL_CHUNK_BYTES):
-            if cancel.stopped or time.monotonic() > deadline:
-                raise _ThumbnailDownloadError("thumbnail image download timed out")
-            if not chunk:
-                continue
-            total += len(chunk)
-            if total > _THUMBNAIL_MAX_BYTES:
-                raise _ThumbnailDownloadError(
-                    "thumbnail image is too large to download"
-                )
-            chunks.append(chunk)
-    except requests.RequestException as exc:
-        if cancel.stopped or isinstance(exc, requests.Timeout):
-            raise _ThumbnailDownloadError(
-                "thumbnail image download timed out"
-            ) from None
-        raise _ThumbnailDownloadError(
-            "thumbnail image download failed: network error"
-        ) from None
-    data = b"".join(chunks)
-    if not data:
-        raise _ThumbnailDownloadError("downloaded thumbnail image is empty")
-    _validate_thumbnail_png(data)
-    return data
-
-
-def _thumbnail_transfer_failure(
-    exc: BaseException, deadline: float, cancel: _ThumbnailCancelToken
-) -> _ThumbnailDownloadError:
-    if cancel.stopped or isinstance(exc, requests.Timeout):
-        return _ThumbnailDownloadError("thumbnail image download timed out")
-    if time.monotonic() >= deadline - _THUMBNAIL_TIMEOUT_GRACE_SECONDS:
-        return _ThumbnailDownloadError("thumbnail image download timed out")
-    return _ThumbnailDownloadError("thumbnail image download failed: network error")
-
-
-def _download_thumbnail_worker(
-    content_url: str,
-    deadline: float,
-    cancel: _ThumbnailCancelToken,
-    result: dict[str, Any],
-) -> None:
-    """Download the image in a cancellable thread with a hard total deadline."""
-    session = None
-    suppressor = None
-    try:
-        suppressor = _suppress_transport_logs_for_current_thread()
-        session = _new_thumbnail_session()
-        _install_thumbnail_destination_policy(session, deadline, cancel)
-        cancel.set_interrupter(session.close)
-        current_url = content_url
-        redirects_followed = 0
-        while True:
-            if cancel.stopped:
-                raise _ThumbnailDownloadError("thumbnail image download timed out")
-            hop_timeout = _thumbnail_hop_timeouts(deadline, cancel)
-            prepared = session.prepare_request(
-                requests.Request(
-                    "GET", current_url, headers=dict(_THUMBNAIL_REQUEST_HEADERS)
-                )
-            )
-            # No hop may carry cookies: the signed URL is the only credential.
-            prepared.headers.pop("Cookie", None)
-            try:
-                response = _send_thumbnail_request(
-                    session,
-                    prepared,
-                    timeout=hop_timeout,
-                    cancel=cancel,
-                    deadline=deadline,
-                )
-            except requests.RequestException as exc:
-                raise _thumbnail_transfer_failure(exc, deadline, cancel) from None
-            except ValueError as error:
-                raise _ThumbnailDownloadError(str(error)) from None
-            cancel.set_interrupter(
-                lambda response=response: _shutdown_thumbnail_response(response)
-            )
-            try:
-                status = response.status_code
-                if 300 <= status < 400:
-                    location = response.headers.get("Location")
-                    if not isinstance(location, str) or not location.strip():
-                        raise _ThumbnailDownloadError(
-                            "thumbnail image download returned an invalid redirect"
-                        )
-                    if redirects_followed >= _THUMBNAIL_MAX_REDIRECTS:
-                        raise _ThumbnailDownloadError(
-                            "thumbnail image download redirected too many times"
-                        )
-                    redirects_followed += 1
-                    current_url = _validate_thumbnail_url(
-                        urljoin(current_url, location.strip())
-                    )
-                    continue
-                if not 200 <= status < 300:
-                    raise _ThumbnailDownloadError(
-                        f"thumbnail image download failed with HTTP {int(status)}"
-                    )
-                result["data"] = _read_thumbnail_body(response, deadline, cancel)
-                return
-            except requests.RequestException as exc:
-                raise _thumbnail_transfer_failure(exc, deadline, cancel) from None
-            finally:
-                cancel.set_interrupter(session.close)
-                response.close()
-    except _ThumbnailDownloadError as error:
-        result["error"] = error
-    except ValueError as error:
-        result["error"] = _ThumbnailDownloadError(str(error))
-    except requests.RequestException as exc:
-        result["error"] = _thumbnail_transfer_failure(exc, deadline, cancel)
-    except Exception:
-        result["error"] = _ThumbnailDownloadError(
-            "thumbnail image download timed out"
-            if cancel.stopped
-            else "thumbnail image download failed: network error"
-        )
-    finally:
-        cancel.clear_interrupter()
-        if session is not None:
-            try:
-                session.close()
-            except Exception:
-                pass
-        if suppressor is not None:
-            _restore_transport_logs(suppressor)
-
-
-def _download_thumbnail_image(content_url: object) -> bytes:
-    """Fetch and validate one thumbnail image under a hard total deadline."""
-    validated_url = _validate_thumbnail_url(content_url)
-    cancel = _ThumbnailCancelToken()
-    deadline = time.monotonic() + _THUMBNAIL_TIMEOUT_SECONDS
-    result: dict[str, Any] = {}
-    worker = threading.Thread(
-        target=_download_thumbnail_worker,
-        args=(validated_url, deadline, cancel, result),
-        name="google-slides-thumbnail",
-        daemon=True,
-    )
-    with _THUMBNAIL_DOWNLOAD_LOCK:
-        finished = {
-            thread for thread in _THUMBNAIL_DOWNLOAD_WORKERS if not thread.is_alive()
-        }
-        _THUMBNAIL_DOWNLOAD_WORKERS.difference_update(finished)
-        if len(_THUMBNAIL_DOWNLOAD_WORKERS) >= _THUMBNAIL_MAX_CONCURRENT_DOWNLOADS:
-            raise _ThumbnailDownloadError(
-                "too many concurrent thumbnail image downloads; try again shortly"
-            )
-        _THUMBNAIL_DOWNLOAD_WORKERS.add(worker)
-        try:
-            worker.start()
-        except BaseException:
-            _THUMBNAIL_DOWNLOAD_WORKERS.discard(worker)
-            raise
-    try:
-        worker.join(max(0.0, deadline - time.monotonic()))
-        if worker.is_alive():
-            cancel.stop()
-            worker.join(_THUMBNAIL_TIMEOUT_GRACE_SECONDS)
-            raise _ThumbnailDownloadError("thumbnail image download timed out")
-        if cancel.stopped:
-            raise _ThumbnailDownloadError("thumbnail image download timed out")
-        error = result.get("error")
-        if isinstance(error, _ThumbnailDownloadError):
-            raise error
-        data = result.get("data")
-        if not isinstance(data, bytes):
-            raise _ThumbnailDownloadError(
-                "thumbnail image download failed: network error"
-            )
-        return data
-    finally:
-        # A timed-out caller does not free a still-running worker's slot.
-        # Future calls also reap finished workers, retaining at most four.
-        with _THUMBNAIL_DOWNLOAD_LOCK:
-            if not worker.is_alive():
-                _THUMBNAIL_DOWNLOAD_WORKERS.discard(worker)
 
 
 def _open_thumbnail_output_directory() -> tuple[Path, Path, str, int]:
@@ -2287,21 +1694,14 @@ def _thumbnail_filename(*, page_number: int | None, slide_object_id: str) -> str
 
 
 def _open_thumbnail_output_file(directory_fd: int, filename: str) -> tuple[str, int]:
-    """Create a new output file inside the already anchored directory."""
-    stem = Path(filename).stem
-    suffix = Path(filename).suffix
+    """Create a private staging file relative to the anchored output directory."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    for counter in range(_THUMBNAIL_MAX_NAME_ATTEMPTS):
-        candidate_name = filename if counter == 0 else f"{stem} ({counter}){suffix}"
+    for _ in range(_THUMBNAIL_MAX_NAME_ATTEMPTS):
+        name = f".{filename}.{uuid.uuid4().hex}.tmp"
         try:
-            descriptor = os.open(candidate_name, flags, 0o600, dir_fd=directory_fd)
+            return name, os.open(name, flags, 0o600, dir_fd=directory_fd)
         except FileExistsError:
             continue
-        except OSError:
-            raise _ThumbnailDownloadError(
-                "could not save the thumbnail image in the task workspace"
-            ) from None
-        return candidate_name, descriptor
     raise _ThumbnailDownloadError("could not choose a unique thumbnail image file name")
 
 
@@ -2313,53 +1713,67 @@ def _write_thumbnail_png(
     dir_fd: int,
     filename: str,
 ) -> Path:
-    file_name, descriptor = _open_thumbnail_output_file(dir_fd, filename)
+    temporary_name: str | None = None
+    published_name: str | None = None
+    complete = False
     try:
+        temporary_name, descriptor = _open_thumbnail_output_file(dir_fd, filename)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(data)
-    except OSError:
+        # Linking publishes the complete file atomically and refuses collisions.
+        # Both names are relative to the same directory descriptor.
+        for counter in range(_THUMBNAIL_MAX_NAME_ATTEMPTS):
+            candidate = (
+                filename if counter == 0 else f"{Path(filename).stem} ({counter}).png"
+            )
+            try:
+                os.link(
+                    temporary_name,
+                    candidate,
+                    src_dir_fd=dir_fd,
+                    dst_dir_fd=dir_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                continue
+            published_name = candidate
+            break
+        if published_name is None:
+            raise _ThumbnailDownloadError(
+                "could not choose a unique thumbnail image file name"
+            )
+        final_path = output_dir / published_name
         try:
-            os.unlink(file_name, dir_fd=dir_fd)
+            created = os.stat(published_name, dir_fd=dir_fd, follow_symlinks=False)
+            visible = os.stat(final_path, follow_symlinks=False)
+            expected = os.path.join(canonical_output_dir, published_name)
+            unchanged = os.path.samestat(created, visible) and (
+                os.path.normcase(os.path.realpath(final_path))
+                == os.path.normcase(expected)
+            )
         except OSError:
-            pass
+            unchanged = False
+        if not unchanged:
+            raise _ThumbnailDownloadError(
+                "the task output directory changed while saving the thumbnail image"
+            )
+        complete = True
+        return final_path
+    except OSError:
         raise _ThumbnailDownloadError(
             "could not save the thumbnail image in the task workspace"
         ) from None
-    final_path = output_dir / file_name
-    try:
-        created = os.stat(file_name, dir_fd=dir_fd, follow_symlinks=False)
-        visible = os.stat(final_path, follow_symlinks=False)
-    except OSError:
-        try:
-            os.unlink(file_name, dir_fd=dir_fd)
-        except OSError:
-            pass
-        raise _ThumbnailDownloadError(
-            "the task output directory changed while saving the thumbnail image"
-        ) from None
-    if not os.path.samestat(created, visible):
-        try:
-            os.unlink(file_name, dir_fd=dir_fd)
-        except OSError:
-            pass
-        raise _ThumbnailDownloadError(
-            "the task output directory changed while saving the thumbnail image"
-        )
-    resolved_path = os.path.realpath(final_path)
-    expected_path = os.path.join(canonical_output_dir, file_name)
-    if os.path.normcase(resolved_path) != os.path.normcase(expected_path):
-        try:
-            os.unlink(file_name, dir_fd=dir_fd)
-        except OSError:
-            pass
-        raise _ThumbnailDownloadError(
-            "the task output directory changed while saving the thumbnail image"
-        )
-    return final_path
+    finally:
+        for name in (temporary_name, published_name if not complete else None):
+            if name is not None:
+                try:
+                    os.unlink(name, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    pass
 
 
 @mcp.tool()
-def google_slides_get_slide_thumbnail(
+async def google_slides_get_slide_thumbnail(
     presentation_id: str,
     slide_id: str | None = None,
     page_number: _PageNumber = None,
@@ -2388,9 +1802,11 @@ def google_slides_get_slide_thumbnail(
 
     The result reports the saved PNG's path in the current task workspace
     output directory, its mime_type ("image/png"), its byte size, and the
-    presentation and slide ids. Each call creates a new file atomically and
-    never overwrites an existing output file. The short-lived thumbnail link
-    Google returns is never included in the result, and the image download
+    presentation and slide ids. A temporary file is written completely before
+    an atomic, non-overwriting link publishes the PNG. Temporary names are
+    cleaned on success and handled failures; an abrupt process termination
+    can leave a hidden .tmp file, but not a partially published PNG. The successful result omits the short-lived thumbnail link
+    Google returns, and the image download
     sends no cookie or Google credentials on any hop.
 
     The host attaches a durable file_ref (file_id) to a successful result
@@ -2440,44 +1856,44 @@ def google_slides_get_slide_thumbnail(
 
         _require_thumbnail_output_directory()
         pres_id = _resolve_presentation_id(presentation_id)
-        service = get_slides_service()
+        service = await asyncio.to_thread(get_slides_service)
 
-        target_slide_id: str
+        # Other tools use synchronous SDK calls in FastMCP's worker context.
+        # Keep this async tool responsive by offloading just the SDK operations.
+        presentation = await asyncio.to_thread(
+            lambda: service.presentations()
+            .get(presentationId=pres_id, fields="slides.objectId")
+            .execute()
+        )
+        opened = True
+        slide_entries = (
+            presentation.get("slides", []) if isinstance(presentation, dict) else []
+        )
+        object_ids = [
+            slide["objectId"]
+            for slide in slide_entries
+            if isinstance(slide, dict)
+            and isinstance(slide.get("objectId"), str)
+            and slide["objectId"]
+        ]
+        if not object_ids:
+            return _error("The presentation has no slides to render.")
         if page_number is not None:
-            presentation = (
-                service.presentations()
-                .get(presentationId=pres_id, fields="slides.objectId")
-                .execute()
-            )
-            opened = True
-            slides = (
-                presentation.get("slides", []) if isinstance(presentation, dict) else []
-            )
-            object_ids: list[str] = [
-                str(slide.get("objectId"))
-                for slide in slides
-                if isinstance(slide, dict)
-                and isinstance(slide.get("objectId"), str)
-                and slide.get("objectId")
-            ]
-            if not object_ids:
-                return _error("The presentation has no slides to render.")
             if page_number > len(object_ids):
                 return _error(
                     f"page_number {page_number} is out of range: the "
                     f"presentation has {len(object_ids)} slides."
                 )
             target_slide_id = object_ids[page_number - 1]
-        elif slide_id is not None:
-            target_slide_id = slide_id
         else:
-            return _error(
-                "Provide exactly one of slide_id (a slide object id) or "
-                "page_number (1-based); neither was given."
-            )
+            if slide_id not in object_ids:
+                return _error(
+                    f"slide_id '{slide_id}' was not found in this presentation."
+                )
+            target_slide_id = slide_id
 
-        thumbnail = (
-            service.presentations()
+        thumbnail = await asyncio.to_thread(
+            lambda: service.presentations()
             .pages()
             .getThumbnail(
                 presentationId=pres_id,
@@ -2495,7 +1911,7 @@ def google_slides_get_slide_thumbnail(
                 "Google Slides did not return a thumbnail image URL for this slide."
             )
 
-        data = _download_thumbnail_image(content_url)
+        data = await _download_thumbnail_image(content_url)
         _, output_dir, canonical_output_dir, output_dir_fd = (
             _open_thumbnail_output_directory()
         )
@@ -2532,12 +1948,10 @@ def google_slides_get_slide_thumbnail(
         )
     except (ValueError, _ThumbnailDownloadError) as e:
         logger.error("Could not render slide thumbnail: %s", type(e).__name__)
-        return _error(_redact_thumbnail_secrets(str(e)))
+        return _error(str(e))
     except Exception as e:
         logger.error("Error rendering slide thumbnail: %s", type(e).__name__)
-        return _redact_error_payload(
-            _presentation_error(e, presentation_id, opened=opened)
-        )
+        return _presentation_error(e, presentation_id, opened=opened)
 
 
 if __name__ == "__main__":
