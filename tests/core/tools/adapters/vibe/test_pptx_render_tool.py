@@ -7,6 +7,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import zipfile
 from types import SimpleNamespace
 from typing import Any
 
@@ -241,7 +242,13 @@ async def test_factory_build_with_sandbox_keeps_the_tool_on_the_host(
     # Reset the sandbox spy and exercise a real render call through the tool.
     sandbox.calls.clear()
     deck = workspace.input_dir / "deck.pptx"
-    deck.write_bytes(b"PK\x03\x04 synthetic")
+    with zipfile.ZipFile(deck, "w") as package:
+        package.writestr(
+            "ppt/presentation.xml",
+            '<p:presentation xmlns:p="http://schemas.openxmlformats.org/'
+            'presentationml/2006/main"><p:sldIdLst><p:sldId id="256"/>'
+            "</p:sldIdLst></p:presentation>",
+        )
 
     async def convert_pptx_to_pdf(
         pptx_path, output_dir, *, timeout_seconds=60.0, include_hidden_slides=False

@@ -401,6 +401,62 @@ async def test_concurrent_conversions_get_isolated_profiles(tmp_path, monkeypatc
     assert (output_two / "second.pdf").is_file()
 
 
+@pytest.mark.asyncio
+async def test_concurrent_conversions_are_capped_process_wide(tmp_path, monkeypatch):
+    conversion = _load_conversion_module()
+    limit = conversion.MAX_CONCURRENT_CONVERSIONS
+    release = asyncio.Event()
+    full = asyncio.Event()
+    running = 0
+    peak = 0
+
+    class _Process(_RecordingProcess):
+        def __init__(self, pdf_path: pathlib.Path):
+            super().__init__()
+            self.pdf_path = pdf_path
+
+        async def wait(self):
+            nonlocal running
+            await release.wait()
+            self.pdf_path.write_bytes(b"%PDF-1.4")
+            running -= 1
+            self.returncode = 0
+            return 0
+
+    async def create_subprocess_exec(*arguments, **kwargs):
+        nonlocal running, peak
+        running += 1
+        peak = max(peak, running)
+        if running == limit:
+            full.set()
+        output_dir = pathlib.Path(arguments[arguments.index("--outdir") + 1])
+        return _Process(output_dir / (pathlib.Path(arguments[-1]).stem + ".pdf"))
+
+    monkeypatch.setattr(
+        conversion.asyncio, "create_subprocess_exec", create_subprocess_exec
+    )
+    conversions = []
+    for index in range(limit + 1):
+        source = tmp_path / f"deck-{index}.pptx"
+        source.write_bytes(b"pptx")
+        output_dir = tmp_path / f"out-{index}"
+        output_dir.mkdir()
+        conversions.append(
+            asyncio.create_task(conversion.convert_pptx_to_pdf(source, output_dir))
+        )
+
+    await asyncio.wait_for(full.wait(), timeout=5)
+    await asyncio.sleep(0)
+    assert peak == limit
+    release.set()
+    results = await asyncio.wait_for(asyncio.gather(*conversions), timeout=10)
+
+    assert peak == limit
+    assert [path.name for path in results] == [
+        f"deck-{index}.pdf" for index in range(limit + 1)
+    ]
+
+
 _FAKE_CONVERTER_SCRIPT = r"""
 import json
 import os

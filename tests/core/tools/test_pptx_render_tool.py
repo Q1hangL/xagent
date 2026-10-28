@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import zipfile
 from types import SimpleNamespace
 
 import pytest
@@ -38,6 +39,8 @@ PNG_1X1 = base64.b64decode(
     "/x8AAwMCAO+aXioAAAAASUVORK5CYII="
 )
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+NS_P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
 
 def _load_render_module():
@@ -92,10 +95,22 @@ def durable_workspace(monkeypatch, tmp_path):
     get_unscoped_file_storage.cache_clear()
 
 
-def _write_deck(directory: pathlib.Path, name: str = "deck.pptx") -> pathlib.Path:
+def _write_deck(
+    directory: pathlib.Path, name: str = "deck.pptx", slides: int = 1
+) -> pathlib.Path:
+    """Write a minimal package whose presentation part lists ``slides`` slides."""
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / name
-    path.write_bytes(b"PK\x03\x04 synthetic presentation bytes")
+    slide_ids = "".join(
+        f'<p:sldId id="{256 + index}" r:id="rId{index + 1}"/>'
+        for index in range(slides)
+    )
+    with zipfile.ZipFile(path, "w") as package:
+        package.writestr(
+            zipfile.ZipInfo("ppt/presentation.xml"),
+            f'<p:presentation xmlns:p="{NS_P}" xmlns:r="{NS_R}">'
+            f"<p:sldIdLst>{slide_ids}</p:sldIdLst></p:presentation>",
+        )
     return path
 
 
@@ -231,6 +246,57 @@ def _install_rasterizer(monkeypatch, render, *, page_count, requested, rendered)
     )
 
 
+def _install_blocking_soffice(monkeypatch, *, starts: int):
+    """Run the real converter against a fake soffice that waits for ``release``.
+
+    Each start records the PDF output directory and the LibreOffice profile
+    directory that the converter actually created; ``ready`` is set once
+    ``starts`` fake processes are running.
+    """
+    conversion = _load_conversion_module()
+    soffice = SimpleNamespace(
+        started=[], ready=asyncio.Event(), release=asyncio.Event()
+    )
+
+    class _Process:
+        pid = -1
+        returncode = None
+
+        def __init__(self, pdf_path: pathlib.Path):
+            self.pdf_path = pdf_path
+
+        async def wait(self) -> int:
+            await soffice.release.wait()
+            self.pdf_path.write_bytes(b"%PDF-1.4 synthetic")
+            self.returncode = 0
+            return 0
+
+    async def create_subprocess_exec(*arguments, **kwargs):
+        pdf_dir = pathlib.Path(_arg_value(arguments, "--outdir"))
+        profile = next(
+            argument
+            for argument in arguments
+            if argument.startswith("-env:UserInstallation=")
+        )
+        soffice.started.append(
+            {
+                "pdf_dir": pdf_dir,
+                "profile_dir": pathlib.Path(
+                    profile.split("=", 1)[1].removeprefix("file://")
+                ),
+            }
+        )
+        if len(soffice.started) == starts:
+            soffice.ready.set()
+        return _Process(pdf_dir / (pathlib.Path(arguments[-1]).stem + ".pdf"))
+
+    monkeypatch.setattr(
+        conversion.asyncio, "create_subprocess_exec", create_subprocess_exec
+    )
+    monkeypatch.setattr(conversion.os, "killpg", lambda _pid, _signal: None)
+    return soffice
+
+
 def _output_rows(session_factory):
     with session_factory() as db:
         return list(db.query(UploadedFile).order_by(UploadedFile.filename).all())
@@ -291,7 +357,7 @@ async def test_render_default_renders_every_page_of_a_small_deck(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(durable_workspace.workspace.input_dir)
+    deck = _write_deck(durable_workspace.workspace.input_dir, slides=2)
     conversion_calls: list[pathlib.Path] = []
     timeouts: list[float] = []
     requested: list[list[int]] = []
@@ -324,16 +390,17 @@ async def test_render_default_renders_every_page_of_a_small_deck(
         assert page["file_ref"]["mime_type"] == "image/png"
         assert page["file_ref"]["filename"] == f"slide_{page['page_number']:03d}.png"
         assert page["file_ref"]["file_id"]
-        assert page["artifacts"] == [
-            {
-                "type": "image",
-                "file_id": page["file_ref"]["file_id"],
-                "filename": page["file_ref"]["filename"],
-                "mime_type": "image/png",
-                "display": "inline",
-            }
-        ]
-    assert len(result["artifacts"]) == 2
+        assert "artifacts" not in page
+    assert result["artifacts"] == [
+        {
+            "type": "image",
+            "file_id": page["file_ref"]["file_id"],
+            "filename": page["file_ref"]["filename"],
+            "mime_type": "image/png",
+            "display": "inline",
+        }
+        for page in result["pages"]
+    ]
     assert timeouts == [60.0]
 
 
@@ -342,7 +409,7 @@ async def test_render_default_caps_at_twenty_pages_without_rasterizing_more(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(durable_workspace.workspace.input_dir)
+    deck = _write_deck(durable_workspace.workspace.input_dir, slides=25)
     requested: list[list[int]] = []
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
     _install_rasterizer(
@@ -367,7 +434,7 @@ async def test_render_rejects_an_explicit_range_over_the_page_limit(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(durable_workspace.workspace.input_dir)
+    deck = _write_deck(durable_workspace.workspace.input_dir, slides=30)
     conversions: list[pathlib.Path] = []
     _install_conversion(monkeypatch, render, calls=conversions, timeout_records=[])
     requested: list[list[int]] = []
@@ -391,7 +458,7 @@ async def test_render_honours_an_explicit_page_range(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(durable_workspace.workspace.input_dir)
+    deck = _write_deck(durable_workspace.workspace.input_dir, slides=10)
     requested: list[list[int]] = []
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
     _install_rasterizer(
@@ -420,7 +487,7 @@ async def test_render_rejects_an_explicit_range_beyond_the_deck(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(durable_workspace.workspace.input_dir)
+    deck = _write_deck(durable_workspace.workspace.input_dir, slides=5)
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
     requested: list[list[int]] = []
     _install_rasterizer(
@@ -443,7 +510,7 @@ async def test_render_reports_an_empty_presentation(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(durable_workspace.workspace.input_dir)
+    deck = _write_deck(durable_workspace.workspace.input_dir, slides=0)
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
     requested: list[list[int]] = []
     _install_rasterizer(
@@ -459,11 +526,73 @@ async def test_render_reports_an_empty_presentation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("deck_bytes", "error_code"),
+    [(None, "pdf_conversion_failed"), (b"not a package", "unsupported_format")],
+)
+async def test_render_refuses_pages_that_cannot_be_matched_to_source_slides(
+    durable_workspace, monkeypatch, deck_bytes, error_code
+):
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    deck = _write_deck(workspace.input_dir, slides=3)
+    if deck_bytes is not None:
+        deck.write_bytes(deck_bytes)
+    _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
+    requested: list[list[int]] = []
+    _install_rasterizer(
+        monkeypatch, render, page_count=2, requested=requested, rendered=[]
+    )
+
+    result = await render.render_pptx_to_images(
+        str(deck), workspace, start_page=2, end_page=2
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == error_code
+    assert requested == []
+    assert not list(workspace.output_dir.iterdir())
+    assert _output_rows(durable_workspace.session_factory) == []
+
+
+@pytest.mark.asyncio
+async def test_render_conversion_runs_inside_the_preview_publication_guard(
+    durable_workspace, monkeypatch
+):
+    from filelock import Timeout
+
+    from xagent.web.services import uploaded_file_cleanup_publication
+
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    deck = _write_deck(workspace.input_dir)
+    _register_input_deck(workspace, deck)
+    conversions: list[pathlib.Path] = []
+    _install_conversion(monkeypatch, render, calls=conversions, timeout_records=[])
+    _install_rasterizer(monkeypatch, render, page_count=1, requested=[], rendered=[])
+
+    def busy_lock(_file_id):
+        raise Timeout("cleanup lock is held")
+
+    monkeypatch.setattr(
+        uploaded_file_cleanup_publication, "file_cleanup_lock", busy_lock
+    )
+
+    result = await render.render_pptx_to_images(str(deck), workspace)
+
+    assert result["success"] is False
+    assert result["error_code"] == "pdf_conversion_unavailable"
+    assert conversions == []
+    assert list((durable_workspace.storage_root / "pptx_pdf_cache").iterdir()) == []
+    assert not list(workspace.output_dir.iterdir())
+
+
+@pytest.mark.asyncio
 async def test_render_page_limit_is_applied_before_any_pixmap_allocation(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(durable_workspace.workspace.input_dir)
+    deck = _write_deck(durable_workspace.workspace.input_dir, slides=25)
     events: list = []
     fake_fitz = _FakeFitz([(720.0, 540.0)] * 25, events)
     monkeypatch.setitem(sys.modules, "fitz", fake_fitz)
@@ -580,7 +709,7 @@ async def test_render_each_page_is_durably_registered_and_resolvable(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(durable_workspace.workspace.input_dir)
+    deck = _write_deck(durable_workspace.workspace.input_dir, slides=2)
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
     _install_rasterizer(monkeypatch, render, page_count=2, requested=[], rendered=[])
 
@@ -604,7 +733,9 @@ async def test_render_each_page_is_durably_registered_and_resolvable(
         assert page["file_ref"]["preview_url"] == f"/api/files/preview/{file_id}"
         assert page["file_ref"]["markdown_link"] is not None
         assert f"file:{file_id}" in page["file_ref"]["markdown_link"]
-        assert page["artifacts"][0]["file_id"] == file_id
+    assert [artifact["file_id"] for artifact in result["artifacts"]] == [
+        page["file_ref"]["file_id"] for page in result["pages"]
+    ]
 
 
 @pytest.mark.asyncio
@@ -658,7 +789,7 @@ async def test_render_accepts_persistent_file_ids_and_allowed_paths(
             selector, durable_workspace.workspace
         )
         assert result["success"] is True, (selector, result)
-        assert pathlib.Path(result["pptx_path"]).resolve() == deck.resolve()
+        assert "pptx_path" not in result
 
     assert len(conversions) == 1
     assert all(path != deck and not path.exists() for path in conversions)
@@ -739,37 +870,29 @@ async def test_render_passes_the_fixed_timeout_to_the_converter(
 
 
 @pytest.mark.asyncio
-async def test_render_cancellation_reclaims_the_subprocess_and_cleans_up(
-    durable_workspace, monkeypatch, tmp_path
+async def test_render_cancelled_during_conversion_removes_conversion_directories(
+    durable_workspace, monkeypatch
 ):
     render = _load_render_module()
-    deck = _write_deck(durable_workspace.workspace.input_dir)
-    started = asyncio.Event()
-    seen: dict[str, pathlib.Path] = {}
+    workspace = durable_workspace.workspace
+    deck = _write_deck(workspace.input_dir)
+    soffice = _install_blocking_soffice(monkeypatch, starts=1)
 
-    async def convert_pptx_to_pdf(
-        pptx_path, output_dir, *, timeout_seconds=60.0, include_hidden_slides=False
-    ):
-        seen["temp_root"] = pathlib.Path(output_dir)
-        seen["pdf_dir"] = pathlib.Path(output_dir)
-        started.set()
-        await asyncio.sleep(60)
-        raise AssertionError("conversion must be cancelled")
-
-    monkeypatch.setattr(render, "convert_pptx_to_pdf", convert_pptx_to_pdf)
-
-    task = asyncio.create_task(
-        render.render_pptx_to_images(str(deck), durable_workspace.workspace)
-    )
-    await asyncio.wait_for(started.wait(), timeout=5)
-    output_dirs = list(durable_workspace.workspace.output_dir.iterdir())
-    assert output_dirs == []
+    task = asyncio.create_task(render.render_pptx_to_images(str(deck), workspace))
+    await asyncio.wait_for(soffice.ready.wait(), timeout=5)
+    [conversion] = soffice.started
+    assert conversion["pdf_dir"] != conversion["profile_dir"]
+    assert conversion["pdf_dir"].is_dir()
+    assert conversion["profile_dir"].is_dir()
+    assert list(workspace.output_dir.iterdir()) == []
     task.cancel()
+    soffice.release.set()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, timeout=5)
 
-    assert not seen["pdf_dir"].exists()
-    assert not seen["temp_root"].exists()
+    assert not conversion["pdf_dir"].exists()
+    assert not conversion["profile_dir"].exists()
+    assert list(workspace.output_dir.iterdir()) == []
     assert _output_rows(durable_workspace.session_factory) == []
 
 
@@ -785,52 +908,28 @@ async def test_concurrent_renders_use_isolated_directories(
         if same_source
         else _write_deck(durable_workspace.workspace.input_dir, "second.pptx")
     )
-    seen: list[dict] = []
-    release = asyncio.Event()
-    arrived = asyncio.Event()
-    in_flight = 0
-
-    async def convert_pptx_to_pdf(
-        pptx_path, output_dir, *, timeout_seconds=60.0, include_hidden_slides=False
-    ):
-        nonlocal in_flight
-        in_flight += 1
-        if in_flight == 2:
-            arrived.set()
-        seen.append(
-            {
-                "source": pathlib.Path(pptx_path),
-                "output_dir": pathlib.Path(output_dir),
-                "temp_root": pathlib.Path(output_dir),
-            }
-        )
-        await release.wait()
-        pdf_path = pathlib.Path(output_dir) / (pathlib.Path(pptx_path).stem + ".pdf")
-        pdf_path.write_bytes(b"%PDF-1.4 synthetic")
-        return pdf_path
-
-    monkeypatch.setattr(render, "convert_pptx_to_pdf", convert_pptx_to_pdf)
+    soffice = _install_blocking_soffice(monkeypatch, starts=2)
     _install_rasterizer(monkeypatch, render, page_count=1, requested=[], rendered=[])
 
     both = asyncio.gather(
         render.render_pptx_to_images(str(first), durable_workspace.workspace),
         render.render_pptx_to_images(str(second), durable_workspace.workspace),
     )
-    await asyncio.wait_for(arrived.wait(), timeout=5)
-    release.set()
+    await asyncio.wait_for(soffice.ready.wait(), timeout=5)
+    soffice.release.set()
     results = await asyncio.wait_for(both, timeout=10)
 
     assert [result["success"] for result in results] == [True, True]
     directories = [pathlib.Path(result["output_dir"]) for result in results]
-    pdf_directories = [entry["output_dir"] for entry in seen]
-    temp_roots = [entry["temp_root"] for entry in seen]
+    pdf_directories = [entry["pdf_dir"] for entry in soffice.started]
+    profile_directories = [entry["profile_dir"] for entry in soffice.started]
     assert len({str(path) for path in directories}) == 2
     assert len({str(path) for path in pdf_directories}) == 2
-    assert len({str(path) for path in temp_roots}) == 2
+    assert len({str(path) for path in profile_directories}) == 2
     for path in directories:
         assert path.is_dir()
         assert (path / "slide_001.png").is_file()
-    for path in temp_roots:
+    for path in [*pdf_directories, *profile_directories]:
         assert not path.exists()
     assert len(_output_rows(durable_workspace.session_factory)) == 2
     cached = list(durable_workspace.storage_root.rglob("*.hidden.preview.pdf"))
@@ -939,7 +1038,7 @@ async def test_render_cleans_up_when_rasterization_fails_midway(
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(durable_workspace.workspace.input_dir)
+    deck = _write_deck(durable_workspace.workspace.input_dir, slides=2)
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
 
     def failing_raster(pdf_path, page_numbers, output_dir, **kwargs):
@@ -991,7 +1090,7 @@ async def test_render_keeps_already_registered_pngs_when_registration_fails_part
     durable_workspace, monkeypatch, tmp_path
 ):
     render = _load_render_module()
-    deck = _write_deck(durable_workspace.workspace.input_dir)
+    deck = _write_deck(durable_workspace.workspace.input_dir, slides=3)
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
     _install_rasterizer(monkeypatch, render, page_count=3, requested=[], rendered=[])
     workspace = durable_workspace.workspace
@@ -1147,7 +1246,7 @@ async def test_render_default_page_boundaries(
     unrendered,
 ):
     render = _load_render_module()
-    deck = _write_deck(durable_workspace.workspace.input_dir)
+    deck = _write_deck(durable_workspace.workspace.input_dir, slides=total_pages)
     requested: list[list[int]] = []
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
     _install_rasterizer(
@@ -1192,7 +1291,7 @@ async def test_output_symlink_escape_is_refused_before_writing(
 ):
     render = _load_render_module()
     workspace = durable_workspace.workspace
-    deck = _write_deck(workspace.input_dir)
+    deck = _write_deck(workspace.input_dir, slides=2)
     outside = tmp_path / "outside"
     outside.mkdir()
     workspace.output_dir.rmdir()
@@ -1256,7 +1355,7 @@ async def test_delegated_workspace_registration_matches_persisted_record(
         base_dir=str(durable_workspace.base_dir),
         db_task_id=4242,
     )
-    deck = _write_deck(delegated.input_dir)
+    deck = _write_deck(delegated.input_dir, slides=2)
     rendered: list[list] = []
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
     _install_rasterizer(
@@ -1330,7 +1429,7 @@ async def test_render_enables_hidden_slides_for_pdf_export(
 ):
     render = _load_render_module()
     workspace = durable_workspace.workspace
-    source = _write_deck(workspace.input_dir)
+    source = _write_deck(workspace.input_dir, slides=3)
     options = []
 
     async def convert(source, output, **kwargs):
@@ -1474,7 +1573,7 @@ async def test_registration_failure_keeps_all_written_images(
 ):
     render = _load_render_module()
     workspace = durable_workspace.workspace
-    deck = _write_deck(workspace.input_dir)
+    deck = _write_deck(workspace.input_dir, slides=3)
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
     _install_rasterizer(monkeypatch, render, page_count=3, requested=[], rendered=[])
 
@@ -1591,7 +1690,7 @@ async def test_render_cache_reuses_content_and_uses_existing_cleanup(
 
     render = _load_render_module()
     workspace = durable_workspace.workspace
-    source = _write_deck(workspace.input_dir)
+    source = _write_deck(workspace.input_dir, slides=3)
     file_id = _register_input_deck(workspace, source) if registered else None
     calls = []
     _install_conversion(monkeypatch, render, calls=calls, timeout_records=[])
@@ -1611,8 +1710,11 @@ async def test_render_cache_reuses_content_and_uses_existing_cleanup(
     result = await render.render_pptx_to_images(str(source), workspace, end_page=1)
     assert result["success"], result
     assert len(calls) == 2
-    cached = list(preview.parent.glob("*.hidden.preview.pdf"))
-    assert len(cached) == 2
+    refreshed = list(preview.parent.glob("*.hidden.preview.pdf"))
+    assert len(refreshed) == 1
+    assert refreshed != cached
+    assert not cached[0].exists()
+    assert preview.read_bytes() == b"default preview excludes hidden slides"
     if registered:
         captured = capture_previews(
             {
@@ -1621,12 +1723,12 @@ async def test_render_cache_reuses_content_and_uses_existing_cleanup(
                 "generation": "render-cache-test",
             }
         )
-        assert len(captured) == 3
+        assert len(captured) == 2
         delete_pptx_pdf_cache(file_id)
     else:
         delete_legacy_preview_caches(source.resolve())
     assert not preview.exists()
-    assert all(not path.exists() for path in cached)
+    assert not refreshed[0].exists()
 
 
 @pytest.mark.asyncio
@@ -1636,7 +1738,7 @@ async def test_cancelled_raster_stops_before_registration(
 ):
     render = _load_render_module()
     workspace = durable_workspace.workspace
-    source = _write_deck(workspace.input_dir)
+    source = _write_deck(workspace.input_dir, slides=page_count)
     _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
     events = []
     fake = _FakeFitz([(72, 54)] * page_count, events)
