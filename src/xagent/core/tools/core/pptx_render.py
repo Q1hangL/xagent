@@ -26,8 +26,8 @@ import contextvars
 import logging
 import math
 import os
-import stat
 import shutil
+import stat
 import struct
 import tempfile
 import threading
@@ -555,15 +555,14 @@ def render_pdf_pages_to_pngs(
     :class:`PptxRenderRasterError` so the caller can clean up the whole call.
     """
     output_dir = Path(output_dir)
-    if not output_dir.is_dir():
-        raise PptxRenderRasterError(f"Output directory {output_dir} does not exist.")
-    document = _open_pdf(Path(pdf_path))
     rendered: list[RenderedPage] = []
     directory = _active_render_directory.get()
     owned_directory = directory is None
-    directory = directory or _RenderDirectory(output_dir)
+    document = None
     try:
+        directory = directory or _RenderDirectory(output_dir)
         directory.verify_path()
+        document = _open_pdf(Path(pdf_path))
         total_pages = int(document.page_count)
         for page_number in page_numbers:
             page = document[page_number - 1]
@@ -615,8 +614,9 @@ def render_pdf_pages_to_pngs(
             directory.verify_file(rendered_page)
         return total_pages, rendered
     finally:
-        document.close()
-        if owned_directory:
+        if document is not None:
+            document.close()
+        if owned_directory and directory is not None:
             directory.close()
 
 

@@ -174,16 +174,22 @@ async def test_managed_pptx_conversion_allows_cached_reads_and_releases_connecti
         output = files.Path(args[args.index("--outdir") + 1])
 
         class Process:
-            returncode = 0
+            pid = 123_456_789
+            returncode = None
 
             async def communicate(self):
                 entered.set()
                 await release.wait()
                 (output / "source.pdf").write_bytes(b"converted preview")
+                self.returncode = 0
                 return b"", b""
+
+            async def wait(self):
+                return self.returncode
 
         return Process()
 
+    monkeypatch.setattr(files.pptx_conversion.os, "killpg", lambda _pid, _signal: None)
     monkeypatch.setattr(files.asyncio, "create_subprocess_exec", convert)
     with sessions() as converting_db, sessions() as reading_db:
         task = asyncio.create_task(

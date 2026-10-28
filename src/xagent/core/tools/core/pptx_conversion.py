@@ -20,8 +20,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import signal
 import shutil
+import signal
 import tempfile
 import threading
 from pathlib import Path

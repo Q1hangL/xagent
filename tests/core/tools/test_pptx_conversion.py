@@ -8,14 +8,14 @@ than any caller's caching behavior.
 
 import asyncio
 import json
-import signal
-import time
 import os
 import pathlib
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 import pytest
 
