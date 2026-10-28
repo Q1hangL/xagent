@@ -693,6 +693,7 @@ async def test_converter_group_teardown_is_bounded_with_inherited_pipes(
     output.mkdir()
     profile_paths = []
     create_process = asyncio.create_subprocess_exec
+    process_ready = asyncio.Event()
 
     async def spawn(*arguments, **kwargs):
         profile_paths.append(_profile_dir_from_arguments(arguments))
@@ -711,6 +712,7 @@ async def test_converter_group_teardown_is_bounded_with_inherited_pipes(
                 raise RuntimeError("synthetic pipe reader error")
 
             process.communicate = broken_pipe
+        process_ready.set()
         return process
 
     monkeypatch.setattr(conversion.asyncio, "create_subprocess_exec", spawn)
@@ -729,6 +731,7 @@ async def test_converter_group_teardown_is_bounded_with_inherited_pipes(
             await asyncio.sleep(0.01)
         assert source.with_suffix(".pids").exists(), "converter did not start"
         pids = json.loads(source.with_suffix(".pids").read_text())
+        await asyncio.wait_for(process_ready.wait(), timeout=5)
         started = time.monotonic()
         if mode == "cancel":
             task.cancel()
