@@ -7,7 +7,7 @@ LibreOffice invocation contract, so the process handling lives here:
   ``--convert-to pdf``;
 * one LibreOffice user profile per call, so two concurrent conversions cannot
   fight over the same configuration lock;
-* a bounded wait whose timeout kills and actually reaps the child process;
+* a bounded wait whose timeout terminates the isolated process group;
 * cleanup of the profile and of the child on success, failure and
   cancellation.
 
@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import signal
 import shutil
 import tempfile
 import threading
@@ -181,17 +183,62 @@ async def create_owned_resource(
     return await creation.wait()
 
 
-async def _terminate_process(process: asyncio.subprocess.Process) -> None:
-    """Kill a conversion child and wait for it to be reaped."""
-    if process.returncode is None:
-        try:
-            process.kill()
-        except ProcessLookupError:  # pragma: no cover - already gone
-            pass
+PROCESS_REAP_TIMEOUT_SECONDS: Final[float] = 1.0
+
+
+def _kill_process_group(process: asyncio.subprocess.Process) -> None:
+    # A conversion owns its session. Kill descendants too, including after the
+    # session leader exits while a descendant still holds the output pipes.
     try:
-        await process.wait()
-    except ProcessLookupError:  # pragma: no cover - already reaped
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
         pass
+
+
+async def _communicate_with_group(
+    process: asyncio.subprocess.Process,
+) -> tuple[bytes, bytes]:
+    communication = asyncio.create_task(process.communicate())
+    try:
+        while process.returncode is None and not communication.done():
+            await asyncio.sleep(0.01)
+        if process.returncode is not None and not communication.done():
+            _kill_process_group(process)
+        return await communication
+    finally:
+        if not communication.done():
+            communication.cancel()
+        await asyncio.gather(communication, return_exceptions=True)
+
+
+async def _terminate_process(process: asyncio.subprocess.Process) -> None:
+    """Terminate the isolated group and bound reaping, even with inherited pipes."""
+    _kill_process_group(process)
+    waiter = asyncio.create_task(process.wait())
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + PROCESS_REAP_TIMEOUT_SECONDS
+    try:
+        while not waiter.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait({waiter}, timeout=remaining)
+            except asyncio.CancelledError:
+                # Repeated cancellation must not bypass group teardown or
+                # restart the fixed reap deadline.
+                continue
+        if waiter.done():
+            waiter.result()
+    finally:
+        if not waiter.done():
+            waiter.cancel()
+            # asyncio exposes no public close for subprocess pipe transports.
+            # A descendant that escaped the group must not hold our pipes open.
+            transport = getattr(process, "_transport", None)
+            if transport is not None:
+                transport.close()
+        await asyncio.gather(waiter, return_exceptions=True)
 
 
 async def convert_pptx_to_pdf(
@@ -210,12 +257,13 @@ async def convert_pptx_to_pdf(
     Raises:
         PptxConverterUnavailableError: LibreOffice cannot be started.
         PptxConversionTimeoutError: the conversion exceeded ``timeout_seconds``;
-            the child was killed and reaped.
+            the process group was terminated and reaping was bounded.
         PptxConversionFailedError: a non-zero exit or no expected PDF.
     """
     pptx_path = Path(pptx_path)
     output_dir = Path(output_dir)
     profile_dir: Path | None = None
+    process: asyncio.subprocess.Process | None = None
     try:
         profile_dir = await create_owned_directory(
             lambda: Path(tempfile.mkdtemp(prefix="xagent-pptx-profile-"))
@@ -231,6 +279,7 @@ async def convert_pptx_to_pdf(
                 *arguments,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
         except FileNotFoundError as exc:
             raise PptxConverterUnavailableError(
@@ -239,17 +288,13 @@ async def convert_pptx_to_pdf(
             ) from exc
         try:
             _stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=timeout_seconds
+                _communicate_with_group(process), timeout=timeout_seconds
             )
         except asyncio.TimeoutError as exc:
-            await _terminate_process(process)
             raise PptxConversionTimeoutError(
                 f"LibreOffice conversion of {pptx_path.name} timed out after "
                 f"{timeout_seconds:g} seconds."
             ) from exc
-        except asyncio.CancelledError:
-            await _terminate_process(process)
-            raise
         if process.returncode != 0:
             detail = stderr.decode("utf-8", "replace").strip()[:200]
             raise PptxConversionFailedError(
@@ -264,5 +309,7 @@ async def convert_pptx_to_pdf(
             )
         return pdf_path
     finally:
+        if process is not None:
+            await _terminate_process(process)
         if profile_dir is not None:
             await asyncio.to_thread(shutil.rmtree, profile_dir, ignore_errors=True)
