@@ -38,6 +38,7 @@ Args:
     end_page: Optional last slide to render, 1-based and inclusive.
 
 Behavior and limits:
+    - Slide numbering and total_pages include hidden slides.
     - Without start_page/end_page the first 20 slides are rendered; when the
       deck has more slides, truncated is true and the remaining pages are not
       rendered.

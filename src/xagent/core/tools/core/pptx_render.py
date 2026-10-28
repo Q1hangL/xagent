@@ -15,7 +15,8 @@ Bounds are part of the tool contract, not caller advice:
   :data:`~xagent.core.tools.core.pptx_conversion.DEFAULT_PPTX_CONVERSION_TIMEOUT_SECONDS`
   timeout.
 
-LibreOffice converts the whole deck; only the PNG output is page-bounded.
+LibreOffice converts the whole deck, including hidden slides, so PDF page
+numbers match source slide numbers. Only the PNG output is page-bounded.
 """
 
 from __future__ import annotations
@@ -1383,6 +1384,7 @@ async def render_pptx_to_images(
                 resolved_input,
                 pdf_dir,
                 timeout_seconds=DEFAULT_PPTX_CONVERSION_TIMEOUT_SECONDS,
+                include_hidden_slides=True,
             )
         except PptxConverterUnavailableError as exc:
             return _error("pdf_conversion_unavailable", str(exc))

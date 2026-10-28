@@ -55,6 +55,7 @@ def build_soffice_arguments(
     profile_dir: Path,
     *,
     soffice_binary: str = DEFAULT_SOFFICE_BINARY,
+    include_hidden_slides: bool = False,
 ) -> list[str]:
     """Return the argv for one headless ``.pptx`` -> PDF conversion.
 
@@ -63,12 +64,17 @@ def build_soffice_arguments(
     directory. It is what keeps concurrent conversions from serialising on (or
     corrupting) a shared profile lock.
     """
+    pdf_filter = (
+        'pdf:impress_pdf_Export:{"ExportHiddenSlides":{"type":"boolean","value":"true"}}'
+        if include_hidden_slides
+        else "pdf"
+    )
     return [
         soffice_binary,
         "--headless",
         f"-env:UserInstallation={profile_dir.as_uri()}",
         "--convert-to",
-        "pdf",
+        pdf_filter,
         "--outdir",
         str(output_dir),
         str(pptx_path),
@@ -247,12 +253,14 @@ async def convert_pptx_to_pdf(
     *,
     timeout_seconds: float = DEFAULT_PPTX_CONVERSION_TIMEOUT_SECONDS,
     soffice_binary: str = DEFAULT_SOFFICE_BINARY,
+    include_hidden_slides: bool = False,
 ) -> Path:
     """Convert ``pptx_path`` into ``output_dir`` and return the produced PDF.
 
     The caller supplies the output directory and decides whether to keep or
     publish the PDF. A unique LibreOffice profile directory is created for this
-    call and removed again on every exit path.
+    call and removed again on every exit path. Hidden slides are included only
+    when explicitly requested; previews retain the default export behavior.
 
     Raises:
         PptxConverterUnavailableError: LibreOffice cannot be started.
@@ -273,6 +281,7 @@ async def convert_pptx_to_pdf(
             output_dir,
             profile_dir,
             soffice_binary=soffice_binary,
+            include_hidden_slides=include_hidden_slides,
         )
         try:
             process = await asyncio.create_subprocess_exec(
