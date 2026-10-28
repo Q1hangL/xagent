@@ -1262,7 +1262,7 @@ async def _cleanup_failed_render(
     """
     if not rendered:
         try:
-            await asyncio.to_thread(directory.remove)
+            await _run_blocking(directory.remove)
         except BaseException:  # pragma: no cover - never mask the outcome
             logger.warning(
                 "Could not remove the empty render output directory",
@@ -1288,15 +1288,15 @@ async def _cleanup_failed_render(
             )
             return
     try:
-        await asyncio.to_thread(
-            _delete_unregistered_outputs, rendered, set(state.unregistered)
+        await _run_blocking(
+            lambda: _delete_unregistered_outputs(rendered, set(state.unregistered))
         )
     except BaseException:  # pragma: no cover - never mask the outcome
         logger.warning("Could not clean up unregistered rendered slides", exc_info=True)
     kept_pages = len(rendered) - len(state.unregistered)
     if kept_pages == 0:
         try:
-            await asyncio.to_thread(directory.remove)
+            await _run_blocking(directory.remove)
         except BaseException:  # pragma: no cover - never mask the outcome
             logger.warning(
                 "Could not remove the empty render output directory",
