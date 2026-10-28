@@ -344,14 +344,6 @@ def test_resolve_page_selection_rejects_out_of_bounds_ranges():
         render.resolve_page_selection(0, None, None)
 
 
-def test_unrendered_page_ranges_report_skipped_pages():
-    render = _load_render_module()
-
-    assert render.unrendered_page_ranges(25, list(range(1, 21))) == [[21, 25]]
-    assert render.unrendered_page_ranges(10, [3, 4, 5]) == [[1, 2], [6, 10]]
-    assert render.unrendered_page_ranges(5, [1, 2, 3, 4, 5]) == []
-
-
 @pytest.mark.asyncio
 async def test_render_default_renders_every_page_of_a_small_deck(
     durable_workspace, monkeypatch, tmp_path
@@ -381,9 +373,6 @@ async def test_render_default_renders_every_page_of_a_small_deck(
     assert result["truncated"] is False
     assert result["unrendered_pages"] == 0
     assert result["unrendered_page_ranges"] == []
-    assert result["page_limit"] == render.MAX_RENDERED_PAGES
-    assert result["max_pixels_per_page"] == render.MAX_PAGE_PIXELS
-    assert result["conversion_timeout_seconds"] == 60
     assert requested == [[1, 2]]
     assert [page["page_number"] for page in result["pages"]] == [1, 2]
     for page in result["pages"]:
@@ -420,7 +409,6 @@ async def test_render_default_caps_at_twenty_pages_without_rasterizing_more(
 
     assert result["success"] is True
     assert requested == [list(range(1, 21))]
-    assert result["page_limit"] == 20
     assert result["rendered_pages"] == 20
     assert result["truncated"] is True
     assert result["total_pages"] == 25

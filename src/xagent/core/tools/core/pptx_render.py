@@ -38,7 +38,7 @@ from typing import Any
 from defusedxml.ElementTree import fromstring
 
 from ....config import get_max_upload_size_bytes
-from ...file_ref import build_workspace_file_ref, parse_file_id_ref
+from ...file_ref import build_workspace_file_ref
 from ...workspace import ExternalUploadSizeLimitError, TaskWorkspace
 from ..artifacts import build_inline_artifact
 from .pptx_conversion import (
@@ -177,21 +177,6 @@ def resolve_page_selection(
     )
 
 
-def unrendered_page_ranges(
-    total_pages: int, page_numbers: list[int] | tuple[int, ...]
-) -> list[list[int]]:
-    """Return the 1-based page ranges that were not rendered."""
-    ranges: list[list[int]] = []
-    expected = 1
-    for page_number in sorted(set(page_numbers)):
-        if page_number > expected:
-            ranges.append([expected, page_number - 1])
-        expected = page_number + 1
-    if expected <= total_pages:
-        ranges.append([expected, total_pages])
-    return ranges
-
-
 def _page_scale(page: Any) -> float:
     import fitz
 
@@ -263,41 +248,22 @@ def render_pdf_pages_to_pngs(
         ) from exc
 
 
-def _looks_like_file_id(value: str) -> bool:
-    try:
-        parsed = uuid.UUID(value)
-    except (ValueError, TypeError, AttributeError):
-        return False
-    return str(parsed) == value.lower()
-
-
 def _resolve_pptx_input(workspace: TaskWorkspace, raw_selector: str) -> Path:
     """Resolve an authorized workspace input that must be an existing .pptx."""
     selector = str(raw_selector).strip()
-    file_id = parse_file_id_ref(selector)
-    if file_id is None and _looks_like_file_id(selector):
-        file_id = selector
-    if file_id is not None:
-        resolved = workspace.resolve_file_id_detached(file_id)
-        if resolved is None:
-            raise PptxRenderInputError(
-                f"File reference {file_id!r} is not available in this task workspace."
-            )
-        path = Path(resolved)
-    else:
-        try:
-            path = Path(
-                workspace.resolve_path_with_search(selector, detached_file_ids=True)
-            )
-        except FileNotFoundError as exc:
-            raise PptxRenderInputError(
-                f"The presentation {selector!r} was not found in this task workspace."
-            ) from exc
-        except ValueError as exc:
-            raise PptxRenderOutsideWorkspaceError(
-                f"The path {selector!r} is outside the task workspace or its "
-                "authorized upload directories."
-            ) from exc
+    try:
+        path = Path(
+            workspace.resolve_path_with_search(selector, detached_file_ids=True)
+        )
+    except FileNotFoundError as exc:
+        raise PptxRenderInputError(
+            f"The presentation {selector!r} was not found in this task workspace."
+        ) from exc
+    except ValueError as exc:
+        raise PptxRenderOutsideWorkspaceError(
+            f"The path {selector!r} is outside the task workspace or its "
+            "authorized upload directories."
+        ) from exc
     try:
         path = path.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
@@ -339,19 +305,19 @@ def _error(code: str, message: str, **extra: Any) -> dict[str, Any]:
 
 
 def _selection_payload(selection: PageSelection) -> dict[str, Any]:
-    rendered_count = len(selection.page_numbers)
+    first, last = selection.page_numbers[0], selection.page_numbers[-1]
+    total = selection.total_pages
     return {
-        "total_pages": selection.total_pages,
-        "rendered_pages": rendered_count,
+        "total_pages": total,
+        "rendered_pages": len(selection.page_numbers),
         "page_numbers": list(selection.page_numbers),
         "truncated": selection.truncated,
-        "unrendered_pages": selection.total_pages - rendered_count,
-        "unrendered_page_ranges": unrendered_page_ranges(
-            selection.total_pages, selection.page_numbers
-        ),
-        "page_limit": MAX_RENDERED_PAGES,
-        "max_pixels_per_page": MAX_PAGE_PIXELS,
-        "conversion_timeout_seconds": DEFAULT_PPTX_CONVERSION_TIMEOUT_SECONDS,
+        "unrendered_pages": total - len(selection.page_numbers),
+        "unrendered_page_ranges": [
+            [start, end]
+            for start, end in ((1, first - 1), (last + 1, total))
+            if start <= end
+        ],
     }
 
 
@@ -468,11 +434,8 @@ def _render_and_register(
 
 
 def _content_hash(path: Path) -> str:
-    digest = hashlib.sha256()
     with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def _publish_hidden_pdf(converted: Path, cache_path: Path) -> Path:
