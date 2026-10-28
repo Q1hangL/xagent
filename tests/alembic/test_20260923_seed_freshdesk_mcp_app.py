@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import create_engine, text
@@ -149,6 +150,67 @@ def test_upgrade_is_idempotent(tmp_path):
             text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='freshdesk'")
         ).scalar()
         assert rows == 1
+
+
+def test_upgrade_raises_if_visibility_column_is_missing(tmp_path):
+    """Without is_visible_in_connector the insert would fall back to the
+    table default (TRUE) and seed the row visible, so upgrade() must fail
+    instead of seeding."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    app_id VARCHAR(100) NOT NULL UNIQUE,
+                    name VARCHAR(200) NOT NULL,
+                    description TEXT,
+                    icon VARCHAR(1000),
+                    transport VARCHAR(50) NOT NULL DEFAULT 'oauth',
+                    provider_name VARCHAR(50),
+                    category VARCHAR(100),
+                    oauth_scopes JSON,
+                    launch_config JSON
+                )
+                """
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="is_visible_in_connector"):
+                migration.upgrade()
+        assert "freshdesk" not in _app_ids(connection)
+
+
+def test_upgrade_forces_hidden_on_a_preexisting_colliding_row(tmp_path):
+    """A pre-existing visible freshdesk row would otherwise stay visible, and
+    the builtin registry overlays the real launch config onto any row with
+    this app_id, so the collision branch must hide it without inserting a
+    duplicate or touching the operator's other fields."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, description, transport, is_visible_in_connector) "
+                "VALUES ('freshdesk', 'Operator Freshdesk', 'hand-made', "
+                "'stdio', 1)"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        row = connection.execute(
+            text(
+                "SELECT COUNT(*), MIN(is_visible_in_connector), MIN(name) "
+                "FROM public_mcp_apps WHERE app_id='freshdesk'"
+            )
+        ).first()
+        assert row[0] == 1  # no duplicate inserted
+        assert row[1] == 0  # forced hidden
+        assert row[2] == "Operator Freshdesk"  # other fields left alone
 
 
 def test_seed_row_matches_registry():
