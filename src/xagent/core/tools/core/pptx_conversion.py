@@ -8,6 +8,9 @@ LibreOffice invocation contract, so the process handling lives here:
 * one LibreOffice user profile per call, so two concurrent conversions cannot
   fight over the same configuration lock;
 * a bounded wait whose timeout terminates the isolated process group;
+* at most :data:`MAX_CONCURRENT_CONVERSIONS` LibreOffice processes at once in this
+  backend process, shared by previews and slide rendering; later calls wait
+  for a slot before their timeout starts;
 * cleanup of the profile on every exit, and of the process group on failure
   or cancellation.
 
@@ -29,6 +32,8 @@ from ....config import get_storage_root
 
 DEFAULT_PPTX_CONVERSION_TIMEOUT_SECONDS: Final[float] = 60.0
 DEFAULT_SOFFICE_BINARY: Final[str] = "soffice"
+MAX_CONCURRENT_CONVERSIONS: Final[int] = 2
+_conversion_slots = asyncio.Semaphore(MAX_CONCURRENT_CONVERSIONS)
 
 
 class PptxConversionError(RuntimeError):
@@ -112,7 +117,8 @@ async def convert_pptx_to_pdf(
     """Convert ``pptx_path`` into ``output_dir`` and return the produced PDF.
 
     The caller supplies the output directory and decides whether to keep or
-    publish the PDF. A unique LibreOffice profile directory is created for this
+    publish the PDF. The call first waits for one of the process-wide
+    conversion slots. A unique LibreOffice profile directory is created for this
     call and removed again on every exit path. Hidden slides are included only
     when explicitly requested; previews retain the default export behavior.
 
@@ -122,57 +128,58 @@ async def convert_pptx_to_pdf(
             process-group termination was attempted and reaping was bounded.
         PptxConversionFailedError: a non-zero exit or no expected PDF.
     """
-    pptx_path = Path(pptx_path)
-    output_dir = Path(output_dir)
-    profile_dir = Path(tempfile.mkdtemp(prefix="xagent-pptx-profile-"))
-    process: asyncio.subprocess.Process | None = None
-    try:
-        arguments = build_soffice_arguments(
-            pptx_path,
-            output_dir,
-            profile_dir,
-            include_hidden_slides=include_hidden_slides,
-        )
-        stderr_path = profile_dir / "stderr.log"
-        with stderr_path.open("wb") as stderr_file:
-            try:
-                process = await asyncio.create_subprocess_exec(
-                    *arguments,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=stderr_file,
-                    start_new_session=True,
+    async with _conversion_slots:
+        pptx_path = Path(pptx_path)
+        output_dir = Path(output_dir)
+        profile_dir = Path(tempfile.mkdtemp(prefix="xagent-pptx-profile-"))
+        process: asyncio.subprocess.Process | None = None
+        try:
+            arguments = build_soffice_arguments(
+                pptx_path,
+                output_dir,
+                profile_dir,
+                include_hidden_slides=include_hidden_slides,
+            )
+            stderr_path = profile_dir / "stderr.log"
+            with stderr_path.open("wb") as stderr_file:
+                try:
+                    process = await asyncio.create_subprocess_exec(
+                        *arguments,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=stderr_file,
+                        start_new_session=True,
+                    )
+                except FileNotFoundError as exc:
+                    raise PptxConverterUnavailableError(
+                        f"LibreOffice is not installed or not on PATH ({DEFAULT_SOFFICE_BINARY!r}); "
+                        f"cannot convert {pptx_path.name} to PDF."
+                    ) from exc
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=timeout_seconds)
+                except asyncio.TimeoutError as exc:
+                    raise PptxConversionTimeoutError(
+                        f"LibreOffice conversion of {pptx_path.name} timed out after "
+                        f"{timeout_seconds:g} seconds."
+                    ) from exc
+            if process.returncode != 0:
+                detail = await asyncio.to_thread(_stderr_summary, stderr_path)
+                raise PptxConversionFailedError(
+                    f"LibreOffice exited {process.returncode} while converting "
+                    f"{pptx_path.name}: {detail or 'no stderr output'}"
                 )
-            except FileNotFoundError as exc:
-                raise PptxConverterUnavailableError(
-                    f"LibreOffice is not installed or not on PATH ({DEFAULT_SOFFICE_BINARY!r}); "
-                    f"cannot convert {pptx_path.name} to PDF."
-                ) from exc
-            try:
-                await asyncio.wait_for(process.wait(), timeout=timeout_seconds)
-            except asyncio.TimeoutError as exc:
-                raise PptxConversionTimeoutError(
-                    f"LibreOffice conversion of {pptx_path.name} timed out after "
-                    f"{timeout_seconds:g} seconds."
-                ) from exc
-        if process.returncode != 0:
-            detail = await asyncio.to_thread(_stderr_summary, stderr_path)
-            raise PptxConversionFailedError(
-                f"LibreOffice exited {process.returncode} while converting "
-                f"{pptx_path.name}: {detail or 'no stderr output'}"
-            )
-        pdf_path = expected_pdf_path(pptx_path, output_dir)
-        if not await asyncio.to_thread(pdf_path.is_file):
-            raise PptxConversionFailedError(
-                f"LibreOffice finished but did not produce the expected PDF "
-                f"{pdf_path.name} for {pptx_path.name}."
-            )
-        return pdf_path
-    except (Exception, asyncio.CancelledError):
-        if process is not None:
-            await _terminate_process(process)
-        raise
-    finally:
-        await asyncio.to_thread(shutil.rmtree, profile_dir, ignore_errors=True)
+            pdf_path = expected_pdf_path(pptx_path, output_dir)
+            if not await asyncio.to_thread(pdf_path.is_file):
+                raise PptxConversionFailedError(
+                    f"LibreOffice finished but did not produce the expected PDF "
+                    f"{pdf_path.name} for {pptx_path.name}."
+                )
+            return pdf_path
+        except (Exception, asyncio.CancelledError):
+            if process is not None:
+                await _terminate_process(process)
+            raise
+        finally:
+            await asyncio.to_thread(shutil.rmtree, profile_dir, ignore_errors=True)
 
 
 def _stderr_summary(path: Path) -> str:

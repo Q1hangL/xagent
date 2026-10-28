@@ -16,7 +16,9 @@ Bounds are part of the tool contract, not caller advice:
   timeout.
 
 LibreOffice converts and caches the whole deck, including hidden slides, so PDF page
-numbers match source slide numbers. Only the PNG output is page-bounded.
+numbers match source slide numbers; a PDF whose page count differs from the deck's
+slide count is refused instead of returning shifted pages. Only the PNG output is
+page-bounded.
 """
 
 from __future__ import annotations
@@ -28,9 +30,12 @@ import os
 import tempfile
 import threading
 import uuid
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from defusedxml.ElementTree import fromstring
 
 from ....config import get_max_upload_size_bytes
 from ...file_ref import build_workspace_file_ref, parse_file_id_ref
@@ -50,6 +55,11 @@ MAX_PAGE_PIXELS = 4_000_000
 DEFAULT_RENDER_SCALE = 2.0
 PNG_MIME_TYPE = "image/png"
 RENDER_OUTPUT_DIR_PREFIX = "pptx_render_"
+_PRESENTATION_NAMESPACES = {
+    "p": "http://schemas.openxmlformats.org/presentationml/2006/main"
+}
+# A larger presentation part fails to parse instead of being expanded in memory.
+_MAX_PRESENTATION_PART_BYTES = 8 * 1024 * 1024
 
 
 class PptxRenderError(ValueError):
@@ -305,6 +315,19 @@ def _resolve_pptx_input(workspace: TaskWorkspace, raw_selector: str) -> Path:
     return path
 
 
+def _count_slides(pptx_path: Path) -> int:
+    """Count source slides, hidden ones included, from ``ppt/presentation.xml``."""
+    try:
+        with zipfile.ZipFile(pptx_path) as package:
+            with package.open("ppt/presentation.xml") as part:
+                root = fromstring(part.read(_MAX_PRESENTATION_PART_BYTES))
+    except Exception as exc:
+        raise PptxRenderUnsupportedInputError(
+            "The presentation is not a readable .pptx file."
+        ) from exc
+    return len(root.findall("p:sldIdLst/p:sldId", _PRESENTATION_NAMESPACES))
+
+
 def _error(code: str, message: str, **extra: Any) -> dict[str, Any]:
     result: dict[str, Any] = {
         "success": False,
@@ -354,7 +377,6 @@ def _build_pages_payload(
                 "height": page.height,
                 "file_id": file_id,
                 "file_ref": file_ref,
-                "artifacts": [build_inline_artifact(file_ref)],
             }
         )
     return pages
@@ -362,6 +384,7 @@ def _build_pages_payload(
 
 def _render_and_register(
     pdf_path: Path,
+    slide_count: int,
     workspace: TaskWorkspace,
     start_page: int | None,
     end_page: int | None,
@@ -369,9 +392,12 @@ def _render_and_register(
 ) -> dict[str, Any]:
     document = _open_pdf(pdf_path)
     try:
-        selection = resolve_page_selection(
-            int(document.page_count), start_page, end_page
-        )
+        selection = resolve_page_selection(slide_count, start_page, end_page)
+        if document.page_count != slide_count:
+            raise PptxConversionFailedError(
+                f"LibreOffice exported {document.page_count} PDF pages for "
+                f"{slide_count} slides, so pages would not match source slides."
+            )
         directory_name = RENDER_OUTPUT_DIR_PREFIX + uuid.uuid4().hex
         output_dir = workspace.output_dir / directory_name
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -412,7 +438,7 @@ def _render_and_register(
                     **_selection_payload(selection),
                     "pages": pages,
                     "artifacts": [
-                        artifact for page in pages for artifact in page["artifacts"]
+                        build_inline_artifact(page["file_ref"]) for page in pages
                     ],
                 }
             finally:
@@ -449,9 +475,20 @@ def _content_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _publish_hidden_pdf(converted: Path, cache_path: Path) -> Path:
+    """Publish an export and remove its owner's exports of older content."""
+    converted.replace(cache_path)
+    owner = cache_path.name.split(".", 1)[0]
+    for stale in cache_path.parent.glob(f"{owner}.*.hidden.preview.pdf"):
+        if stale != cache_path:
+            stale.unlink(missing_ok=True)
+    return cache_path
+
+
 async def _cached_render_pdf(
     staged_input: Path, source: Path, workspace: TaskWorkspace
-) -> Path:
+) -> Path | None:
+    """Return the hidden-slide PDF, or ``None`` while its publication is busy."""
     from ....web.services.uploaded_file_cleanup_publication import (
         guard_preview_publication,
         preview_cache_hit,
@@ -465,21 +502,25 @@ async def _cached_render_pdf(
     cached = await asyncio.to_thread(preview_cache_hit, source, cache_path, file_id)
     if cached is not None:
         return cached
-    with tempfile.TemporaryDirectory(
-        dir=cache_path.parent, prefix=f".{file_id or cache_path.stem}.preview-"
-    ) as directory:
-        converted = await convert_pptx_to_pdf(
-            staged_input,
-            Path(directory),
-            timeout_seconds=DEFAULT_PPTX_CONVERSION_TIMEOUT_SECONDS,
-            include_hidden_slides=True,
-        )
 
-        @guard_preview_publication
-        def publish(path: Path, file_id: str | None = None) -> Path:
-            return path.replace(cache_path)
+    # As in the preview path, the guard spans the temporary directory,
+    # conversion and publication, and reports a busy cleanup lock as None.
+    @guard_preview_publication
+    async def convert_and_publish(
+        path: Path, file_id: str | None = None
+    ) -> Path | None:
+        with tempfile.TemporaryDirectory(
+            dir=cache_path.parent, prefix=f".{file_id or cache_path.stem}.preview-"
+        ) as directory:
+            converted = await convert_pptx_to_pdf(
+                path,
+                Path(directory),
+                timeout_seconds=DEFAULT_PPTX_CONVERSION_TIMEOUT_SECONDS,
+                include_hidden_slides=True,
+            )
+            return await asyncio.to_thread(_publish_hidden_pdf, converted, cache_path)
 
-        return await asyncio.to_thread(publish, converted, file_id)
+    return await convert_and_publish(staged_input, file_id)
 
 
 async def render_pptx_to_images(
@@ -492,9 +533,11 @@ async def render_pptx_to_images(
     """Render selected source slides, including hidden ones, into registered PNGs.
 
     Registration failures preserve the images. Failures before registration
-    remove this call's output. Cancellation propagates without waiting for workers;
-    the worker checks it between pages and before registration. Registration
-    already in progress may finish and its images are preserved.
+    remove this call's output. Cancellation during a conversion waits for that
+    conversion under the preview publication guard, as previews do. Later
+    cancellation propagates without waiting for workers; the worker checks it
+    between pages and before registration. Registration already in progress may
+    finish and its images are preserved.
     """
     try:
         import fitz  # noqa: F401 - optional dependency checked at invocation
@@ -522,13 +565,23 @@ async def render_pptx_to_images(
             max_bytes=get_max_upload_size_bytes(),
             host_private=True,
         )
+        slide_count = await asyncio.to_thread(_count_slides, staged_input)
         pdf_path = await _cached_render_pdf(staged_input, source, workspace)
-        result = await asyncio.to_thread(
-            _render_and_register, pdf_path, workspace, start_page, end_page, cancelled
+        if pdf_path is None:
+            return _error(
+                "pdf_conversion_unavailable",
+                "The presentation is busy with file cleanup or another conversion; "
+                "try again.",
+            )
+        return await asyncio.to_thread(
+            _render_and_register,
+            pdf_path,
+            slide_count,
+            workspace,
+            start_page,
+            end_page,
+            cancelled,
         )
-        if result["success"]:
-            result["pptx_path"] = str(source)
-        return result
     except asyncio.CancelledError:
         cancelled.set()
         raise

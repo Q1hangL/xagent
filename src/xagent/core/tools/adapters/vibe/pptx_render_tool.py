@@ -58,9 +58,9 @@ Behavior and limits:
       it does not run in the sandbox. When soffice is missing the call fails
       with a clear error instead of returning images.
     - Every returned PNG is registered as a durable workspace file. Each page
-      entry carries the 1-based page_number, a file_ref and an inline image
-      artifact. Rendered pages keep the slide layout; exact fonts and
-      animations may differ from the original editor.
+      entry carries the 1-based page_number and a file_ref; the result lists
+      one inline image artifact per page. Rendered pages keep the slide
+      layout; exact fonts and animations may differ from the original editor.
 """.strip()
 
 
