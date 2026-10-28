@@ -2533,3 +2533,117 @@ async def test_cancelled_cleanup_keeps_directory_handle_until_worker_finishes(
         await asyncio.gather(task, return_exceptions=True)
     assert directories[0].fd == -1
     assert list(workspace.output_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_changed_input_symlink_is_rejected_before_conversion(
+    durable_workspace, monkeypatch, tmp_path
+):
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    deck = _write_deck(workspace.input_dir)
+    outside = tmp_path / "private.pptx"
+    outside.write_bytes(b"private presentation")
+    resolve = render._resolve_pptx_input
+    reads = []
+
+    def resolve_then_replace(*args):
+        source = resolve(*args)
+        source.unlink()
+        source.symlink_to(outside)
+        return source
+
+    async def convert(source, output_dir, **kwargs):
+        reads.append(source.read_bytes())
+        pdf = output_dir / "deck.pdf"
+        pdf.write_bytes(b"%PDF synthetic")
+        return pdf
+
+    monkeypatch.setattr(render, "_resolve_pptx_input", resolve_then_replace)
+    monkeypatch.setattr(render, "convert_pptx_to_pdf", convert)
+    _install_rasterizer(monkeypatch, render, page_count=1, requested=[], rendered=[])
+    result = await render.render_pptx_to_images(str(deck), workspace)
+
+    assert reads == [], "conversion read a substituted input"
+    assert result["success"] is False
+    assert not list(workspace.output_dir.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_converter_reads_private_staged_input_and_discards_it(
+    durable_workspace, monkeypatch
+):
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    deck = _write_deck(workspace.input_dir)
+    sources = []
+
+    async def convert(source, output_dir, **kwargs):
+        sources.append(source)
+        assert source != deck
+        assert not source.is_relative_to(workspace.workspace_dir)
+        assert source.read_bytes() == deck.read_bytes()
+        pdf = output_dir / "deck.pdf"
+        pdf.write_bytes(b"%PDF synthetic")
+        return pdf
+
+    monkeypatch.setattr(render, "convert_pptx_to_pdf", convert)
+    _install_rasterizer(monkeypatch, render, page_count=1, requested=[], rendered=[])
+    result = await render.render_pptx_to_images(str(deck), workspace)
+
+    assert result["success"] is True, result
+    assert len(sources) == 1
+    assert not sources[0].exists()
+
+
+@pytest.mark.asyncio
+async def test_registration_failure_keeps_all_written_images(
+    durable_workspace, monkeypatch
+):
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    deck = _write_deck(workspace.input_dir)
+    _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
+    _install_rasterizer(monkeypatch, render, page_count=3, requested=[], rendered=[])
+
+    def reject(*args, **kwargs):
+        raise RuntimeError("metadata database unavailable")
+
+    monkeypatch.setattr(workspace, "register_files", reject)
+    monkeypatch.setattr(workspace, "register_delivery_file", reject)
+    result = await render.render_pptx_to_images(str(deck), workspace)
+
+    assert result["error_code"] == "registration_failed"
+    assert len(list(workspace.output_dir.glob("pptx_render_*/*.png"))) == 3
+
+
+@pytest.mark.asyncio
+async def test_cancellation_does_not_wait_for_registration(
+    durable_workspace, monkeypatch
+):
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    deck = _write_deck(workspace.input_dir)
+    _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
+    _install_rasterizer(monkeypatch, render, page_count=1, requested=[], rendered=[])
+    ready = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def blocked(*args, **kwargs):
+        loop.call_soon_threadsafe(ready.set)
+        assert release.wait(5)
+        raise RuntimeError("registration stopped")
+
+    monkeypatch.setattr(workspace, "register_files", blocked)
+    monkeypatch.setattr(workspace, "register_delivery_file", blocked)
+    task = asyncio.create_task(render.render_pptx_to_images(str(deck), workspace))
+    try:
+        await asyncio.wait_for(ready.wait(), 3)
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=0.5)
+        assert task in done, "cancellation waited for the registration worker"
+        assert task.cancelled()
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
