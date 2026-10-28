@@ -1858,8 +1858,8 @@ async def google_slides_get_slide_thumbnail(
         pres_id = _resolve_presentation_id(presentation_id)
         service = await asyncio.to_thread(get_slides_service)
 
-        # Other tools use synchronous SDK calls in FastMCP's worker context.
-        # Keep this async tool responsive by offloading just the SDK operations.
+        # Other tools call the synchronous SDK directly. Offload this tool's
+        # SDK operations so its async entry does not block other downloads.
         presentation = await asyncio.to_thread(
             lambda: service.presentations()
             .get(presentationId=pres_id, fields="slides.objectId")
