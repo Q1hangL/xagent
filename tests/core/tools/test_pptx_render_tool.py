@@ -2469,3 +2469,67 @@ async def test_output_handle_open_failure_removes_created_directory(
     with pytest.raises(render.PptxRenderOutputError):
         await render._create_render_output_directory(workspace)
     assert list(workspace.output_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup", ["directory", "pages"])
+async def test_cancelled_cleanup_keeps_directory_handle_until_worker_finishes(
+    durable_workspace, monkeypatch, cleanup
+):
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    source = _write_deck(workspace.input_dir)
+    entered, release = threading.Event(), threading.Event()
+    directories = []
+    _install_conversion(monkeypatch, render, calls=[], timeout_records=[])
+    if cleanup == "directory":
+
+        def unreadable(_path):
+            raise render.PptxRenderPdfError("synthetic unreadable PDF")
+
+        monkeypatch.setattr(render, "read_pdf_page_count", unreadable)
+        original = render._RenderDirectory.remove
+
+        def paused(directory):
+            directories.append(directory)
+            entered.set()
+            assert release.wait(5)
+            if directory.fd >= 0:
+                original(directory)
+
+        monkeypatch.setattr(render._RenderDirectory, "remove", paused)
+    else:
+        _install_rasterizer(
+            monkeypatch, render, page_count=1, requested=[], rendered=[]
+        )
+        monkeypatch.setattr(
+            workspace,
+            "register_files",
+            lambda files: tuple(str(uuid.uuid4()) for _ in files),
+        )
+        original = render._delete_unregistered_outputs
+
+        def paused(pages, unregistered):
+            directories.append(pages[0].directory)
+            entered.set()
+            assert release.wait(5)
+            if pages[0].directory.fd >= 0:
+                original(pages, unregistered)
+
+        monkeypatch.setattr(render, "_delete_unregistered_outputs", paused)
+    task = asyncio.create_task(render.render_pptx_to_images(str(source), workspace))
+    try:
+        async with asyncio.timeout(5):
+            while not entered.is_set():
+                await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.1)
+        assert directories[0].fd >= 0, (
+            "directory handle closed while its cleanup worker was active"
+        )
+        os.fstat(directories[0].fd)
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+    assert directories[0].fd == -1
+    assert list(workspace.output_dir.iterdir()) == []
