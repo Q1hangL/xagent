@@ -495,3 +495,43 @@ slides._write_thumbnail_png(b"partial image", output_dir=output,
     # A force-killed process cannot run finally; remove its private staging name.
     for temporary in output.glob("*.tmp"):
         temporary.unlink()
+
+
+async def test_api_failure_does_not_create_output_directory(api, tmp_path):
+    api[1].return_value.execute.side_effect = ValueError("presentation unavailable")
+    result = await invoke(slide_id="s1")
+    assert result["status"] == "error"
+    assert not (tmp_path / "output").exists()
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        ("http", "thumbnail image download failed: HTTP 403"),
+        ("network", "thumbnail image download failed: network error"),
+        ("validation", "Thumbnail image response was empty"),
+    ],
+)
+async def test_download_error_messages_are_useful_without_signed_urls(
+    api, transport, caplog, failure, expected
+):
+    def respond(request):
+        if failure == "network":
+            raise httpx.ConnectError(f"Cannot connect to {URL}", request=request)
+        return httpx.Response(403 if failure == "http" else 200, content=b"")
+
+    transport["response"] = respond
+    result = await invoke(slide_id="s1")
+    assert result["status"] == "error"
+    assert result["message"] == expected
+    assert expected in caplog.text
+    assert "synthetic-private-query" not in json.dumps(result) + caplog.text
+
+
+async def test_https_port_uses_shared_url_policy(api, transport):
+    api[1].return_value.execute.return_value = {
+        "contentUrl": f"https://{HOST}:8443/image"
+    }
+    result = await invoke(slide_id="s1")
+    assert result["status"] == "success"
+    assert transport["requests"][0].url.port == 8443
