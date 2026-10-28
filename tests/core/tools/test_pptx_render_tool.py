@@ -124,8 +124,11 @@ class _FakePixelExtent:
         self.width = width
         self.height = height
 
-    def save(self, path) -> None:
-        pathlib.Path(path).write_bytes(PNG_1X1)
+    def save(self, path, output=None) -> None:
+        if hasattr(path, "write"):
+            path.write(PNG_1X1)
+        else:
+            pathlib.Path(path).write_bytes(PNG_1X1)
 
 
 class _FakeRect:
@@ -2280,3 +2283,65 @@ async def test_blocking_operation_preserves_context_and_runs_off_loop():
         value.reset(token)
     assert observed[0] == "workspace-context"
     assert observed[1] != loop_thread
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["conversion", "write", "registration"])
+@pytest.mark.parametrize("existing_image", [False, True])
+async def test_replaced_render_directory_never_modifies_outside_files(
+    durable_workspace, monkeypatch, tmp_path, stage, existing_image
+):
+    render = _load_render_module()
+    workspace = durable_workspace.workspace
+    deck = _write_deck(workspace.input_dir)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "sentinel.txt").write_bytes(b"preserve this file")
+    if existing_image:
+        (outside / "slide_001.png").write_bytes(b"preserve this image")
+    before = {p.name: (p.read_bytes(), p.stat().st_ino) for p in outside.iterdir()}
+    moved = workspace.output_dir / "moved_render"
+    replaced = []
+
+    def replace_directory():
+        directory = next(workspace.output_dir.glob("pptx_render_*"))
+        directory.rename(moved)
+        directory.symlink_to(outside, target_is_directory=True)
+        replaced.append(directory)
+
+    async def convert(source, output_dir, **kwargs):
+        if stage == "conversion":
+            replace_directory()
+        pdf = output_dir / "deck.pdf"
+        pdf.write_bytes(b"%PDF synthetic")
+        return pdf
+
+    monkeypatch.setattr(render, "convert_pptx_to_pdf", convert)
+    monkeypatch.setattr(render, "fitz", _FakeFitz([(72, 54)], []))
+    save = _FakePixelExtent.save
+
+    def save_and_replace(pixmap, destination, *args, **kwargs):
+        if stage == "write":
+            replace_directory()
+        return save(pixmap, destination, *args, **kwargs)
+
+    monkeypatch.setattr(_FakePixelExtent, "save", save_and_replace)
+    register = workspace.register_files
+
+    def register_and_replace(files, **kwargs):
+        ids = register(files, **kwargs)
+        if stage == "registration":
+            replace_directory()
+        return ids
+
+    monkeypatch.setattr(workspace, "register_files", register_and_replace)
+    result = await render.render_pptx_to_images(str(deck), workspace)
+
+    after = {p.name: (p.read_bytes(), p.stat().st_ino) for p in outside.iterdir()}
+    assert after == before, "rendering changed files outside the task"
+    assert result["success"] is False, result
+    assert len(replaced) == 1
+    assert replaced[0].is_symlink()
+    if stage == "registration":
+        assert (moved / "slide_001.png").read_bytes() == PNG_1X1
+        assert len(_output_rows(durable_workspace.session_factory)) == 1
