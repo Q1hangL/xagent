@@ -108,7 +108,7 @@ def test_upgrade_is_noop_when_catalog_columns_are_missing() -> None:
     migration = _load_migration_module()
     engine = sa.create_engine("sqlite:///:memory:")
     metadata = sa.MetaData()
-    sa.Table(
+    table = sa.Table(
         "public_mcp_apps",
         metadata,
         sa.Column("app_id", sa.String(100), primary_key=True),
@@ -119,7 +119,21 @@ def test_upgrade_is_noop_when_catalog_columns_are_missing() -> None:
         engine.begin() as connection,
         patch.object(migration, "op", _operations(connection)),
     ):
+        connection.execute(sa.insert(table), {"app_id": "freshdesk"})
         migration.upgrade()
+        assert connection.execute(sa.select(table)).all() == [("freshdesk",)]
+
+
+def test_upgrade_is_noop_without_catalog_table() -> None:
+    migration = _load_migration_module()
+    engine = sa.create_engine("sqlite:///:memory:")
+
+    with (
+        engine.begin() as connection,
+        patch.object(migration, "op", _operations(connection)),
+    ):
+        migration.upgrade()
+        assert "public_mcp_apps" not in sa.inspect(connection).get_table_names()
 
 
 def test_offline_sqlite_upgrade_round_trips_visibility() -> None:
@@ -146,6 +160,21 @@ def test_offline_sqlite_upgrade_round_trips_visibility() -> None:
     assert row == (1,)
 
 
+def test_offline_postgresql_upgrade_renders_true_literal() -> None:
+    migration = _load_migration_module()
+    output = StringIO()
+    context = MigrationContext.configure(
+        dialect_name="postgresql", opts={"as_sql": True, "output_buffer": output}
+    )
+    with Operations.context(context):
+        migration.upgrade()
+
+    sql = output.getvalue()
+    assert "UPDATE public_mcp_apps SET is_visible_in_connector=true" in sql
+    assert "app_id = 'freshdesk'" in sql
+    assert "%(" not in sql
+
+
 def test_offline_downgrade_emits_no_sql() -> None:
     migration = _load_migration_module()
     output = StringIO()
@@ -166,7 +195,7 @@ def test_revision_metadata() -> None:
     assert migration.down_revision == "20261027_wrap_legacy_password_hashes"
 
 
-def test_registry_matches_migration() -> None:
+def test_registry_default_is_visible() -> None:
     """A fresh install seeds from the registry, an existing one is flipped by
     this migration; both must end up visible."""
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
