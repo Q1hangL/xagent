@@ -77,8 +77,11 @@ def upgrade() -> None:
 
     # is_visible_in_connector is load-bearing for the release gate this row
     # ships behind: without it the column filter below would drop the key and
-    # the table default (TRUE) would seed the row visible. Same guard as the
-    # zendesk/chrome seeds.
+    # the table default (TRUE) would seed the row visible. Checked before the
+    # collision branch so both paths are covered. A plain RuntimeError rather
+    # than assert: assertions are stripped under `python -O`/PYTHONOPTIMIZE,
+    # which would silently defeat this guard. Same guard as the zendesk/chrome
+    # seeds.
     if "is_visible_in_connector" not in columns:
         raise RuntimeError(
             "public_mcp_apps.is_visible_in_connector is missing; the freshdesk "
@@ -126,9 +129,13 @@ def downgrade() -> None:
     # already connected are intentionally left in place -- connect-driven rows
     # are not owned by this migration and are cleaned up through the normal
     # disconnect path. Matches chartmogul's/posthog's identical downgrade.
+    #
     # Only rows still matching this migration's own seed snapshot are removed.
-    # upgrade() skips seeding when the app_id already exists, so an
-    # unconditional delete by app_id would drop a row this migration never
-    # created -- the same reason atlassian/miro/fireflies/rocketlane use this
-    # helper.
+    # upgrade()'s collision branch adopts a pre-existing row by flipping only
+    # is_visible_in_connector and leaves its other fields as the operator set
+    # them, so an unconditional delete by app_id would destroy that operator's
+    # own row -- the same reason atlassian/miro/fireflies/rocketlane use this
+    # helper. An adopted row that differs from the snapshot is therefore left
+    # in place as a hidden orphan: downgrade does not restore the visibility
+    # it had before upgrade().
     delete_unmodified_seeded_rows(bind, PUBLIC_MCP_APPS_TABLE, [ROW])

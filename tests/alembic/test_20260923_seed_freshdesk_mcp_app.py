@@ -278,10 +278,11 @@ def test_seed_row_classifies_api_key():
 
 
 def test_downgrade_leaves_an_operator_modified_row_alone(tmp_path):
-    """upgrade() skips seeding when the app_id already exists, so an
-    unconditional delete by app_id would drop a row this migration never
-    created -- an operator's own freshdesk entry, or one a later migration
-    edited.
+    """downgrade() removes only a row that still matches the seed snapshot.
+    upgrade() adopts a pre-existing freshdesk row (forcing it hidden) instead
+    of inserting one, so an unconditional delete by app_id would drop a row
+    this migration never created -- an operator's own freshdesk entry -- or
+    one edited after the seed, e.g. by a later migration.
     """
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
