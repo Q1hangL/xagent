@@ -65,8 +65,12 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    if op.get_context().as_sql:
-        _set_visibility_offline(False)
-        return
-
-    _set_visibility(op.get_bind(), False)
+    # Intentionally not reversed, online or offline. Hiding the row
+    # unconditionally would make it match the 20260923_seed_freshdesk_mcp_app
+    # snapshot again, so a full downgrade would then let that seed's
+    # downgrade delete a freshdesk row an operator had made visible before
+    # this migration. The code being downgraded to reads visibility from the
+    # database as well, so nothing needs the flag reset. As a result, after
+    # upgrading through this migration, a full downgrade leaves the row
+    # visible and the seed's downgrade keeps it.
+    pass
