@@ -14,12 +14,11 @@ MIGRATION_PATH = (
     Path(__file__).parent.parent.parent
     / "src/xagent/migrations/versions/20261028_enable_freshdesk.py"
 )
+SEED_MIGRATION_PATH = MIGRATION_PATH.with_name("20260923_seed_freshdesk_mcp_app.py")
 
 
-def _load_migration_module():
-    spec = importlib.util.spec_from_file_location(
-        "enable_freshdesk_migration", MIGRATION_PATH
-    )
+def _load_migration_module(path: Path = MIGRATION_PATH):
+    spec = importlib.util.spec_from_file_location(path.stem, path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -67,23 +66,42 @@ def test_upgrade_enables_freshdesk_idempotently(tmp_path) -> None:
     assert rows["other"]["is_visible_in_connector"] is False
 
 
-def test_downgrade_hides_freshdesk(tmp_path) -> None:
+def test_full_downgrade_keeps_a_row_an_operator_enabled(tmp_path) -> None:
+    """Hiding the row on downgrade would make it match the seed snapshot
+    again, so the seed migration's downgrade would then delete a row an
+    operator had made visible before this migration ran."""
+    seed = _load_migration_module(SEED_MIGRATION_PATH)
     migration = _load_migration_module()
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     metadata = sa.MetaData()
-    table = _public_mcp_apps(metadata)
+    table = sa.Table(
+        "public_mcp_apps",
+        metadata,
+        sa.Column("id", sa.Integer, primary_key=True),
+        *(
+            sa.Column(column.name, column.type)
+            for column in seed.PUBLIC_MCP_APPS_TABLE.c
+        ),
+    )
     metadata.create_all(engine)
+    select_rows = sa.select(table.c.app_id, table.c.is_visible_in_connector)
 
     with engine.begin() as connection:
+        with patch.object(seed, "op", _operations(connection)):
+            seed.upgrade()
         connection.execute(
-            sa.insert(table),
-            {"app_id": "freshdesk", "is_visible_in_connector": True},
+            sa.update(table)
+            .where(table.c.app_id == "freshdesk")
+            .values(is_visible_in_connector=True)
         )
         with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
             migration.downgrade()
-        row = connection.execute(sa.select(table)).mappings().one()
+        assert connection.execute(select_rows).all() == [("freshdesk", True)]
 
-    assert row["is_visible_in_connector"] is False
+        with patch.object(seed, "op", _operations(connection)):
+            seed.downgrade()
+        assert connection.execute(select_rows).all() == [("freshdesk", True)]
 
 
 def test_upgrade_is_noop_when_catalog_columns_are_missing() -> None:
@@ -126,6 +144,19 @@ def test_offline_sqlite_upgrade_round_trips_visibility() -> None:
     connection.close()
 
     assert row == (1,)
+
+
+def test_offline_downgrade_emits_no_sql() -> None:
+    migration = _load_migration_module()
+    output = StringIO()
+    context = MigrationContext.configure(
+        dialect_name="sqlite",
+        opts={"as_sql": True, "output_buffer": output},
+    )
+    with Operations.context(context):
+        migration.downgrade()
+
+    assert output.getvalue() == ""
 
 
 def test_revision_metadata() -> None:
