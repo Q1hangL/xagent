@@ -3,6 +3,38 @@
   var scriptTag = document.currentScript;
   var host = new URL(scriptTag.src).origin;
 
+  // Host-page API: window.XagentWidget.open(options). Every warning carries a
+  // fixed text plus, at most, the host page's own option names.
+  var W_NO_INSTANCE = 'Xagent Widget: XagentWidget.open() was called, but no chat widget is active on this page.';
+  var W_BAD_OPTIONS = 'Xagent Widget: XagentWidget.open() expects an options object; opening the chat without sending a message.';
+  var W_UNKNOWN_OPTIONS_PREFIX = 'Xagent Widget: XagentWidget.open() ignored unknown option(s): ';
+
+  // Shared by every widget.js instance on the page: open() targets the newest
+  // instance that is still live, and falls back to an older one once the newer
+  // one is torn down. Defined before this instance can fail to initialize, so a
+  // host page always gets a callable object and a console warning instead of a
+  // TypeError. Each instance assigns an equivalent function that reads only this
+  // shared list, so whichever instance assigned it last makes no difference.
+  function xagentOpenTargets() {
+    if (!Array.isArray(window.__xagentWidgetOpenTargets)) {
+      window.__xagentWidgetOpenTargets = [];
+    }
+    return window.__xagentWidgetOpenTargets;
+  }
+  window.XagentWidget = {
+    open: function (options) {
+      var targets = xagentOpenTargets();
+      for (var i = targets.length - 1; i >= 0; i--) {
+        if (targets[i].isLive()) {
+          targets[i].open(options);
+          return undefined;
+        }
+      }
+      console.warn(W_NO_INSTANCE);
+      return undefined;
+    }
+  };
+
   var SESSION_TIMEOUT_MS = 5000;          // constants appendix #16
   // Transport failures (a rejected fetch, a timed-out attempt, an uncoded 5xx)
   // are retried without a limit, so a widget left open across a backend
@@ -812,6 +844,12 @@
   var panelRemovalObserver = new MutationObserver(function () {
     if (panel.isConnected) return;
     torndown = true;
+    // open() falls back to an older live instance from now on, and nothing
+    // this instance still holds can be delivered.
+    openMessageSlot = null;
+    var openTargets = xagentOpenTargets();
+    var openTargetIndex = openTargets.indexOf(openTarget);
+    if (openTargetIndex !== -1) openTargets.splice(openTargetIndex, 1);
     panelRemovalObserver.disconnect();
     window.removeEventListener('resize', onWindowResize);
     window.removeEventListener('blur', onWindowBlur);
@@ -861,6 +899,17 @@
   var hasOpened = false;
   var initialMessageRequested = false;
   var initialMessageDelivered = false;
+
+  // XagentWidget.open() state for this instance: one slot for the newest
+  // unacknowledged message; whether the iframe has asked for open messages at
+  // least once (it stays set, so a reloaded iframe's next request gets the
+  // pending message again); the per-instance id counter; and this instance's
+  // entry in the shared target list, set once it registers.
+  var OPEN_OPTION_KEYS = ['message'];
+  var openMessageSlot = null;
+  var openMessageRequested = false;
+  var openMessageSeq = 0;
+  var openTarget = null;
 
   // Non-null exactly while THIS instance owns a reference on the shared lock
   // below, and which element that reference is against -- a second widget
@@ -1067,6 +1116,66 @@
     iframe.contentWindow.postMessage({ xagent: true, v: 1, type: 'initial_message', value: value }, host);
   }
 
+  // Applies the data-initial-message rules (trimmed, non-empty, at most
+  // MAX_INITIAL_MESSAGE_LENGTH) to open()'s message and returns it, or null.
+  // Unlike the attribute, every unusable call warns: each one is an explicit
+  // request from the host page. Only own properties count, so a `message`
+  // inherited from a prototype is ignored. A host getter or Proxy trap that
+  // throws is not caught: the exception reaches the caller before anything opens.
+  function readOpenMessage(options) {
+    if (options === undefined) return null;
+    if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+      console.warn(W_BAD_OPTIONS);
+      return null;
+    }
+    var unknownKeys = Object.keys(options).filter(function (key) {
+      return OPEN_OPTION_KEYS.indexOf(key) === -1;
+    });
+    if (unknownKeys.length) {
+      console.warn(W_UNKNOWN_OPTIONS_PREFIX + unknownKeys.join(', ') + '.');
+    }
+    if (!Object.prototype.hasOwnProperty.call(options, 'message')) return null;
+    var raw = options.message;
+    if (raw === undefined) return null;
+    var value = typeof raw === 'string' ? raw.trim() : '';
+    if (!value || value.length > MAX_INITIAL_MESSAGE_LENGTH) {
+      // Built here rather than beside the W_* texts at the top: the limit is
+      // assigned further down than they are, so it is still undefined there.
+      console.warn('Xagent Widget: XagentWidget.open() message must be a non-empty string of at most ' + MAX_INITIAL_MESSAGE_LENGTH + ' characters; opening the chat without sending it.');
+      return null;
+    }
+    return value;
+  }
+
+  // Posted whether or not the panel is still open: the call asked for this
+  // message to be sent. Before the iframe's first request there is no listener
+  // to post to, so the slot waits for that request.
+  function deliverOpenMessage() {
+    if (torndown || !openMessageSlot || !openMessageRequested || !iframe.contentWindow) return;
+    iframe.contentWindow.postMessage(
+      { xagent: true, v: 1, type: 'open_message', id: openMessageSlot.id, value: openMessageSlot.value },
+      host
+    );
+  }
+
+  // XagentWidget.open() for this instance. A usable message permanently spends
+  // data-initial-message (marked before openPanel(), whose own delivery attempt
+  // must already see it spent), replaces any message still waiting for its ack,
+  // and goes to the iframe once the iframe listens for open messages. The panel
+  // only ever opens here, never closes. The message is host-authored in the
+  // same way as data-initial-message: never pass visitor-controlled input.
+  function openFromHost(options) {
+    if (torndown || !panel.isConnected) return;
+    var value = readOpenMessage(options);
+    if (value !== null) {
+      initialMessageDelivered = true;
+      openMessageSeq += 1;
+      openMessageSlot = { id: String(openMessageSeq), value: value };
+    }
+    openPanel();
+    if (value !== null) deliverOpenMessage();
+  }
+
   // The header's close control lives inside the iframe's React app and has
   // no direct handle to panel/fab, so it signals intent back here over
   // postMessage instead. Named (not inline) so panelRemovalObserver can
@@ -1114,11 +1223,26 @@
       // Only the iframe's own acknowledgement ends delivery: a post made while
       // its listener was down (not ready, reloading) is simply answered again.
       initialMessageDelivered = true;
+    } else if (data.type === 'open_message_request') {
+      openMessageRequested = true;
+      deliverOpenMessage();
+    } else if (data.type === 'open_message_ack') {
+      // Only the ack for the message in the slot clears it: an ack for one a
+      // later call already replaced leaves the newer message pending.
+      if (openMessageSlot && data.id === openMessageSlot.id) openMessageSlot = null;
     }
   }
   window.addEventListener('message', onChromeMessage);
 
   mode.attach(iframe);
+
+  // Registered only once this instance has fully initialized; the teardown
+  // below removes it again.
+  openTarget = {
+    open: openFromHost,
+    isLive: function () { return !torndown && panel.isConnected; }
+  };
+  xagentOpenTargets().push(openTarget);
 
   function createGuestMode(scriptTag, host) {
     var token = scriptTag.getAttribute('data-token') || 'default';

@@ -63,13 +63,13 @@ def test_agent_chat_reply_and_followup(shared_app, interface):
     ws_path = (
         f"/ws/chat/{task_id}" if interface == "owner" else f"{prefix}/ws/{task_id}"
     )
-    url = (
-        str(app.client.base_url).replace("http://", "ws://").rstrip("/")
-        + ws_path
-        + (f"?token={token}" if interface != "owner" else "")
-    )
+    url = str(app.client.base_url).replace("http://", "ws://").rstrip("/") + ws_path
+    # Guests carry their token in the handshake headers, never the URL.
     with connect(
-        url, additional_headers=app.headers if interface == "owner" else None
+        url,
+        additional_headers=app.headers
+        if interface == "owner"
+        else {"Authorization": f"Bearer {token}"},
     ) as ws:
         receive_event(ws, "historical_data_complete")
         ws.send(
@@ -112,7 +112,10 @@ def test_agent_chat_reply_and_followup(shared_app, interface):
         "Continue the conversation" in json.dumps(call["messages"]) for call in calls
     )
     with connect(
-        url, additional_headers=app.headers if interface == "owner" else None
+        url,
+        additional_headers=app.headers
+        if interface == "owner"
+        else {"Authorization": f"Bearer {token}"},
     ) as ws:
         _, history = receive_event(ws, "historical_data_complete")
         assert "Continue the conversation" in json.dumps(history)
@@ -246,13 +249,13 @@ def test_chat_file_input_and_output(shared_app, interface):
     ws_path = (
         f"/ws/chat/{task_id}" if interface == "owner" else f"{prefix}/ws/{task_id}"
     )
-    url = (
-        str(app.client.base_url).replace("http://", "ws://").rstrip("/")
-        + ws_path
-        + (f"?token={token}" if interface != "owner" else "")
-    )
+    url = str(app.client.base_url).replace("http://", "ws://").rstrip("/") + ws_path
+    # Guests carry their token in the handshake headers, never the URL.
     with connect(
-        url, additional_headers=app.headers if interface == "owner" else None
+        url,
+        additional_headers=app.headers
+        if interface == "owner"
+        else {"Authorization": f"Bearer {token}"},
     ) as ws:
         receive_event(ws, "historical_data_complete")
         ws.send(
@@ -278,7 +281,8 @@ def test_chat_file_input_and_output(shared_app, interface):
     assert output_id in completed["output"]
     assert output_id in json.dumps(events)
     response = app.client.get(
-        f"/api/files/public/download/{output_id}", params={"token": token}
+        f"/api/files/public/download/{output_id}",
+        headers={"Authorization": f"Bearer {token}"},
     )
     assert response.status_code == 200, response.text
     assert response.content == b"UNIQUE SHARED INPUT\n"

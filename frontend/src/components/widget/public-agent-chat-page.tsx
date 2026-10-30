@@ -7,12 +7,14 @@ import { TaskConversationPanel } from "@/components/task/task-conversation-panel
 import { iconButtonClassName, WidgetChromeControls } from "@/components/widget/widget-chrome-controls"
 import { AppProvider, useApp, type AppProviderTransportConfig } from "@/contexts/app-context-chat"
 import { useWidgetInitialMessage } from "@/hooks/use-widget-initial-message"
+import { useWidgetOpenMessage, W_SEND_FAILED } from "@/hooks/use-widget-open-message"
 import { resolveReportedTimezone } from "@/hooks/use-websocket"
 import { usePublicFileAccessPolicy } from "@/contexts/file-access-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { uploadPublicChatFile } from "@/lib/public-chat-file-upload"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
 import { clientErrorTranslationKey } from "@/lib/client-errors"
+import { notifySendFailure } from "@/lib/send-failure-notice"
 import { normalizeTaskStatus } from "@/lib/task-status"
 import { requestPromptContext } from "@/lib/widget-parent-message"
 import {
@@ -153,6 +155,7 @@ function PublicConversationContent({
     setTaskId,
     connectionError,
     voiceInputEnabled,
+    isSendInFlight,
   } = useApp()
   const { t } = useI18n()
   const [createTaskError, setCreateTaskError] = useState<string | null>(null)
@@ -392,6 +395,54 @@ function PublicConversationContent({
       })
     },
   })
+
+  const { request: openRequest, take: takeOpenRequest } = useWidgetOpenMessage({
+    enabled: authMode === "widget",
+  })
+  // The conversation this driver last ended for an open message, so a taskId
+  // is ended once while that reset is still being applied.
+  const resetIssuedForTaskIdRef = useRef<number | null>(null)
+
+  // XagentWidget.open(message) from the host page always starts a new
+  // conversation, one message at a time. A message waits in the hook's slot
+  // while any send is in flight: a task being created (isBootstrappingTask) or
+  // a send anywhere on the page that has not settled (isSendInFlight), whose
+  // queued delivery a reset would fail. With a conversation open it is first
+  // ended the way the "new conversation" control ends it, and the send runs in
+  // a later render. The taskId read here and the handleSend called here belong
+  // to the same render, so that handleSend already sees no conversation.
+  useEffect(() => {
+    if (!openRequest) return
+    if (!hasResolvedStoredTask || isBootstrappingTask || isSendInFlight) return
+    if (state.taskId !== null) {
+      if (resetIssuedForTaskIdRef.current !== state.taskId) {
+        resetIssuedForTaskIdRef.current = state.taskId
+        handleNewConversation()
+      }
+      return
+    }
+    resetIssuedForTaskIdRef.current = null
+    takeOpenRequest(openRequest.seq)
+    openingTaskCreatedRef.current = false
+    handleSend(openRequest.message, undefined, []).catch((error: unknown) => {
+      console.warn(W_SEND_FAILED)
+      // The notice the start screen's input raises for its own failed send,
+      // from the same helper. Once the task exists that input has been
+      // replaced, so a lost connection shows nothing; every other failure
+      // raises the toast. A header error, when there is one, is handleSend's own.
+      notifySendFailure(error, t, { suppressConnectionLost: openingTaskCreatedRef.current })
+    })
+  }, [
+    handleNewConversation,
+    handleSend,
+    hasResolvedStoredTask,
+    isBootstrappingTask,
+    isSendInFlight,
+    openRequest,
+    state.taskId,
+    t,
+    takeOpenRequest,
+  ])
 
   const resolvedAgentName = state.currentTask?.agentName || agentName || t("widgetChat.title")
   const resolvedAgentLogo = state.currentTask?.agentLogoUrl || agentLogo || null
@@ -650,8 +701,10 @@ export function PublicAgentChatPage({
       // an ordinary full page, where in-tab navigation is expected behavior.
       linksOpenInNewTab: authMode === "widget" ? "enabled" : "disabled",
     },
-    buildWebSocketUrl: ({ baseUrl, taskId, token }) =>
-      `${baseUrl}/${authMode === "share" ? "api/share" : "api/widget"}/chat/ws/${taskId}${token ? `?token=${token}` : ""}`,
+    // The guest token rides the WebSocket handshake headers (the shared
+    // xagent-auth-v1 subprotocol scheme), never the URL.
+    buildWebSocketUrl: ({ baseUrl, taskId }) =>
+      `${baseUrl}/${authMode === "share" ? "api/share" : "api/widget"}/chat/ws/${taskId}`,
     fileAccess,
     uploadFiles: (files, params) =>
       Promise.all(files.map((file) =>

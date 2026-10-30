@@ -560,16 +560,17 @@ def test_ws_connect_over_limit_is_refused_pre_accept(
     monkeypatch.setenv("XAGENT_SHARE_WS_CONNECT_IP_RATE_LIMIT", "1/minute")
     reset_share_rate_limiter()
 
-    url = "/api/share/chat/ws/1?token=garbage"
+    url = "/api/share/chat/ws/1"
+    garbage = ["xagent-auth-v1", "xagent-auth-token.garbage"]
     # First attempt is admitted: it upgrades, then auth rejects it post-accept.
-    with client.websocket_connect(url) as ws:
+    with client.websocket_connect(url, subprotocols=garbage) as ws:
         with pytest.raises(WebSocketDisconnect) as first:
             ws.receive_text()
     assert first.value.code == 4003
 
     # Second attempt from the same caller trips the budget pre-accept.
     with pytest.raises(WebSocketDisconnect) as denied:
-        with client.websocket_connect(url):
+        with client.websocket_connect(url, subprotocols=garbage):
             pass
     assert denied.value.code == 4008
 
@@ -700,16 +701,17 @@ def test_widget_ws_connect_over_limit_is_refused_pre_accept(
     monkeypatch.setenv("XAGENT_WIDGET_WS_CONNECT_IP_RATE_LIMIT", "1/minute")
     reset_share_rate_limiter()
 
-    url = "/api/widget/chat/ws/1?token=garbage"
+    url = "/api/widget/chat/ws/1"
+    garbage = ["xagent-auth-v1", "xagent-auth-token.garbage"]
     # First attempt is admitted: it upgrades, then auth rejects it post-accept.
-    with client.websocket_connect(url) as ws:
+    with client.websocket_connect(url, subprotocols=garbage) as ws:
         with pytest.raises(WebSocketDisconnect) as first:
             ws.receive_text()
     assert first.value.code == 4003
 
     # Second attempt from the same caller trips the budget pre-accept.
     with pytest.raises(WebSocketDisconnect) as denied:
-        with client.websocket_connect(url):
+        with client.websocket_connect(url, subprotocols=garbage):
             pass
     assert denied.value.code == 4008
 

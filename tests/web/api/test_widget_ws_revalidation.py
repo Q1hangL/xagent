@@ -279,6 +279,11 @@ def _build_guest(channel: str, monkeypatch: pytest.MonkeyPatch) -> _WidgetGuest:
     return _workforce_widget_guest(monkeypatch)
 
 
+def _guest_protocols(guest: _WidgetGuest) -> list[str]:
+    """Browsers carry the guest token in Sec-WebSocket-Protocol, not the URL."""
+    return ["xagent-auth-v1", f"xagent-auth-token.{guest.token}"]
+
+
 def _receive_until(ws: WebSocketTestSession, event_type: str) -> bool:
     """Read frames until one carries ``event_type``.
 
@@ -328,9 +333,9 @@ def test_widget_ws_closes_4003_when_widget_is_revoked_mid_session(
     (#1055).
     """
     guest = _build_guest(channel, monkeypatch)
-    url = f"/api/widget/chat/ws/{guest.task_id}?token={guest.token}"
+    url = f"/api/widget/chat/ws/{guest.task_id}"
 
-    with client.websocket_connect(url) as ws:
+    with client.websocket_connect(url, subprotocols=_guest_protocols(guest)) as ws:
         # Control: prove the socket survives an inbound message while the widget
         # is still live, so the close below is attributable to the revocation and
         # not to sending anything at all. ``intervention`` is the cheapest
@@ -368,11 +373,11 @@ def test_widget_ws_reconnect_after_revocation_reports_4003(
     revoke: Callable[[], None] = getattr(guest, revocation)
     revoke()
 
-    url = f"/api/widget/chat/ws/{guest.task_id}?token={guest.token}"
+    url = f"/api/widget/chat/ws/{guest.task_id}"
     # Accept-first (#1057): the connection upgrades, then connect-time auth
     # rejects it, so the denial surfaces at receive rather than at
     # context-manager entry (a pre-accept close would raise on the ``with``).
-    with client.websocket_connect(url) as ws:
+    with client.websocket_connect(url, subprotocols=_guest_protocols(guest)) as ws:
         denied = _drain_until_disconnect(ws)
 
     assert denied.code == 4003

@@ -5,6 +5,8 @@ import os
 from logging.config import dictConfig
 from typing import Literal, cast
 
+from .request_log_redaction import install_request_log_redaction
+
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
 
@@ -64,6 +66,10 @@ def setup_logging(level: LogLevel | None = None, force: bool = False) -> None:
             },
         }
     )
+
+    # Server access and WebSocket handshake lines carry the raw request
+    # target; mask credential-like query values before they reach a handler.
+    install_request_log_redaction()
 
     if invalid_level:
         logging.warning(

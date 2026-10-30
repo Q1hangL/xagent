@@ -49,9 +49,11 @@ describe("PptxPreviewRenderer public file access", () => {
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalled())
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/files/public/preview/presentation-id?token=pptx-guest-token",
+      "/api/files/public/preview/presentation-id",
       expect.objectContaining({ credentials: "same-origin" }),
     )
+    const [, options] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(new Headers(options.headers).get("Authorization")).toBe("Bearer pptx-guest-token")
     expect(fetchMock.mock.calls.every(([url]) => !String(url).includes("preview-pdf"))).toBe(true)
   })
 })

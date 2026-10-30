@@ -42,6 +42,7 @@ from .task_command_transport import (
     stage_task_command,
 )
 from .task_execution_controller import TaskControlState
+from .task_orchestrator import invalidate_task_cache_best_effort
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,27 @@ def _release_held_delivery_no_commit(
         .execution_options(synchronize_session=False)
     )
     return int(held)
+
+
+def settle_channel_reply_after_cancel_no_commit(
+    db: Session, *, task_id: int, run_id: str, channel_id: int
+) -> int | None:
+    """The channel reply of ``run_id`` once a person cancelled its automatic
+    resume: "interrupted" (first writer wins, whatever a later resume by
+    hand answers), and its pending reply claimable now. Returns the START
+    whose held reply was released. Caller holds the ``tasks`` row lock; lock
+    order: tasks, the recovery row, commands, deliveries. Without a stored
+    START or a delivery row (no shared execution) both steps do nothing."""
+
+    stamp_channel_result_no_commit(
+        db,
+        task_id=task_id,
+        run_id=run_id,
+        channel_result=interrupted_channel_result(),
+    )
+    return _release_held_delivery_no_commit(
+        db, task_id=task_id, run_id=run_id, channel_id=channel_id
+    )
 
 
 def _idle(db: Session, task: Task) -> bool:
@@ -205,17 +227,8 @@ def _stop_once_no_commit(
     if cancel.raced:
         return None
     if cancel.cancelled:
-        run_id = str(cancel.run_id)
-        # First writer wins: the run's reply is "stopped", whatever a later
-        # resume by hand answers.
-        stamp_channel_result_no_commit(
-            db,
-            task_id=task_id,
-            run_id=run_id,
-            channel_result=interrupted_channel_result(),
-        )
-        held = _release_held_delivery_no_commit(
-            db, task_id=task_id, run_id=run_id, channel_id=channel_id
+        held = settle_channel_reply_after_cancel_no_commit(
+            db, task_id=task_id, run_id=str(cancel.run_id), channel_id=channel_id
         )
         notices = (cancel.notice,) if cancel.notice is not None else ()
         return (
@@ -287,6 +300,11 @@ def stop_channel_task_sync(
         break
     else:
         logger.warning("Channel stop of task %s kept losing a race", task_id)
+    if result.outcome is ChannelStopOutcome.CANCELLED:
+        # The cancel moved ``state_version``; a cached detail or status read
+        # keyed on ``updated_at`` (one-second resolution on SQLite) would
+        # otherwise keep serving the old fence.
+        invalidate_task_cache_best_effort(task_id)
     if staged:
         notify_task_command_dispatcher()
     increment_counter(

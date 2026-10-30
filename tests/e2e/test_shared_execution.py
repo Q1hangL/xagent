@@ -536,7 +536,8 @@ def test_workforce_manager_and_child_execute_in_worker(shared_app, interface):
             else app.token
         )
         downloaded = app.client.get(
-            f"/api/files/public/download/{output_id}", params={"token": file_token}
+            f"/api/files/public/download/{output_id}",
+            headers={"Authorization": f"Bearer {file_token}"},
         )
         assert downloaded.status_code == 200, downloaded.text
         assert downloaded.content == b"UNIQUE SHARED INPUT\n"
@@ -583,13 +584,13 @@ def test_workforce_manager_and_child_execute_in_worker(shared_app, interface):
             url = (
                 str(app.client.base_url).replace("http://", "ws://").rstrip("/")
                 + ws_path
-                + (f"?token={token}" if interface in {"widget", "share"} else "")
             )
+            # Guests carry their token in the handshake headers, not the URL.
             with connect(
                 url,
                 additional_headers=app.headers
                 if interface not in {"widget", "share"}
-                else None,
+                else {"Authorization": f"Bearer {token}"},
             ) as ws:
                 receive_event(ws, "historical_data_complete")
                 ws.send(

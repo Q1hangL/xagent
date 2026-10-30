@@ -1,6 +1,7 @@
 """Login credentials in WebSocket handshake headers, never navigation URLs."""
 
 import re
+from urllib.parse import parse_qs
 
 from starlette.datastructures import Headers
 from starlette.types import Scope
@@ -8,10 +9,23 @@ from starlette.types import Scope
 AUTH_PROTOCOL = "xagent-auth-v1"
 AUTH_TOKEN_PREFIX = "xagent-auth-token."
 _TOKEN = re.compile(r"[A-Za-z0-9._~-]{1,8192}\Z")
+# Retired URI credential carriers. A handshake naming any of them is refused
+# even when a valid header credential is also present, so a client cannot
+# keep (and proxies cannot keep logging) the leaking contract.
+LEGACY_QUERY_CREDENTIALS = frozenset({"token", "access_token"})
 
 
 class InvalidWebSocketCredentials(ValueError):
     """Malformed or ambiguous credentials; never include their value."""
+
+
+def websocket_query_carries_credential(scope: Scope) -> bool:
+    """Whether the handshake URL names a retired query-string credential."""
+    raw = scope.get("query_string", b"")
+    if not isinstance(raw, (bytes, bytearray)) or not raw:
+        return False
+    query = parse_qs(bytes(raw).decode("latin-1"), keep_blank_values=True)
+    return bool(LEGACY_QUERY_CREDENTIALS.intersection(query))
 
 
 def websocket_header_token(scope: Scope) -> str | None:

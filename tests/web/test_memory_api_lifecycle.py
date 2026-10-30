@@ -112,16 +112,20 @@ def _unavailable(state: MemoryLifecycleState):
     return provider, status
 
 
+# Memory IDs are opaque; a non-UUID ID still reaches the lifecycle check.
+_NOTE_PATH = "/api/memory/some-id"
+
+
 @pytest.mark.parametrize("state", UNAVAILABLE_STATES)
 @pytest.mark.parametrize(
     ("method", "path", "body"),
     [
         ("get", "/api/memory/list", None),
         ("get", "/api/memory/stats", None),
-        ("get", "/api/memory/some-id", None),
+        ("get", _NOTE_PATH, None),
         ("post", "/api/memory", {"content": "note"}),
-        ("put", "/api/memory/some-id", {"content": "note"}),
-        ("delete", "/api/memory/some-id", None),
+        ("put", _NOTE_PATH, {"content": "note"}),
+        ("delete", _NOTE_PATH, None),
     ],
 )
 def test_every_memory_route_fails_closed_with_one_stable_detail(
@@ -180,10 +184,10 @@ class _RevokedAfterAcquire:
         ("get", "/api/memory/list", None),
         ("get", "/api/memory/list?search=note", None),
         ("get", "/api/memory/stats", None),
-        ("get", "/api/memory/some-id", None),
+        ("get", _NOTE_PATH, None),
         ("post", "/api/memory", {"content": "note"}),
-        ("put", "/api/memory/some-id", {"content": "note"}),
-        ("delete", "/api/memory/some-id", None),
+        ("put", _NOTE_PATH, {"content": "note"}),
+        ("delete", _NOTE_PATH, None),
     ],
 )
 def test_a_revocation_after_acquisition_still_answers_the_stable_503(

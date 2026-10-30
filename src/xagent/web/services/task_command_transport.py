@@ -1931,14 +1931,16 @@ def _fair_share_enabled() -> bool:
 # FAIR_SHARE_TENANTS_PER_SCAN ranked tenants for the best command it can claim among
 # the FAIR_SHARE_WINDOW highest-priority, then oldest, queued commands of one
 # (tenant key, dispatch class). A (tenant key, class) that has none is not asked
-# again for FAIR_SHARE_SKIP_SECONDS.
+# again for FAIR_SHARE_SKIP_SECONDS, unless its tenant is the only one ranked: no
+# other tenant could take that turn, so every scan asks it again.
 #
 # A fallback round reads the queue as it always did, so that a command only the full
 # scan can reach is not left behind. Fallback rounds aim at one in every
 # FAIR_SHARE_FALLBACK_EVERY new slots that counted attempts open: a fair round that
-# opens a slot adds one to a balance, a fallback round that opens one takes
-# FAIR_SHARE_FALLBACK_EVERY - 1 off, and attempts that read the balance together may
-# all become fallback rounds, so the share holds over time rather than slot by slot.
+# opens a slot adds one to a balance, a fallback round the balance brought that
+# opens one takes FAIR_SHARE_FALLBACK_EVERY - 1 off, and attempts that read the
+# balance together may all become fallback rounds, so the share holds over time
+# rather than slot by slot.
 # An attempt that opens no slot leaves the balance alone: one that joins a task this
 # process already executes, takes a control command, has its slot refused or picks
 # nothing. So every counted attempt whose scan finds a command also adds one to an
@@ -1949,10 +1951,12 @@ def _fair_share_enabled() -> bool:
 # must not bring a fallback round. Once FAIR_SHARE_FALLBACK_AFTER_ATTEMPTS attempts
 # have been counted, every attempt is a fallback round until one does; an attempt
 # decides its round before it is counted, so up to DISPATCHER_CONCURRENCY - 1 more
-# may go by first. A fallback round the attempt count brings also takes
-# FAIR_SHARE_FALLBACK_EVERY - 1 off when it opens a slot, and the balance has no
-# floor, so after a stretch of attempts that open no slot the fair rounds pay that
-# back before the balance brings a fallback round again.
+# may go by first. Only a fallback round whose first scan read the balance at its
+# line takes FAIR_SHARE_FALLBACK_EVERY - 1 off when it opens a slot; one the attempt
+# count alone brings leaves the balance alone, so a stretch of attempts that open no
+# slot leaves no debt for the fair rounds to pay back. The balance goes below zero
+# only when attempts that read it at its line together each open a slot, so it stays
+# at or above -(FAIR_SHARE_FALLBACK_EVERY - 1) * (DISPATCHER_CONCURRENCY - 1).
 FAIR_SHARE_WINDOW = 16
 FAIR_SHARE_TENANTS_PER_SCAN = 4
 FAIR_SHARE_SKIP_SECONDS = 2.0
@@ -2176,22 +2180,25 @@ class _FairState:
 
     def __init__(self) -> None:
         # The fallback rounds' balance: each new slot a counted fair round opens
-        # adds one, each new slot a fallback round opens takes off
-        # FAIR_SHARE_FALLBACK_EVERY - 1. It has no floor and can be negative.
+        # adds one, each new slot a fallback round that read it at its line opens
+        # takes off FAIR_SHARE_FALLBACK_EVERY - 1. It is negative only after
+        # attempts that read it at its line together each opened a slot.
         self.since_fallback = 0
         # Counted attempts that found a command since a fallback round last
         # dispatched a command holding a slot token, whatever they then dispatched
         # and whether they dispatched at all.
         self.attempts_since_fallback = 0
         # Until when (``_fair_clock``) a (tenant key, dispatch class) is not asked.
+        # When only one tenant is ranked, ranking neither reads nor writes it.
         self.skips: dict[tuple[str, str], float] = {}
         # Window queries that found nothing since the diagnostics line last asked.
         # Attempts that read the skip table before one of them records a miss each
         # query and count the same (tenant key, class), so this counts lookups.
         self.misses = 0
         # Since the diagnostics line last asked: counted attempts decided as
-        # fallback rounds, and scans that ranked tenants but took the plain lookup
-        # because no tenant asked had a claimable command or none could be asked.
+        # fallback rounds, and scans that ranked at least two tenants but took the
+        # plain lookup because no tenant asked had a claimable command or none
+        # could be asked.
         self.fallbacks = 0
         self.all_missed = 0
 
@@ -2237,10 +2244,12 @@ def _fair_live_skips() -> frozenset[tuple[str, str]]:
         return frozenset(skips)
 
 
-def _fair_record_miss(key: str, dispatch_class: str) -> None:
+def _fair_record_miss(key: str, dispatch_class: str, skip: bool = True) -> None:
+    """Count a window query that found nothing and, with ``skip``, skip the pair."""
     until = _fair_clock() + FAIR_SHARE_SKIP_SECONDS
     with _fair_state_lock:
-        _fair_state.skips[(key, dispatch_class)] = until
+        if skip:
+            _fair_state.skips[(key, dispatch_class)] = until
         _fair_state.misses += 1
 
 
@@ -2269,18 +2278,19 @@ def _fair_count_dispatch(attempt: _FairAttempt, opened: bool) -> None:
     command is applied leaves it counted as joining. An attempt whose slot is refused or
     released, or whose ownership check raises, never gets here; one that does is
     recorded even if applying the command then fails. A dispatch that opens a slot
-    moves the balance: a fallback round takes FAIR_SHARE_FALLBACK_EVERY - 1 off,
-    any other round adds one. A fallback round's dispatch also sets the attempt
-    count back to zero, whether or not it opens a slot; the attempt itself was
-    counted by the scan that found its command (``_fair_count_attempt``). The lock
-    is held for the memory update only.
+    moves the balance: a fallback round whose first scan read the balance at its
+    line takes FAIR_SHARE_FALLBACK_EVERY - 1 off, one the attempt count alone
+    brought leaves it alone, and any other round adds one. A fallback round's
+    dispatch also sets the attempt count back to zero, whether or not it opens a
+    slot; the attempt itself was counted by the scan that found its command
+    (``_fair_count_attempt``). The lock is held for the memory update only.
     """
     if not attempt.counted:
         return
     with _fair_state_lock:
         if attempt.fallback:
             _fair_state.attempts_since_fallback = 0
-            if opened:
+            if opened and attempt.at_balance_line:
                 _fair_state.since_fallback -= FAIR_SHARE_FALLBACK_EVERY - 1
         elif opened:
             _fair_state.since_fallback += 1
@@ -2296,14 +2306,17 @@ class _FairAttempt:
     finds a command (``_fair_count_attempt``), and only a counted attempt is
     recorded once it dispatches (``_fair_count_dispatch``). A scan the
     presence precheck ends because no command is open never reaches that
-    decision, so it leaves ``decided`` unset. ``tenants`` is the listing of the
-    queue, taken by the first scan that ranks or that is between the batch line
-    and the limit, and reused by the rescans of the same attempt.
+    decision, so it leaves ``decided`` unset. ``at_balance_line`` is set when that
+    scan read the balance at its line, so that the attempt's dispatch takes its
+    share off the balance. ``tenants`` is the listing of the queue, taken by the
+    first scan that ranks or that is between the batch line and the limit, and
+    reused by the rescans of the same attempt.
     """
 
     decided: bool = False
     counted: bool = False
     fallback: bool = False
+    at_balance_line: bool = False
     tenants: dict[str, dict[str, int]] | None = None
 
 
@@ -2323,11 +2336,12 @@ def _ranks_tenants(
     balance has reached FAIR_SHARE_FALLBACK_EVERY - 1 or the attempt count has
     reached FAIR_SHARE_FALLBACK_AFTER_ATTEMPTS. So once that many counted attempts
     have found a command since a fallback round last dispatched a command holding
-    a slot token, every attempt is a fallback round until one does. It only reads
-    both: ``_fair_count_attempt`` adds the attempt to the attempt count once the
-    scan finds a command, and ``_fair_count_dispatch`` moves the balance and sets
-    the attempt count back. A scan the presence precheck already ended never calls
-    this, so it is not counted and does not set ``decided``.
+    a slot token, every attempt is a fallback round until one does; only an
+    attempt that read the balance at its line is marked to take its share off. It
+    only reads both: ``_fair_count_attempt`` adds the attempt to the attempt count
+    once the scan finds a command, and ``_fair_count_dispatch`` moves the balance
+    and sets the attempt count back. A scan the presence precheck already ended
+    never calls this, so it is not counted and does not set ``decided``.
     """
     has_room = command_db_id is None and (cap is None or not cap.closed)
     if not attempt.decided:
@@ -2335,8 +2349,11 @@ def _ranks_tenants(
         if has_room:
             attempt.counted = True
             with _fair_state_lock:
-                attempt.fallback = (
+                attempt.at_balance_line = (
                     _fair_state.since_fallback >= FAIR_SHARE_FALLBACK_EVERY - 1
+                )
+                attempt.fallback = (
+                    attempt.at_balance_line
                     or _fair_state.attempts_since_fallback
                     >= FAIR_SHARE_FALLBACK_AFTER_ATTEMPTS
                 )
@@ -2365,7 +2382,10 @@ def _fair_pick(
     and the oldest claimable command older than that which needs no new slot
     (``_older_needing_no_new_slot``) is taken in its place. A (tenant key, class)
     with no claimable command in its window is missed and skipped for a while.
-    With no tenant ranked, the plain lookup decides. So it returns None only when
+    With no tenant listed, the plain lookup decides. A single listed tenant is
+    ranked too, so its windows are read by priority, but ranking neither reads
+    nor writes the skip table for it: no other tenant could take its turn, so
+    every scan asks each of its classes again. So it returns None only when
     ``oldest_claimable()`` does, which a fallback round reads instead: the attempt
     count leaves out the attempts that find nothing on that ground.
 
@@ -2390,14 +2410,16 @@ def _fair_pick(
     The listing is taken once per attempt, so a rescan may rank a queue that has
     moved on; at worst that costs one more window query or one more recorded miss.
     A task the attempt already set aside (``busy``) that fills the window of a tenant
-    makes that tenant miss and be skipped, as a task that cannot be claimed does.
+    makes that tenant miss and, unless it is the only tenant ranked, be skipped, as a
+    task that cannot be claimed does.
     """
     if attempt.tenants is None:
         attempt.tenants = _list_queued_tenants(db)
     tenants = _tenants_in_band(attempt.tenants, cap)
-    if len(tenants) <= 1:
+    if not tenants:
         return oldest_claimable()
-    skipped = skips()
+    alone = len(tenants) == 1
+    skipped = frozenset() if alone else skips()
     occupancy = cap.occupancy if cap is not None else {}
     ranked = sorted(
         (
@@ -2422,7 +2444,7 @@ def _fair_pick(
             else:
                 rows = [row] if (row := window.first()) is not None else []
             if not rows:
-                _fair_record_miss(key, dispatch_class)
+                _fair_record_miss(key, dispatch_class, skip=not alone)
                 continue
             hits.append(rows[0])
             ages[dispatch_class] = min(row.id for row in rows)
@@ -2430,8 +2452,11 @@ def _fair_pick(
             best = min(hits, key=lambda row: ages[row.dispatch_class])
             break
     if best is None:
-        with _fair_state_lock:
-            _fair_state.all_missed += 1
+        # A tenant ranked alone falls back with no other tenant passed over, so
+        # only a scan that ranked at least two is counted as all missed.
+        if not alone:
+            with _fair_state_lock:
+                _fair_state.all_missed += 1
         return oldest_claimable()
     active = cap.active_ids if cap is not None else frozenset()
     older = _older_needing_no_new_slot(claimable, best.id, active)
@@ -2654,7 +2679,11 @@ async def dispatch_one_task_command(
         # restart holds new execution: the held snapshot then applies the
         # closed-cap claim rules, so commands that would open an execution
         # stay pending for the next process while controls and commands of
-        # active tasks are still applied here.
+        # active tasks are still applied here. Its host never seals, but a
+        # seal reported by ``execution_status`` is enforced here too;
+        # ``_dispatch_task_command`` already counts the whole attempt.
+        if release_hold.sealed:
+            return False
         return await _dispatch_task_command(
             executor,
             command_db_id=command_db_id,
@@ -2662,6 +2691,28 @@ async def dispatch_one_task_command(
         )
     if not consumes_task_commands():
         return False
+    # Shared execution: one token covers the whole attempt -- candidate query,
+    # dispatch reservation, the ``registry.ensure`` wait (which may wait for an
+    # old owner's close before creating a new one) and the apply. Checked and
+    # registered in one synchronous step, so a seal either sees this attempt
+    # in the ledger until it returns or refuses it here, before any side
+    # effect.
+    attempt = release_hold.try_begin_attempt(
+        "command_attempt", str(command_db_id or "next")
+    )
+    if attempt is None:
+        return False
+    with attempt:
+        return await _dispatch_shared_task_command(
+            executor, command_db_id=command_db_id
+        )
+
+
+async def _dispatch_shared_task_command(
+    executor: CommandExecutor,
+    *,
+    command_db_id: int | None,
+) -> bool:
     from types import SimpleNamespace
 
     from .task_coordinator_runtime import (
@@ -2764,6 +2815,11 @@ async def dispatch_one_task_command(
             task_id,
             selected_id,
             kind.value,
+        )
+        release_hold.record_unsettled(
+            "command_claim",
+            f"command:{selected_id}",
+            f"{kind.value} application interrupted; claim left for recovery",
         )
         return False
     finally:

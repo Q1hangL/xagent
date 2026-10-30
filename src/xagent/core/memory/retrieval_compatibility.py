@@ -30,6 +30,7 @@ from itertools import count
 from typing import Any, Callable, Generator, Iterable, Iterator, Optional, Union
 
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
+from ..utils.lancedb_sql import sql_and
 from .core import MemoryNote
 from .scope_columns import build_scope_where
 from .storage_admission import AdmittedLanceDBMemoryStore, DormantLanceDBMemoryHandle
@@ -92,8 +93,9 @@ def _stream_rows(
         if scope_where:
             terms.append(scope_where)
         scan = table.search()
-        if terms:
-            scan = scan.where(" AND ".join(terms))
+        where_sql = sql_and(terms)
+        if where_sql:
+            scan = scan.where(where_sql)
         projection = [column for column in PROJECTED_COLUMNS if column in names]
         if projection:
             scan = scan.select(projection)

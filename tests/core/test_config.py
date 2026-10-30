@@ -77,7 +77,6 @@ from xagent.config import (
     PUBLIC_API_BASE_URL,
     REDIS_URL,
     S2S_API_BASE_URL,
-    SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY,
     SANDBOX_CPUS,
     SANDBOX_ENV,
     SANDBOX_HOST_PROJECT_ROOT,
@@ -191,7 +190,6 @@ from xagent.config import (
     get_public_api_base_url,
     get_redis_url,
     get_s2s_api_base_url,
-    get_sandbox_allow_local_fallback_on_capacity,
     get_sandbox_cpus,
     get_sandbox_env,
     get_sandbox_host_project_root,
@@ -296,6 +294,20 @@ def test_google_scope_config(monkeypatch, value):
 
     assert flag == config.GOOGLE_RESTRICTED_SCOPES_ENABLED
     assert config.get_google_restricted_scopes() is (value in {"true", "1", "ON"})
+
+
+@pytest.mark.parametrize("value", [None, "false", "", "invalid", "true", "1", "ON"])
+def test_google_shared_oauth_grants_config(monkeypatch, value):
+    flag = "XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED"
+    if value is None:
+        monkeypatch.delenv(flag, raising=False)
+    else:
+        monkeypatch.setenv(flag, value)
+
+    assert flag == config.GOOGLE_SHARED_OAUTH_GRANTS_ENABLED
+    assert config.get_google_shared_oauth_grants_enabled() is (
+        value in {"true", "1", "ON"}
+    )
 
 
 @pytest.mark.parametrize("value", [None, "false", "", "invalid", "true", "1", "ON"])
@@ -3151,24 +3163,6 @@ class TestGetSandboxMaxContainers:
         assert get_sandbox_max_containers() is None
         monkeypatch.setenv(SANDBOX_MAX_CONTAINERS, "-5")
         assert get_sandbox_max_containers() is None
-
-
-class TestGetSandboxAllowLocalFallbackOnCapacity:
-    """Test get_sandbox_allow_local_fallback_on_capacity() function."""
-
-    def test_defaults_to_false(self, monkeypatch):
-        monkeypatch.delenv(SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY, raising=False)
-        assert get_sandbox_allow_local_fallback_on_capacity() is False
-
-    def test_enabled_values(self, monkeypatch):
-        for value in ("1", "true", "True", "yes", "on"):
-            monkeypatch.setenv(SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY, value)
-            assert get_sandbox_allow_local_fallback_on_capacity() is True
-
-    def test_disabled_values(self, monkeypatch):
-        for value in ("0", "false", "off", "junk"):
-            monkeypatch.setenv(SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY, value)
-            assert get_sandbox_allow_local_fallback_on_capacity() is False
 
 
 class TestCheckpointGateStallWarningConfig:

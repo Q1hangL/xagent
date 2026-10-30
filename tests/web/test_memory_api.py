@@ -1,10 +1,15 @@
 """Test cases for memory API endpoints."""
 
+import json
 import os
 import tempfile
 from datetime import datetime
+from typing import Any
 from unittest.mock import Mock
+from urllib.parse import quote
 
+import lancedb  # type: ignore
+import pyarrow as pa  # type: ignore
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -13,11 +18,28 @@ from sqlalchemy.orm import sessionmaker
 
 from xagent.core.memory.base import MemoryStore
 from xagent.core.memory.core import MemoryNote
+from xagent.core.memory.lancedb import LanceDBMemoryStore
+from xagent.core.memory.storage_admission import (
+    DormantLanceDBMemoryHandle,
+    StorageAdmissionState,
+    admit_lancedb_memory_storage,
+)
+from xagent.core.memory.vector_compatibility import EmbeddingIdentity
+from xagent.core.model.embedding import BaseEmbedding
+from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 from xagent.web.api.auth import auth_router, hash_password
 from xagent.web.api.memory import MemoryManagementRouter
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.models.database import Base, get_db
 from xagent.web.models.user import User
+from xagent.web.user_isolated_memory import UserContext, UserIsolatedMemoryStore
+
+# Fixture IDs in the minted str(uuid.uuid4()) form; the routes accept any opaque ID.
+MEMORY_ID_1 = "0b7a6a52-3f1e-4c3a-9d55-1f0c8e2a7b11"
+MEMORY_ID_2 = "5d2c9e40-8a6b-4f7d-b3c1-6e9f2a4d8c22"
+MISSING_MEMORY_ID = "9e8d7c6b-5a49-4382-a716-2f3e4d5c6b33"
+OTHER_MEMORY_ID = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c44"
+CRD_MEMORY_ID = "7f6e5d4c-3b2a-4190-8f7e-6d5c4b3a2955"
 
 # Create temporary directory for database
 temp_dir = tempfile.mkdtemp()
@@ -116,7 +138,7 @@ def sample_memory_notes():
     """Create sample memory notes for testing."""
     return [
         MemoryNote(
-            id="memory_1",
+            id=MEMORY_ID_1,
             content="Test memory 1",
             keywords=["test", "sample"],
             tags=["important"],
@@ -126,7 +148,7 @@ def sample_memory_notes():
             mime_type="text/plain",
         ),
         MemoryNote(
-            id="memory_2",
+            id=MEMORY_ID_2,
             content="Test memory 2",
             keywords=["test", "example"],
             tags=["normal"],
@@ -318,24 +340,24 @@ class TestMemoryGetEndpoint:
     ):
         """Test successful memory retrieval."""
         mock_memory_store.get.return_value = Mock(
-            success=True, memory_id="memory_1", content=sample_memory_notes[0]
+            success=True, memory_id=MEMORY_ID_1, content=sample_memory_notes[0]
         )
 
-        response = client.get("/api/memory/memory_1", headers=auth_headers)
+        response = client.get(f"/api/memory/{MEMORY_ID_1}", headers=auth_headers)
 
         assert response.status_code == 200
         data = response.json()
-        assert data["id"] == "memory_1"
+        assert data["id"] == MEMORY_ID_1
         assert data["content"] == "Test memory 1"
         assert "context" not in data  # Ensure context field is not present
 
     def test_get_memory_not_found(self, client, mock_memory_store, auth_headers):
         """Test memory retrieval for non-existent ID."""
         mock_memory_store.get.return_value = Mock(
-            success=False, error="Memory not found", memory_id="non_existent"
+            success=False, error="Memory not found", memory_id=MISSING_MEMORY_ID
         )
 
-        response = client.get("/api/memory/non_existent", headers=auth_headers)
+        response = client.get(f"/api/memory/{MISSING_MEMORY_ID}", headers=auth_headers)
 
         assert response.status_code == 404
         assert "not found" in response.json()["detail"].lower()
@@ -345,7 +367,7 @@ class TestMemoryGetEndpoint:
         # Setup mock to raise exception
         mock_memory_store.get.side_effect = Exception("Database error")
 
-        response = client.get("/api/memory/test_id", headers=auth_headers)
+        response = client.get(f"/api/memory/{OTHER_MEMORY_ID}", headers=auth_headers)
 
         assert response.status_code == 500
         assert "Failed to get memory" in response.json()["detail"]
@@ -463,7 +485,7 @@ class TestMemoryUpdateEndpoint:
         }
 
         response = client.put(
-            "/api/memory/memory_1", json=update_data, headers=auth_headers
+            f"/api/memory/{MEMORY_ID_1}", json=update_data, headers=auth_headers
         )
 
         assert response.status_code == 200
@@ -477,7 +499,7 @@ class TestMemoryUpdateEndpoint:
         assert isinstance(call_args, MemoryNote)
         assert call_args.content == "Updated content"
         assert call_args.keywords == ["updated"]
-        assert call_args.id == "memory_1"
+        assert call_args.id == MEMORY_ID_1
 
     def test_update_memory_not_found(self, client, mock_memory_store, auth_headers):
         """Test memory update for non-existent ID."""
@@ -488,7 +510,7 @@ class TestMemoryUpdateEndpoint:
         update_data = {"content": "Updated content"}
 
         response = client.put(
-            "/api/memory/non_existent", json=update_data, headers=auth_headers
+            f"/api/memory/{MISSING_MEMORY_ID}", json=update_data, headers=auth_headers
         )
 
         assert response.status_code == 404
@@ -507,7 +529,7 @@ class TestMemoryUpdateEndpoint:
         update_data = {"content": "Only content updated"}
 
         response = client.put(
-            "/api/memory/memory_1", json=update_data, headers=auth_headers
+            f"/api/memory/{MEMORY_ID_1}", json=update_data, headers=auth_headers
         )
 
         assert response.status_code == 200
@@ -528,7 +550,7 @@ class TestMemoryUpdateEndpoint:
         update_data = {"content": "Updated content"}
 
         response = client.put(
-            "/api/memory/test_id", json=update_data, headers=auth_headers
+            f"/api/memory/{OTHER_MEMORY_ID}", json=update_data, headers=auth_headers
         )
 
         assert response.status_code == 500
@@ -542,7 +564,7 @@ class TestMemoryDeleteEndpoint:
         """Test successful memory deletion."""
         mock_memory_store.delete.return_value = Mock(success=True)
 
-        response = client.delete("/api/memory/memory_1", headers=auth_headers)
+        response = client.delete(f"/api/memory/{MEMORY_ID_1}", headers=auth_headers)
 
         assert response.status_code == 200
         data = response.json()
@@ -550,7 +572,7 @@ class TestMemoryDeleteEndpoint:
         assert "Memory deleted successfully" in data["message"]
 
         # Verify delete was called with correct ID
-        mock_memory_store.delete.assert_called_once_with("memory_1")
+        mock_memory_store.delete.assert_called_once_with(MEMORY_ID_1)
 
     def test_delete_memory_not_found(self, client, mock_memory_store, auth_headers):
         """Test memory deletion for non-existent ID."""
@@ -558,7 +580,9 @@ class TestMemoryDeleteEndpoint:
             success=False, error="Memory not found"
         )
 
-        response = client.delete("/api/memory/non_existent", headers=auth_headers)
+        response = client.delete(
+            f"/api/memory/{MISSING_MEMORY_ID}", headers=auth_headers
+        )
 
         assert response.status_code == 404
         assert "not found" in response.json()["detail"].lower()
@@ -570,10 +594,251 @@ class TestMemoryDeleteEndpoint:
         # Setup mock to raise exception
         mock_memory_store.delete.side_effect = Exception("Database error")
 
-        response = client.delete("/api/memory/test_id", headers=auth_headers)
+        response = client.delete(f"/api/memory/{OTHER_MEMORY_ID}", headers=auth_headers)
 
         assert response.status_code == 500
         assert "Failed to delete memory" in response.json()["detail"]
+
+
+# Opaque IDs a store can hold: legacy admission keeps any unique non-empty
+# string ID and ``LanceDBMemoryStore.add`` keeps any non-empty supplied ID.
+OPAQUE_IDS = [
+    "legacy-note-1",
+    "memory_1",
+    "a'b",
+    "id with spaces",
+    "50%_off",
+    "back\\slash",
+    "a/b",
+    MEMORY_ID_1.upper(),
+    # A prefix ID and the same ID with a trailing newline must stay distinct.
+    "note",
+    "note\n",
+    "note\r\n",
+]
+# Values that used to rewrite the LanceDB predicate when interpolated raw.
+HOSTILE_IDS = [
+    "x' OR '1'='1",
+    "') OR (1=1",
+    "' OR true OR '",
+    "'",
+    "''",
+    "\\",
+    "\\' OR 1=1 --",
+    "%",
+    "_",
+    MEMORY_ID_1 + "' OR '1'='1",
+]
+
+
+def _memory_path(memory_id: str) -> str:
+    return "/api/memory/" + quote(memory_id, safe="")
+
+
+class TestOpaqueMemoryIds:
+    """By-ID routes pass the exact listed ID to the store, never a rewrite of it.
+
+    Safety comes from the store quoting the ID as one SQL literal (see
+    ``TestOpaqueMemoryIdsAgainstAdmittedLegacyStore`` and
+    ``tests/core/memory/test_memory_id_filter_injection.py``), not from
+    restricting the ID's shape at the API.
+    """
+
+    @pytest.mark.parametrize("memory_id", OPAQUE_IDS + HOSTILE_IDS)
+    def test_get_passes_the_exact_id(
+        self, client, mock_memory_store, auth_headers, memory_id
+    ):
+        mock_memory_store.get.return_value = Mock(
+            success=True, content=MemoryNote(id=memory_id, content="x")
+        )
+
+        response = client.get(_memory_path(memory_id), headers=auth_headers)
+
+        assert response.status_code == 200
+        assert response.json()["id"] == memory_id
+        mock_memory_store.get.assert_called_once_with(memory_id)
+
+    @pytest.mark.parametrize("memory_id", OPAQUE_IDS + HOSTILE_IDS)
+    def test_update_passes_the_exact_id(
+        self, client, mock_memory_store, auth_headers, memory_id
+    ):
+        mock_memory_store.get.return_value = Mock(
+            success=True, content=MemoryNote(id=memory_id, content="x")
+        )
+        mock_memory_store.update.return_value = Mock(success=True)
+
+        response = client.put(
+            _memory_path(memory_id), json={"content": "y"}, headers=auth_headers
+        )
+
+        assert response.status_code == 200
+        mock_memory_store.get.assert_called_once_with(memory_id)
+        assert mock_memory_store.update.call_args[0][0].id == memory_id
+
+    @pytest.mark.parametrize("memory_id", OPAQUE_IDS + HOSTILE_IDS)
+    def test_delete_passes_the_exact_id(
+        self, client, mock_memory_store, auth_headers, memory_id
+    ):
+        mock_memory_store.delete.return_value = Mock(success=True)
+
+        response = client.delete(_memory_path(memory_id), headers=auth_headers)
+
+        assert response.status_code == 200
+        mock_memory_store.delete.assert_called_once_with(memory_id)
+
+    @pytest.mark.parametrize("method", ["get", "put", "delete"])
+    def test_empty_id_never_reaches_a_by_id_route(
+        self, client, mock_memory_store, auth_headers, method
+    ):
+        # No store can hold an empty ID; ``/api/memory/`` stays the collection
+        # path (POST-only), so it never reaches the store as an empty ID.
+        kwargs = {"json": {"content": "y"}} if method == "put" else {}
+        response = getattr(client, method)(
+            "/api/memory/", headers=auth_headers, **kwargs
+        )
+
+        assert response.status_code == 405
+        mock_memory_store.get.assert_not_called()
+        mock_memory_store.update.assert_not_called()
+        mock_memory_store.delete.assert_not_called()
+
+
+class _FixedEmbedding(BaseEmbedding):
+    def encode(self, text: Any, dimension: Any = None, instruct: Any = None) -> Any:
+        if isinstance(text, str):
+            return [0.1] * 4
+        return [[0.1] * 4 for _ in text]
+
+    def get_dimension(self) -> int:
+        return 4
+
+    @property
+    def abilities(self) -> list[str]:
+        return ["embed"]
+
+
+class TestOpaqueMemoryIdsAgainstAdmittedLegacyStore:
+    """List -> GET/PUT/DELETE round trip on a real, legacy-admitted LanceDB table.
+
+    The table is seeded the way a pre-UUID deployment would have left it, with
+    opaque and hostile IDs, admitted through production legacy admission and
+    served through the production isolation wrapper. Every ID ``/list`` returns
+    must work at all three by-ID routes for its owner, and only for its owner.
+    """
+
+    IDENTITY = EmbeddingIdentity("openai", "test-embedding", None, 4, None)
+    VICTIM_ID = "victim-note"
+
+    @pytest.fixture
+    def store(self, tmp_path, test_db):
+        owner = int(test_db.id)
+        self.other_user = owner + 1000
+        owned = OPAQUE_IDS + HOSTILE_IDS
+        rows = [(memory_id, owner) for memory_id in owned]
+        rows.append((self.VICTIM_ID, self.other_user))
+        # The victim also owns notes whose IDs collide with hostile patterns'
+        # intended matches, so any widened predicate would hit them.
+        rows.append(("1", self.other_user))
+        rows.append(("victim%", self.other_user))
+
+        db_dir = str(tmp_path / "memory")
+        connection = lancedb.connect(db_dir)
+        table = connection.create_table(
+            "memories",
+            pa.table(
+                {
+                    "id": [memory_id for memory_id, _ in rows],
+                    "text": [f"note {memory_id}" for memory_id, _ in rows],
+                    "metadata": [
+                        json.dumps({"content": f"note {memory_id}", "user_id": user_id})
+                        for memory_id, user_id in rows
+                    ],
+                }
+            ),
+        )
+        _safe_close_table(table)
+
+        outcome = admit_lancedb_memory_storage(
+            DormantLanceDBMemoryHandle(connection, "memories"),
+            self.IDENTITY,
+            writers_quiesced=True,
+        )
+        assert outcome.state is StorageAdmissionState.ADMITTED
+        assert outcome.admitted is not None
+        base = LanceDBMemoryStore.open_admitted(
+            outcome.admitted,
+            self.IDENTITY,
+            db_dir=db_dir,
+            embedding_model=_FixedEmbedding(),
+        )
+        self.base = base
+        return UserIsolatedMemoryStore(base)
+
+    @pytest.fixture
+    def memory_router(self, store):
+        return MemoryManagementRouter(lambda: store)
+
+    def _other_users_notes(self) -> dict[str, str]:
+        with UserContext(self.other_user):
+            return {
+                note.id: str(note.content)
+                for note in self.base.list_all(
+                    {"metadata": {"user_id": self.other_user}}
+                )
+            }
+
+    def test_listed_ids_round_trip_through_get_put_delete(self, client, auth_headers):
+        victims_before = self._other_users_notes()
+        assert set(victims_before) == {self.VICTIM_ID, "1", "victim%"}
+
+        listed = client.get("/api/memory/list", headers=auth_headers)
+        assert listed.status_code == 200
+        listed_ids = [memory["id"] for memory in listed.json()["memories"]]
+        assert sorted(listed_ids) == sorted(OPAQUE_IDS + HOSTILE_IDS)
+
+        for memory_id in listed_ids:
+            path = _memory_path(memory_id)
+
+            got = client.get(path, headers=auth_headers)
+            assert got.status_code == 200, memory_id
+            assert got.json()["id"] == memory_id
+            assert got.json()["content"] == f"note {memory_id}"
+
+            put = client.put(
+                path, json={"content": f"edited {memory_id}"}, headers=auth_headers
+            )
+            assert put.status_code == 200, memory_id
+            assert client.get(path, headers=auth_headers).json()["content"] == (
+                f"edited {memory_id}"
+            )
+
+            deleted = client.delete(path, headers=auth_headers)
+            assert deleted.status_code == 200, memory_id
+            assert client.get(path, headers=auth_headers).status_code == 404
+
+            # Each step touched exactly that one note: the other user's notes
+            # are untouched after every hostile ID.
+            assert self._other_users_notes() == victims_before, memory_id
+
+        assert (
+            client.get("/api/memory/list", headers=auth_headers).json()["memories"]
+            == []
+        )
+
+    @pytest.mark.parametrize("victim_id", [VICTIM_ID, "1", "victim%"])
+    def test_another_users_listed_id_is_not_reachable(
+        self, client, auth_headers, victim_id
+    ):
+        victims_before = self._other_users_notes()
+        path = _memory_path(victim_id)
+
+        assert client.get(path, headers=auth_headers).status_code == 404
+        assert (
+            client.put(path, json={"content": "hijacked"}, headers=auth_headers)
+        ).status_code == 404
+        assert client.delete(path, headers=auth_headers).status_code == 404
+
+        assert self._other_users_notes() == victims_before
 
 
 class TestMemoryStatsEndpoint:
@@ -639,15 +904,15 @@ class TestMemoryApiIntegration:
         # Setup mock responses
         def mock_add_side_effect(note):
             # Return the memory with the provided content
-            return Mock(success=True, memory_id="test_memory_123")
+            return Mock(success=True, memory_id=CRD_MEMORY_ID)
 
         def mock_get_side_effect(memory_id):
-            if memory_id == "test_memory_123":
+            if memory_id == CRD_MEMORY_ID:
                 # Create a memory note with the test data
                 from xagent.core.memory.core import MemoryNote
 
                 test_memory = MemoryNote(
-                    id="test_memory_123",
+                    id=CRD_MEMORY_ID,
                     content="CRD test memory",
                     keywords=["test", "crd"],
                     tags=[],
@@ -828,7 +1093,7 @@ class TestMemoryApiUsage:
             MemoryResponse(success=True)
         )
         response = client.put(
-            "/api/memory/memory_1", json={"content": "new"}, headers=auth_headers
+            f"/api/memory/{MEMORY_ID_1}", json={"content": "new"}, headers=auth_headers
         )
 
         assert response.status_code == 200

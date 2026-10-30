@@ -10,7 +10,6 @@ from fastapi import (
     File,
     Form,
     HTTPException,
-    Query,
     Request,
     UploadFile,
     WebSocket,
@@ -44,6 +43,7 @@ from .public_chat_access import (
     create_public_chat_access_token,
     create_public_chat_task,
     public_chat_websocket_endpoint,
+    public_websocket_header_token,
     upload_public_chat_files,
     widget_entity_key,
 )
@@ -621,12 +621,11 @@ async def create_widget_task(
 async def websocket_widget_chat_endpoint(
     websocket: WebSocket,
     task_id: int,
-    token: str = Query(..., description="Authentication token"),
 ) -> None:
-    """WebSocket unified endpoint for widget."""
+    """Widget chat socket; the guest token rides the handshake headers."""
     await public_chat_websocket_endpoint(
         websocket=websocket,
         task_id=task_id,
-        token=token,
+        token=public_websocket_header_token(websocket),
         expected_auth_mode="widget",
     )

@@ -106,7 +106,7 @@ describe("widget chrome", () => {
     // corresponding control (a same-origin, same-source, correctly-enveloped
     // message the host would now just ignore) with no compiler error to
     // catch it.
-    const messageTypes: WidgetParentMessageType[] = ["widget_close", "widget_expand", "widget_collapse", "prompt_context_request", "initial_message_request", "initial_message_ack"]
+    const messageTypes: WidgetParentMessageType[] = ["widget_close", "widget_expand", "widget_collapse", "prompt_context_request", "initial_message_request", "initial_message_ack", "open_message_request", "open_message_ack"]
     for (const messageType of messageTypes) {
       expect(widgetScript).toContain(`data.type === '${messageType}'`)
     }

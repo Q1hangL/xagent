@@ -241,12 +241,32 @@ describe("FileAccessProvider", () => {
     })
   })
 
-  it("does not expose getStreamingUrl on the public policy", () => {
-    const policy = createPublicFileAccessPolicy("guest-token")
-    expect(policy.getStreamingUrl).toBeUndefined()
+  it("builds public file URLs that never carry the guest token", () => {
+    const policy = createPublicFileAccessPolicy("guest-secret-token")
+    const urls = [
+      policy.previewUrl("file/id"),
+      policy.downloadUrl("file/id"),
+      policy.inlinePreviewUrl("file/id"),
+      policy.inlineDownloadUrl("file/id"),
+      policy.relativePreviewUrl("file/id", "slides/one.png"),
+      policy.validationUrl?.("file/id") ?? "",
+    ]
+    for (const url of urls) {
+      expect(url).not.toContain("guest-secret-token")
+      expect(url).not.toMatch(/[?&]token=/)
+    }
+    expect(policy.downloadUrl("file/id")).toBe("/api/files/public/download/file%2Fid")
+    expect(policy.relativePreviewUrl("file/id", "slides/one.png")).toBe(
+      "/api/files/public/preview/file%2Fid?relative_path=slides%2Fone.png",
+    )
+    expect(policy.validationUrl?.("file/id")).toBe(
+      "/api/files/public/preview/file%2Fid?validation_only=true",
+    )
+    // Media elements cannot send the header: they must not load previewUrl directly.
+    expect(policy.requiresBlobFetch).toBe(true)
   })
 
-  it("keeps public file URLs and requests scoped to each provider", async () => {
+  it("sends each provider's guest token only as an Authorization header", async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response())
     vi.stubGlobal("fetch", fetchMock)
 
@@ -261,65 +281,24 @@ describe("FileAccessProvider", () => {
       </>,
     )
 
-    expect(screen.getByTestId("first")).toHaveTextContent("token=first-token")
-    expect(screen.getByTestId("first")).not.toHaveTextContent("second-token")
-    expect(screen.getByTestId("second")).toHaveTextContent("token=second-token")
-    expect(screen.getByTestId("second")).not.toHaveTextContent("first-token")
-    const firstPolicy = createPublicFileAccessPolicy("first-token")
-    expect(firstPolicy.downloadUrl("file/id")).toContain(
-      "/api/files/public/download/file%2Fid?token=first-token",
-    )
-    expect(firstPolicy.relativePreviewUrl("file/id", "slides/one.png")).toContain(
-      "token=first-token&relative_path=slides%2Fone.png",
-    )
+    expect(screen.getByTestId("first")).not.toHaveTextContent("token")
+    expect(screen.getByTestId("second")).not.toHaveTextContent("token")
 
     screen.getByTestId("first").click()
     screen.getByTestId("second").click()
 
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      1,
-      expect.stringContaining("token=first-token"),
-      expect.objectContaining({ credentials: "same-origin" }),
-    )
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      2,
-      expect.stringContaining("token=second-token"),
-      expect.objectContaining({ credentials: "same-origin" }),
-    )
-  })
-
-  it("keeps a surviving provider isolated when a neighboring provider unmounts", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response())
-    vi.stubGlobal("fetch", fetchMock)
-    const secondPolicy = createPublicFileAccessPolicy("surviving-token")
-    const renderProviders = (showFirst: boolean) => (
-      <>
-        {showFirst ? (
-          <FileAccessProvider policy={createPublicFileAccessPolicy("removed-token")}>
-            <FileAccessProbe id="removed" />
-          </FileAccessProvider>
-        ) : null}
-        <FileAccessProvider policy={secondPolicy}>
-          <FileAccessProbe id="surviving" />
-        </FileAccessProvider>
-      </>
-    )
-
-    const { rerender } = render(renderProviders(true))
-    rerender(renderProviders(false))
-
-    expect(screen.queryByTestId("removed")).toBeNull()
-    expect(screen.getByTestId("surviving")).toHaveTextContent("surviving-token")
-    screen.getByTestId("surviving").click()
-
-    expect(fetchMock).toHaveBeenCalledWith(
-      expect.stringContaining("token=surviving-token"),
-      expect.objectContaining({ credentials: "same-origin" }),
-    )
+    const calls = fetchMock.mock.calls as Array<[string, RequestInit]>
+    expect(calls.map(([url]) => url)).toEqual([
+      "/api/files/public/preview/file-id",
+      "/api/files/public/preview/file-id",
+    ])
+    expect(new Headers(calls[0][1].headers).get("Authorization")).toBe("Bearer first-token")
+    expect(new Headers(calls[1][1].headers).get("Authorization")).toBe("Bearer second-token")
+    expect(calls.every(([, options]) => options.credentials === "same-origin")).toBe(true)
     expect(sessionStorage.getItem("xagent_public_access_token")).toBeNull()
   })
 
-  it("allows same-origin routing cookies but strips ambient Authorization", async () => {
+  it("replaces ambient Authorization and never sends the guest token elsewhere", async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response())
     vi.stubGlobal("fetch", fetchMock)
     const policy = createPublicFileAccessPolicy("guest-token")
@@ -328,10 +307,220 @@ describe("FileAccessProvider", () => {
       headers: { Authorization: "Bearer ambient-user-token", "X-Trace": "request" },
       credentials: "include",
     })
+    await policy.request("https://elsewhere.example/api/files/public/preview/file-id", {
+      headers: { Authorization: "Bearer ambient-user-token" },
+    })
+    await policy.request("/api/files/preview/file-id")
 
-    const [, options] = fetchMock.mock.calls[0] as [string, RequestInit]
-    expect(options.credentials).toBe("same-origin")
-    expect(new Headers(options.headers).get("Authorization")).toBeNull()
-    expect(new Headers(options.headers).get("X-Trace")).toBe("request")
+    const calls = fetchMock.mock.calls as Array<[string, RequestInit]>
+    expect(calls[0][1].credentials).toBe("same-origin")
+    expect(new Headers(calls[0][1].headers).get("Authorization")).toBe("Bearer guest-token")
+    expect(new Headers(calls[0][1].headers).get("X-Trace")).toBe("request")
+    expect(new Headers(calls[1][1].headers).get("Authorization")).toBeNull()
+    expect(new Headers(calls[2][1].headers).get("Authorization")).toBeNull()
+  })
+
+  it("mints a file-bound ticket over the header for URLs the browser loads itself", async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => new Response(
+      JSON.stringify({ ticket: "ticket.abc-123", expires_in: 600 }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    ))
+    vi.stubGlobal("fetch", fetchMock)
+    const policy = createPublicFileAccessPolicy("guest-token")
+
+    const streamingUrl = await policy.getStreamingUrl?.("file/id")
+    const assetUrl = await policy.authorizeBrowserUrl?.(
+      policy.relativePreviewUrl("file/id", "img/a.png"),
+    )
+
+    expect(streamingUrl).toBe("/api/files/public/preview/file%2Fid?ticket=ticket.abc-123")
+    expect(assetUrl).toBe(
+      "/api/files/public/preview/file%2Fid?relative_path=img%2Fa.png&ticket=ticket.abc-123",
+    )
+    expect(streamingUrl).not.toContain("guest-token")
+    // One mint per file while the ticket is fresh.
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [mintUrl, mintOptions] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(mintUrl).toBe("/api/files/public/tickets/file%2Fid")
+    expect(mintOptions.method).toBe("POST")
+    expect(new Headers(mintOptions.headers).get("Authorization")).toBe("Bearer guest-token")
+  })
+
+  it("refuses to sign foreign URLs or accept a malformed ticket response", async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => new Response(
+      JSON.stringify({ ticket: "bad ticket", expires_in: 600 }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    ))
+    vi.stubGlobal("fetch", fetchMock)
+    const policy = createPublicFileAccessPolicy("guest-token")
+
+    await expect(policy.authorizeBrowserUrl?.("https://elsewhere.example/x.png"))
+      .rejects.toThrow("Not a public file URL")
+    await expect(policy.authorizeBrowserUrl?.("/api/files/preview/file-id"))
+      .rejects.toThrow("Not a public file URL")
+    expect(fetchMock).not.toHaveBeenCalled()
+    await expect(policy.getStreamingUrl?.("file-id"))
+      .rejects.toThrow("File ticket response has an unexpected shape")
+  })
+  const ticketResponse = (ticket: string, expiresIn: number) => new Response(
+    JSON.stringify({ ticket, expires_in: expiresIn }),
+    { status: 200, headers: { "Content-Type": "application/json" } },
+  )
+
+  it("mints once for a short server TTL instead of looping on a fresh ticket", async () => {
+    vi.useFakeTimers()
+    try {
+      let minted = 0
+      const fetchMock = vi.fn().mockImplementation(async () => ticketResponse(`t${++minted}`, 10))
+      vi.stubGlobal("fetch", fetchMock)
+      const policy = createPublicFileAccessPolicy("guest-token")
+
+      // TTL (10s) is below the 30s refresh margin: the fresh ticket is used.
+      await expect(policy.getStreamingUrl?.("file-id")).resolves.toContain("ticket=t1")
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      // Still reused within the clamped margin (half the lifetime).
+      vi.advanceTimersByTime(4_000)
+      await expect(policy.getStreamingUrl?.("file-id")).resolves.toContain("ticket=t1")
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      // Refreshed once past it -- exactly one more mint.
+      vi.advanceTimersByTime(2_000)
+      await expect(policy.getStreamingUrl?.("file-id")).resolves.toContain("ticket=t2")
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("refreshes a ticket 30s before a normal expiry and shares concurrent mints", async () => {
+    vi.useFakeTimers()
+    try {
+      let minted = 0
+      const fetchMock = vi.fn().mockImplementation(async () => ticketResponse(`t${++minted}`, 600))
+      vi.stubGlobal("fetch", fetchMock)
+      const policy = createPublicFileAccessPolicy("guest-token")
+
+      const burst = await Promise.all([
+        policy.getStreamingUrl?.("file-id"),
+        policy.getStreamingUrl?.("file-id"),
+      ])
+      expect(burst.every((url) => url?.includes("ticket=t1"))).toBe(true)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+
+      vi.advanceTimersByTime(569_000)
+      await expect(policy.getStreamingUrl?.("file-id")).resolves.toContain("ticket=t1")
+      vi.advanceTimersByTime(2_000)
+      await expect(policy.getStreamingUrl?.("file-id")).resolves.toContain("ticket=t2")
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("prunes stale settled tickets for other files but keeps pending mints", async () => {
+    vi.useFakeTimers()
+    const mapDelete = vi.spyOn(Map.prototype, "delete")
+    try {
+      let releasePending: ((response: Response) => void) | undefined
+      const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+        if (url.endsWith("/tickets/file-a")) return ticketResponse("ta", 10)
+        if (url.endsWith("/tickets/file-b")) return ticketResponse("tb", 600)
+        return new Promise<Response>((resolve) => { releasePending = resolve })
+      })
+      vi.stubGlobal("fetch", fetchMock)
+      const policy = createPublicFileAccessPolicy("guest-token")
+
+      await expect(policy.getStreamingUrl?.("file-a")).resolves.toContain("ticket=ta")
+      const pending = policy.getStreamingUrl?.("file-pending")
+      // Past file-a's reuse window (half its 10s lifetime), inside the mint timeout.
+      vi.advanceTimersByTime(6_000)
+
+      await expect(policy.getStreamingUrl?.("file-b")).resolves.toContain("ticket=tb")
+      const deleted = mapDelete.mock.calls.map(([key]) => key)
+      expect(deleted).toContain("file-a")
+      expect(deleted).not.toContain("file-pending")
+      expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/tickets/file-b")))
+        .toHaveLength(1)
+
+      // The in-flight mint is still shared rather than restarted.
+      const joined = policy.getStreamingUrl?.("file-pending")
+      releasePending?.(ticketResponse("tp", 600))
+      await expect(pending).resolves.toContain("ticket=tp")
+      await expect(joined).resolves.toContain("ticket=tp")
+      expect(fetchMock).toHaveBeenCalledTimes(3)
+    } finally {
+      mapDelete.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it("evicts a failed ticket mint so the next load retries", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response("nope", { status: 503 }))
+      .mockResolvedValueOnce(ticketResponse("fresh", 600))
+    vi.stubGlobal("fetch", fetchMock)
+    const policy = createPublicFileAccessPolicy("guest-token")
+
+    await expect(policy.getStreamingUrl?.("file-id"))
+      .rejects.toThrow("Failed to mint file ticket: 503")
+    await expect(policy.getStreamingUrl?.("file-id")).resolves.toContain("ticket=fresh")
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it("aborts a hung ticket mint after the timeout and evicts it", async () => {
+    vi.useFakeTimers()
+    try {
+      const fetchMock = vi.fn()
+        .mockImplementationOnce((_url: string, options: RequestInit) => new Promise((_, reject) => {
+          options.signal?.addEventListener("abort", () => reject(new Error("aborted")))
+        }))
+        .mockImplementationOnce(async () => ticketResponse("after-timeout", 600))
+      vi.stubGlobal("fetch", fetchMock)
+      const policy = createPublicFileAccessPolicy("guest-token")
+
+      const hung = policy.getStreamingUrl?.("file-id")
+      const settled = expect(hung).rejects.toThrow("File ticket mint timed out")
+      await vi.advanceTimersByTimeAsync(10_000)
+      await settled
+      await expect(policy.getStreamingUrl?.("file-id")).resolves.toContain("ticket=after-timeout")
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("keeps the mint deadline through a response body that stalls after headers", async () => {
+    vi.useFakeTimers()
+    try {
+      let bodySignal: AbortSignal | undefined
+      const stalledBody = {
+        ok: true,
+        status: 200,
+        // Headers arrived; the body never finishes (and ignores the abort).
+        json: () => new Promise(() => {}),
+      } as unknown as Response
+      const fetchMock = vi.fn()
+        .mockImplementationOnce(async (_url: string, options: RequestInit) => {
+          bodySignal = options.signal ?? undefined
+          return stalledBody
+        })
+        .mockImplementationOnce(async () => ticketResponse("after-stall", 600))
+      vi.stubGlobal("fetch", fetchMock)
+      const policy = createPublicFileAccessPolicy("guest-token")
+
+      const stalled = policy.authorizeBrowserUrl?.(policy.inlinePreviewUrl("file-id"))
+      const settled = expect(stalled).rejects.toThrow("File ticket mint timed out")
+      await vi.advanceTimersByTimeAsync(9_999)
+      expect(bodySignal?.aborted).toBe(false)
+      await vi.advanceTimersByTimeAsync(1)
+      await settled
+      // The real fetch's body read is cancelled too.
+      expect(bodySignal?.aborted).toBe(true)
+      // Evicted: the next load mints afresh instead of waiting on the stall.
+      await expect(policy.authorizeBrowserUrl?.(policy.inlinePreviewUrl("file-id")))
+        .resolves.toContain("ticket=after-stall")
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

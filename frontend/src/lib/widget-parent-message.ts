@@ -16,6 +16,8 @@ export type WidgetParentMessageType =
   | "prompt_context_request"
   | "initial_message_request"
   | "initial_message_ack"
+  | "open_message_request"
+  | "open_message_ack"
 
 // Must stay in step with MAX_INITIAL_MESSAGE_LENGTH in public/widget.js.
 export const MAX_INITIAL_MESSAGE_LENGTH = 2000
@@ -110,5 +112,41 @@ export function requestInitialMessage(
   }
   window.addEventListener("message", handleMessage)
   postToParentWidget("initial_message_request")
+  return () => window.removeEventListener("message", handleMessage)
+}
+
+// Bounds the id this iframe echoes back in an ack; widget.js's own ids are a
+// short decimal counter.
+const MAX_OPEN_MESSAGE_ID_LENGTH = 64
+
+// The id is the counter widget.js generated for its own message, so this
+// stays within the no-sensitive-payload rule above.
+function postOpenMessageAck(id: string): void {
+  const type: WidgetParentMessageType = "open_message_ack"
+  window.parent.postMessage({ xagent: true, v: 1, type, id }, "*")
+}
+
+// Posts open_message_request, then listens for every message the host page
+// sends through XagentWidget.open(), for as long as the caller keeps it.
+// widget.js re-sends its pending message after each request until the ack for
+// that id arrives, so one id can reach onMessage more than once; deduplication
+// belongs to the caller. Values follow the data-initial-message rules.
+export function listenForOpenMessages(
+  onMessage: (message: string, id: string) => void,
+): () => void {
+  if (window.parent === window) return () => undefined
+  const handleMessage = (event: MessageEvent) => {
+    const data = hostMessageOfType(event, "open_message")
+    if (!data) return
+    const { id, value } = data
+    if (typeof id !== "string" || !id || id.length > MAX_OPEN_MESSAGE_ID_LENGTH) return
+    if (typeof value !== "string") return
+    const message = value.trim()
+    if (!message || message.length > MAX_INITIAL_MESSAGE_LENGTH) return
+    postOpenMessageAck(id)
+    onMessage(message, id)
+  }
+  window.addEventListener("message", handleMessage)
+  postToParentWidget("open_message_request")
   return () => window.removeEventListener("message", handleMessage)
 }

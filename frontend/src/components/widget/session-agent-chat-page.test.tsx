@@ -47,6 +47,7 @@ const app = vi.hoisted(() => ({
   isConversationResetPending: false,
   isMessageDeliveryPending: false,
   sessionConversationState: "unbound",
+  sessionConversationAttachment: "pending" as "pending" | "attached" | "unsupported",
   isSessionInteractionLocked: false,
 }))
 
@@ -85,6 +86,7 @@ vi.mock("@/contexts/app-context-chat", () => ({
     isConversationResetPending: app.isConversationResetPending,
     isMessageDeliveryPending: app.isMessageDeliveryPending,
     sessionConversationState: app.sessionConversationState,
+    sessionConversationAttachment: app.sessionConversationAttachment,
     isSessionInteractionLocked: app.isSessionInteractionLocked,
   }),
 }))
@@ -186,6 +188,7 @@ describe("SessionAgentChatPage", () => {
     app.isConversationResetPending = false
     app.isMessageDeliveryPending = false
     app.sessionConversationState = "unbound"
+    app.sessionConversationAttachment = "pending"
     app.isSessionInteractionLocked = false
     localStorage.clear()
     sessionStorage.clear()
@@ -253,6 +256,7 @@ describe("SessionAgentChatPage", () => {
         "xagent-session-v1",
         `xagent-session-token.${SESSION_TOKEN}`,
         "xagent-session-liveness-v1",
+        "xagent-session-attach-v1",
       ],
       expectedProtocol: "xagent-session-v1",
       chatTaskIdMode: "omit",
@@ -981,5 +985,71 @@ describe("SessionAgentChatPage", () => {
 
       expect(await screen.findByText("widgetSession.startMessageFailed")).toBeInTheDocument()
     })
+  })
+
+  describe("open message from the host page", () => {
+    function deliverOpenMessage(value: string, id = "1") {
+      act(() => {
+        window.dispatchEvent(new MessageEvent("message", {
+          data: { xagent: true, v: 1, type: "open_message", id, value },
+          source: window.parent as unknown as MessageEventSource,
+        }))
+      })
+    }
+
+    const openRequests = (post: ReturnType<typeof vi.fn>) => (
+      post.mock.calls.filter(([data]) => data.type === "open_message_request")
+    )
+
+    const mountBound = async () => {
+      const post = vi.fn()
+      vi.stubGlobal("parent", { postMessage: post })
+      setBridge("active", activeSession())
+      app.isConnected = true
+      app.state.taskId = 61
+      app.sessionConversationState = "bound"
+      const view = render(<SessionAgentChatPage />)
+      await waitFor(() => expect(openRequests(post)).toHaveLength(1))
+      return view
+    }
+
+    it.each([
+      ["attached", 1],
+      ["pending", 0],
+    ] as const)("wires the open message driver (attachment %s)", async (attachment, resets) => {
+      app.sessionConversationAttachment = attachment
+      // Held open: this mock's phase never moves on from bound, so a settled
+      // reset would only start another one.
+      app.startNewConversation.mockReturnValue(new Promise(() => {}))
+      await mountBound()
+
+      deliverOpenMessage("Book a shift")
+
+      await waitFor(() => expect(app.startNewConversation).toHaveBeenCalledTimes(resets))
+      expect(app.sendMessage).not.toHaveBeenCalled()
+    })
+
+    it.each([
+      ["the conversation stays bound", false, ["widgetSession.resetFailed"]],
+      ["the session then needs a reload", true, ["widgetSession.reloadRequired"]],
+    ] as const)(
+      "shows the reset failure line when an open message cannot start a new conversation: %s",
+      async (_name, reloadRequired, alerts) => {
+        vi.spyOn(console, "warn").mockImplementation(() => {})
+        app.sessionConversationAttachment = "attached"
+        app.startNewConversation.mockRejectedValueOnce(new Error("reset refused"))
+        const { rerender } = await mountBound()
+
+        deliverOpenMessage("Book a shift")
+        await waitFor(() => expect(screen.queryAllByRole("alert")).not.toHaveLength(0))
+        if (reloadRequired) {
+          app.sessionConversationState = "reload_required"
+          app.isSessionInteractionLocked = true
+          rerender(<SessionAgentChatPage />)
+        }
+
+        expect(screen.getAllByRole("alert").map((alert) => alert.textContent)).toEqual(alerts)
+      },
+    )
   })
 })

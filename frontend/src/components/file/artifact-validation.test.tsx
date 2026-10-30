@@ -67,14 +67,14 @@ describe('ArtifactValidation', () => {
     expect(screen.queryByRole('status')).toBeNull()
   })
 
-  it('uses the public scoped token and strips ambient authorization', async () => {
+  it('sends the public guest token as a header, never in the validation URL', async () => {
     const fetchMock = vi.fn().mockResolvedValue(report('valid'))
     vi.stubGlobal('fetch', fetchMock)
     const policy = createPublicFileAccessPolicy('guest-token')
     render(<I18nProvider><FileAccessProvider policy={policy}><ArtifactValidation fileId="one">file</ArtifactValidation></FileAccessProvider></I18nProvider>)
     await screen.findByText('Format readable · content not verified')
-    expect(fetchMock.mock.calls[0][0]).toContain('token=guest-token&validation_only=true')
-    expect(fetchMock.mock.calls[0][1].headers.has('Authorization')).toBe(false)
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/files/public/preview/one?validation_only=true')
+    expect(fetchMock.mock.calls[0][1].headers.get('Authorization')).toBe('Bearer guest-token')
   })
 
   it('hides unsupported-format controls using the server capability, retaining the file', async () => {

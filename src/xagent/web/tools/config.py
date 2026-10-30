@@ -36,7 +36,7 @@ from weakref import WeakValueDictionary
 import httpx
 from sqlalchemy import text
 
-from ...config import get_uploads_dir
+from ...config import get_google_shared_oauth_grants_enabled, get_uploads_dir
 from ...core.agent.result import (
     ClassifiedToolFailure,
     is_oauth_token_required_code,
@@ -646,13 +646,13 @@ def _oauth_launch_config_env_mapping(
 def _actor_oauth_refresh_lock(
     user_id: int,
     resource_owner_key: str,
-    app_id: str,
+    credential_key: str,
 ) -> asyncio.Lock:
     key = (
         id(asyncio.get_running_loop()),
         user_id,
         resource_owner_key,
-        app_id,
+        credential_key,
     )
     lock = _ACTOR_OAUTH_REFRESH_LOCKS.get(key)
     if lock is None:
@@ -776,6 +776,10 @@ async def _request_oauth_refresh_with_retries(
 # meta_invalid_token_error_code) are Meta-specific and unambiguous, unlike
 # RFC 6749's own invalid_grant string, so they're listed here too rather
 # than trusted for every provider.
+# Google's dead-token signal additionally requires an exact response
+# description and HTTP 400, so it is handled by
+# oauth_provider_quirks.is_google_revoked_refresh_error instead of this
+# code-only table.
 _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES: dict[str, frozenset[str]] = {
     # GitHub's classic OAuth Apps token endpoint reports a dead
     # refresh_token via a 200 response with this code, not a 4xx.
@@ -809,8 +813,8 @@ class _OAuthRefreshPermanentlyInvalid(Exception):
     """
 
 
-def _oauth_refresh_error_code(
-    response: httpx.Response, provider_name: str
+def _oauth_refresh_error_code_from_payload(
+    data: Mapping[str, Any], provider_name: str
 ) -> str | None:
     """Best-effort OAuth ``error`` code from a failed refresh response body.
 
@@ -821,6 +825,19 @@ def _oauth_refresh_error_code(
     carry the same type/code-shaped keys isn't misread as Meta's.
     """
     from ..oauth_provider_quirks import meta_invalid_token_error_code
+
+    error = data.get("error")
+    if isinstance(error, str) and error:
+        return error
+    if provider_name.lower() == "meta":
+        return meta_invalid_token_error_code(error)
+    return None
+
+
+def _oauth_refresh_error_payload(
+    response: httpx.Response,
+) -> Mapping[str, Any] | None:
+    """Best-effort structured OAuth error body from one refresh response."""
 
     try:
         data = response.json()
@@ -833,18 +850,16 @@ def _oauth_refresh_error_code(
         # let an exotic exception escape uncaught to the caller's generic
         # handler and lose the status-code-bearing log line above it.
         return None
-    if not data or not isinstance(data, Mapping):
-        return None
-    error = data.get("error")
-    if isinstance(error, str) and error:
-        return error
-    if provider_name.lower() == "meta":
-        return meta_invalid_token_error_code(error)
-    return None
+    return data if data and isinstance(data, Mapping) else None
 
 
 def _is_permanent_oauth_refresh_error(
-    provider_name: str, status_code: int, error_code: str | None
+    provider_name: str,
+    status_code: int,
+    error_code: str | None,
+    *,
+    error_description: object = None,
+    error_subtype: object = None,
 ) -> bool:
     """Whether the provider's error body unambiguously says the refresh
     token itself is dead. Any other failure (an unrecognized error code, a
@@ -868,6 +883,14 @@ def _is_permanent_oauth_refresh_error(
     """
     if status_code >= 500:
         return False
+    if provider_name.lower() == "google" and status_code == 400:
+        from ..oauth_provider_quirks import is_google_revoked_refresh_error
+
+        return is_google_revoked_refresh_error(
+            error_code=error_code,
+            error_description=error_description,
+            error_subtype=error_subtype,
+        )
     return error_code in _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES.get(
         provider_name.lower(), frozenset()
     )
@@ -888,16 +911,29 @@ def _log_and_classify_failed_refresh(
     # token-endpoint text rather than a second, independently-tunable copy.
     from ..api.auth import _OAUTH_ERROR_MESSAGE_LIMIT
 
-    error_code = _oauth_refresh_error_code(response, provider_name)
+    payload = _oauth_refresh_error_payload(response)
+    error_code = (
+        _oauth_refresh_error_code_from_payload(payload, provider_name)
+        if payload
+        else None
+    )
+    error_description = payload.get("error_description") if payload else None
+    error_subtype = payload.get("error_subtype") if payload else None
+    classified_permanent = _is_permanent_oauth_refresh_error(
+        provider_name,
+        response.status_code,
+        error_code,
+        error_description=error_description,
+        error_subtype=error_subtype,
+    )
     logger.error(
-        "Failed to refresh %s token (status %s, error=%s)",
+        "Failed to refresh %s token (status %s, error=%s, classified_permanent=%s)",
         provider_name,
         response.status_code,
         (error_code or "unknown")[:_OAUTH_ERROR_MESSAGE_LIMIT],
+        classified_permanent,
     )
-    if _is_permanent_oauth_refresh_error(
-        provider_name, response.status_code, error_code
-    ):
+    if classified_permanent:
         raise _OAuthRefreshPermanentlyInvalid()
 
 
@@ -2006,7 +2042,7 @@ class WebToolConfig(BaseToolConfig):
 
     def _build_mcp_task_output_dir(self) -> str:
         """Single write-target root for connectors that create new files in
-        the task workspace (currently Google Drive, OneDrive, and SharePoint
+        the task workspace (currently Google Drive, Google Slides, OneDrive, and SharePoint
         download tools).
 
         Deliberately distinct from _mcp_file_allowed_dir_paths() above:
@@ -3938,8 +3974,8 @@ class WebToolConfig(BaseToolConfig):
                 env["XAGENT_SHAREPOINT_FILE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_JIRA_FILE_ALLOWED_DIRS"] = allowed_file_dirs
-            # Distinct from the read allowlists above: Google Drive, OneDrive,
-            # and SharePoint download tools write NEW files into the task workspace, so they
+            # Distinct from the read allowlists above: Google Drive, Google Slides,
+            # OneDrive, and SharePoint downloads write new files into the task workspace, so they
             # get their own single-value, task-dir-only vars rather than
             # reusing the read-allowlist shape (see
             # _build_mcp_task_output_dir's docstring for why that would be
@@ -4114,6 +4150,7 @@ class WebToolConfig(BaseToolConfig):
                     mark_gmail_oauth_reconnect_required(
                         oauth_db,
                         oauth_account=oauth_account,
+                        expected_refresh_token=attempted_refresh_token,
                     )
                 else:
                     oauth_account.access_token = ""
@@ -4135,12 +4172,120 @@ class WebToolConfig(BaseToolConfig):
             credential_present=True,
         )
 
+    def _resolve_shared_google_oauth_account(
+        self,
+        oauth_db: Any,
+        *,
+        provider_name: object,
+        app_id: object,
+        app_info: Mapping[str, Any] | None,
+        user_id: int,
+        resource_owner_key: str | None,
+        lock: bool | None = None,
+    ) -> Any | None:
+        """Resolve one explicitly-associated shared grant, or fall back safely."""
+        if (
+            not get_google_shared_oauth_grants_enabled()
+            or str(provider_name).lower() != "google"
+            or not isinstance(app_id, str)
+            or not app_id.strip()
+        ):
+            return None
+
+        from ..api.auth import _resolve_oauth_client_per_field
+        from ..models.oauth_provider import OAuthProvider
+        from ..services.google_oauth_grants import (
+            resolve_google_shared_oauth_account,
+        )
+
+        provider_config = (
+            oauth_db.query(OAuthProvider)
+            .filter(OAuthProvider.provider_name == "google")
+            .one_or_none()
+        )
+        if provider_config is None:
+            return None
+        client_id, _client_secret = _resolve_oauth_client_per_field(
+            "google", provider_config
+        )
+        if not client_id:
+            return None
+
+        required_scopes: list[str] = []
+        for candidate in (
+            provider_config.default_scopes or [],
+            (app_info or {}).get("oauth_scopes") or [],
+        ):
+            if isinstance(candidate, str):
+                required_scopes.append(candidate)
+            elif isinstance(candidate, (list, tuple, set)):
+                if any(not isinstance(scope, str) for scope in candidate):
+                    return None
+                required_scopes.extend(candidate)
+            elif candidate:
+                # A malformed catalog/provider row must not broaden a shared
+                # credential's authority. The legacy resolver remains the
+                # compatibility fallback for this request.
+                return None
+
+        account = resolve_google_shared_oauth_account(
+            oauth_db,
+            user_id=user_id,
+            resource_owner_key=resource_owner_key,
+            oauth_client_id=client_id,
+            app_id=app_id,
+            required_scopes=required_scopes,
+            # Ordinary refreshes retain their re-read-and-compare concurrency
+            # semantics. Holding a database row lock across an async provider
+            # request can deadlock the event loop. Actor refreshes run on a
+            # worker thread behind an in-process credential lock.
+            lock=resource_owner_key is not None if lock is None else lock,
+        )
+        logger.info(
+            "OAUTH CONFIG: Checked shared Google grant for app %s user %s owner %s. Found: %s",
+            app_id,
+            user_id,
+            "actor" if resource_owner_key is not None else "ordinary",
+            account is not None,
+        )
+        return account
+
+    def _resolve_actor_oauth_lock_key_in_worker(
+        self,
+        *,
+        session_factory: Callable[[], Any],
+        provider_name: object,
+        app_id: str,
+        app_info: Mapping[str, Any] | None,
+        resource_owner_key: str,
+        user_id: int,
+    ) -> str:
+        """Choose one process lock shared by every app using the same grant."""
+        oauth_db = session_factory()
+        try:
+            shared_account = self._resolve_shared_google_oauth_account(
+                oauth_db,
+                provider_name=provider_name,
+                app_id=app_id,
+                app_info=app_info,
+                user_id=user_id,
+                resource_owner_key=resource_owner_key,
+                lock=False,
+            )
+            if shared_account is not None:
+                return f"shared-google:{int(shared_account.id)}"
+            return f"legacy-app:{app_id}"
+        finally:
+            oauth_db.rollback()
+            oauth_db.close()
+
     async def _resolve_actor_oauth_access_token_in_worker(
         self,
         *,
         session_factory: Callable[[], Any],
         provider_name: object,
         app_id: str,
+        app_info: Mapping[str, Any] | None,
         resource_owner_key: str,
         user_id: int,
     ) -> _LegacyOAuthTokenResolution:
@@ -4149,6 +4294,22 @@ class WebToolConfig(BaseToolConfig):
 
         oauth_db = session_factory()
         try:
+            shared_account = self._resolve_shared_google_oauth_account(
+                oauth_db,
+                provider_name=provider_name,
+                app_id=app_id,
+                app_info=app_info,
+                user_id=user_id,
+                resource_owner_key=resource_owner_key,
+            )
+            if shared_account is not None:
+                return await self._finish_legacy_oauth_access_token_resolution(
+                    oauth_db=oauth_db,
+                    oauth_account=shared_account,
+                    provider_name=provider_name,
+                    user_id=user_id,
+                    resource_owner_key=resource_owner_key,
+                )
             # Lock the current namespace, not a stale row id. Actor callbacks
             # replace credentials with delete-and-insert, so the primary key
             # can change while this resolver waits.
@@ -4204,28 +4365,39 @@ class WebToolConfig(BaseToolConfig):
         *,
         provider_name: object,
         app_id: str,
+        app_info: Mapping[str, Any] | None,
         resource_owner_key: str,
         user_id: int,
     ) -> _LegacyOAuthTokenResolution:
         from ..services.db_runtime import run_db_io_cancellation_safe
 
-        # Same-process waiters must not open a Session or reserve a pooled
-        # connection. The stable namespace also survives callback replacement
-        # of the credential row.
+        session_factory = self._legacy_oauth_session_factory()
+        credential_key = await run_db_io_cancellation_safe(
+            lambda: self._resolve_actor_oauth_lock_key_in_worker(
+                session_factory=session_factory,
+                provider_name=provider_name,
+                app_id=app_id,
+                app_info=app_info,
+                resource_owner_key=resource_owner_key,
+                user_id=user_id,
+            )
+        )
+        # Same-process waiters must not reserve a pooled connection while
+        # waiting. Apps associated with one shared credential use one lock.
         actor_refresh_lock = _actor_oauth_refresh_lock(
             user_id,
             resource_owner_key,
-            app_id,
+            credential_key,
         )
         await actor_refresh_lock.acquire()
         try:
-            session_factory = self._legacy_oauth_session_factory()
             return await run_db_io_cancellation_safe(
                 lambda: asyncio.run(
                     self._resolve_actor_oauth_access_token_in_worker(
                         session_factory=session_factory,
                         provider_name=provider_name,
                         app_id=app_id,
+                        app_info=app_info,
                         resource_owner_key=resource_owner_key,
                         user_id=user_id,
                     )
@@ -4258,12 +4430,29 @@ class WebToolConfig(BaseToolConfig):
             return await self._resolve_actor_oauth_access_token(
                 provider_name=provider_name,
                 app_id=app_id,
+                app_info=app_info,
                 resource_owner_key=resource_owner_key,
                 user_id=user_id,
             )
 
         oauth_db = self._new_legacy_oauth_session()
         try:
+            shared_account = self._resolve_shared_google_oauth_account(
+                oauth_db,
+                provider_name=provider_name,
+                app_id=app_id,
+                app_info=app_info,
+                user_id=user_id,
+                resource_owner_key=None,
+            )
+            if shared_account is not None:
+                return await self._finish_legacy_oauth_access_token_resolution(
+                    oauth_db=oauth_db,
+                    oauth_account=shared_account,
+                    provider_name=provider_name,
+                    user_id=user_id,
+                    resource_owner_key=None,
+                )
             if app_id:
                 # A bare provider-level grant (e.g. UserOAuth.provider ==
                 # "meta") never requested this app's own oauth_scopes, so it
@@ -4274,22 +4463,30 @@ class WebToolConfig(BaseToolConfig):
                 providers_to_check = restrict_to_app_scoped_oauth_grant(
                     policy_app, provider_candidates
                 )
-                oauth_account = (
-                    scoped_user_oauth_query(
-                        oauth_db,
-                        user_id=user_id,
-                        resource_owner_key=None,
+                oauth_account_query = scoped_user_oauth_query(
+                    oauth_db,
+                    user_id=user_id,
+                    resource_owner_key=None,
+                ).filter(UserOAuth.provider.in_(providers_to_check))
+                if str(provider_name).lower() == "google":
+                    # A provider='google' row owned by the shared-grant table
+                    # is reachable only through its explicit app association,
+                    # client fingerprint, and scope checks above. Never let a
+                    # newer shared row bypass those gates through the legacy
+                    # provider-candidate path, including while the flag is off.
+                    from ..models.google_oauth_grant import GoogleOAuthGrant
+
+                    oauth_account_query = oauth_account_query.filter(
+                        UserOAuth.id.notin_(
+                            oauth_db.query(GoogleOAuthGrant.oauth_account_id)
+                        )
                     )
-                    .filter(UserOAuth.provider.in_(providers_to_check))
-                    # Deterministic tie-break for the rare case of more than
-                    # one row for this (user, provider) set (e.g. a provider
-                    # whose identity backfill can't always derive a non-NULL
-                    # provider_user_id, like Employment Hero with zero
-                    # accessible organisations) -- most-recently-created wins,
-                    # rather than an arbitrary, backend-dependent row order.
-                    .order_by(UserOAuth.id.desc())
-                    .first()
-                )
+                # Deterministic tie-break for the rare case of more than one
+                # row for this provider set: most-recently-created wins rather
+                # than an arbitrary, backend-dependent row order.
+                oauth_account = oauth_account_query.order_by(
+                    UserOAuth.id.desc()
+                ).first()
                 logger.info(
                     "OAUTH CONFIG: Checked providers %s for user %s. Found: %s",
                     providers_to_check,

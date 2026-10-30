@@ -74,6 +74,7 @@ vi.mock("@/components/task/task-conversation-panel", async () => {
 })
 
 import { SessionAgentChatPage } from "./session-agent-chat-page"
+import { W_UNSUPPORTED } from "./use-session-open-message"
 
 const PARENT_ORIGIN = "https://shiftcare.example"
 const SESSION_TOKEN = "st_integration_secret"
@@ -1514,5 +1515,185 @@ describe("SessionAgentChatPage file attachments", () => {
 
       await waitFor(() => expect(selected("a.pdf")).toBe(true))
     })
+  })
+})
+
+describe("SessionAgentChatPage opens a new conversation from the host page", () => {
+  const ATTACH_CAPABILITIES = {
+    type: "connection_capabilities",
+    capabilities: ["heartbeat", "conversation_attached"],
+  }
+  const ATTACHED = { type: "conversation_attached" }
+  let warn = vi.fn()
+
+  const mountActive = async () => {
+    render(<SessionAgentChatPage />)
+    dispatchSession()
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open("xagent-session-v1"))
+    return socket
+  }
+  const receive = (socket: MockWebSocket, frame: Record<string, unknown>) => {
+    act(() => socket.onmessage?.({ data: JSON.stringify(frame) } as MessageEvent))
+  }
+  const sentFrames = (socket: MockWebSocket) =>
+    socket.send.mock.calls.map((call) => JSON.parse(call[0] as string) as Record<string, unknown>)
+  const sentTypes = (socket: MockWebSocket) => sentFrames(socket).map((frame) => frame.type)
+  const taskInfo = (taskId: number) => ({
+    type: "trace_event",
+    timestamp: "2026-10-28T00:00:00Z",
+    data: {
+      event_id: `task-info-${taskId}`,
+      event_type: "task_info",
+      data: {
+        id: taskId,
+        title: `Task ${taskId}`,
+        status: "running",
+        description: "Session task",
+        created_at: "2026-10-28T00:00:00Z",
+        updated_at: "2026-10-28T00:00:00Z",
+      },
+    },
+  })
+  const replayEarlierConversation = (socket: MockWebSocket, extra: Array<Record<string, unknown>> = []) => {
+    receive(socket, taskInfo(41))
+    receive(socket, {
+      type: "trace_event",
+      task_id: 41,
+      timestamp: "2026-10-28T00:00:01Z",
+      data: {
+        event_id: "earlier-answer",
+        event_type: "agent_message",
+        data: { message: "Earlier answer", content: "Earlier answer", role: "assistant" },
+      },
+    })
+    receive(socket, { type: "historical_data_complete", task_id: 41, timestamp: "2026-10-28T00:00:02Z" })
+    for (const frame of extra) receive(socket, frame)
+  }
+  const deliverOpenMessage = (value: string, id = "1") => {
+    act(() => {
+      window.dispatchEvent(new MessageEvent("message", {
+        data: { xagent: true, v: 1, type: "open_message", id, value },
+        source: EMBEDDED_PARENT as unknown as MessageEventSource,
+      }))
+    })
+  }
+  const openWarnings = () => warn.mock.calls.filter(([text]) => String(text).startsWith("Xagent Widget:"))
+
+  beforeEach(() => {
+    MockWebSocket.instances = []
+    MockWebSocket.failConstruction = false
+    MockWebSocket.constructionCount = 0
+    localStorage.clear()
+    sessionStorage.clear()
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    vi.spyOn(console, "log").mockImplementation(() => {})
+    warn = vi.fn()
+    vi.spyOn(console, "warn").mockImplementation(warn)
+    Object.defineProperty(window, "parent", { configurable: true, value: EMBEDDED_PARENT })
+  })
+
+  afterEach(() => {
+    cleanup()
+    surfaces.real = false
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+    if (originalParentDescriptor) Object.defineProperty(window, "parent", originalParentDescriptor)
+  })
+
+  it("sends nothing until the socket attaches, then sends the message as the first one", async () => {
+    const socket = await mountActive()
+    receive(socket, ATTACH_CAPABILITIES)
+    deliverOpenMessage("Book a shift")
+    expect(sentTypes(socket)).toEqual([])
+
+    receive(socket, ATTACHED)
+
+    await waitFor(() => expect(sentTypes(socket)).toEqual(["chat"]))
+    expect(sentFrames(socket)[0].message).toBe("Book a shift")
+    expect(openWarnings()).toEqual([])
+  })
+
+  it.each([
+    ["has finished its answer", []],
+    ["is waiting for the visitor", [{
+      type: "task_waiting_for_user",
+      task_id: 41,
+      timestamp: "2026-10-28T00:00:03Z",
+      question: "Which day?",
+      interactions: [],
+      request_id: "inputreq_0011223344556677889900aabbccddee",
+    }]],
+  ] as const)("replaces a replayed conversation that %s", async (_name, extra) => {
+    surfaces.real = true
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 404 })))
+    const socket = await mountActive()
+    receive(socket, ATTACH_CAPABILITIES)
+    deliverOpenMessage("Book a shift")
+    replayEarlierConversation(socket, [...extra])
+    expect(sentTypes(socket)).toEqual([])
+
+    receive(socket, ATTACHED)
+    await waitFor(() => expect(sentTypes(socket)).toEqual(["new_conversation"]))
+    receive(socket, { type: "conversation_reset" })
+    await waitFor(() => expect(sentTypes(socket)).toEqual(["new_conversation", "chat"]))
+    const chat = sentFrames(socket)[1]
+    expect(chat.message).toBe("Book a shift")
+    receive(socket, taskInfo(42))
+    receive(socket, { type: "message_accepted", client_message_id: chat.client_message_id })
+
+    await waitFor(() => expect(screen.getByText("Book a shift")).toBeInTheDocument())
+    expect(screen.queryByText("Earlier answer")).not.toBeInTheDocument()
+    expect(sentTypes(socket)).toEqual(["new_conversation", "chat"])
+    expect(openWarnings()).toEqual([])
+  })
+
+  it("waits for the next socket to attach after a reconnect", async () => {
+    vi.spyOn(window, "postMessage").mockImplementation(() => {})
+    const first = await mountActive()
+    receive(first, ATTACH_CAPABILITIES)
+    receive(first, ATTACHED)
+    act(() => first.triggerClose())
+    dispatchSession({ session_delivery_id: "delivery-b" })
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2))
+    const second = MockWebSocket.instances[1]
+    act(() => second.open("xagent-session-v1"))
+    receive(second, ATTACH_CAPABILITIES)
+
+    deliverOpenMessage("Book a shift")
+    expect(sentTypes(second)).toEqual([])
+    receive(second, taskInfo(41))
+    expect(sentTypes(second)).toEqual([])
+
+    receive(second, ATTACHED)
+
+    await waitFor(() => expect(sentTypes(second)).toEqual(["new_conversation"]))
+    expect(sentTypes(first)).toEqual([])
+  })
+
+  it("drops the message when the server does not announce attach completion", async () => {
+    const socket = await mountActive()
+    receive(socket, { type: "connection_capabilities", capabilities: ["heartbeat"] })
+
+    deliverOpenMessage("Book a shift")
+
+    await waitFor(() => expect(openWarnings()).toEqual([[W_UNSUPPORTED]]))
+    expect(sentTypes(socket)).toEqual([])
+  })
+
+  it("offers the attach marker alongside the liveness marker", async () => {
+    render(<SessionAgentChatPage />)
+    dispatchSession()
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+
+    expect(MockWebSocket.instances[0].protocols).toEqual([
+      "xagent-session-v1",
+      `xagent-session-token.${SESSION_TOKEN}`,
+      "xagent-session-liveness-v1",
+      "xagent-session-attach-v1",
+      "xagent-session-binding-v1",
+      "xagent-session-task.unbound",
+    ])
   })
 })

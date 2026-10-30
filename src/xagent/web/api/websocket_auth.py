@@ -10,7 +10,6 @@ from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from functools import wraps
 from typing import Any, TypeVar, cast
-from urllib.parse import parse_qs
 
 from fastapi import WebSocket
 from fastapi.responses import JSONResponse
@@ -30,6 +29,7 @@ from ..websocket_credentials import (
     AUTH_PROTOCOL,
     InvalidWebSocketCredentials,
     websocket_header_token,
+    websocket_query_carries_credential,
 )
 
 logger = logging.getLogger(__name__)
@@ -178,12 +178,9 @@ def revalidate_websocket_session(endpoint: _Endpoint) -> _Endpoint:
         token = arguments.get("token")
         scope = getattr(websocket, "scope", None)
         if isinstance(scope, dict):
-            query = parse_qs(
-                scope.get("query_string", b"").decode("latin-1"), keep_blank_values=True
-            )
             # Reject the legacy URI contract even when a valid header is also
             # present. Do not retain a credential-leaking fallback.
-            if {"token", "access_token"}.intersection(query):
+            if websocket_query_carries_credential(scope):
                 await websocket.close(code=4001)
                 return
             try:

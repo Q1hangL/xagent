@@ -27,6 +27,9 @@ from xagent.web.models.trigger import TriggerProvisioningStatus
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services.gmail_provisioning import GMAIL_RECONNECT_REQUIRED_ERROR
+from xagent.web.services.google_oauth_grants import (
+    create_google_oauth_grant_association,
+)
 from xagent.web.services.mcp_oauth import MCPAuthorizationChallenge
 from xagent.web.tools import config as web_tools_config
 from xagent.web.tools.config import (
@@ -928,6 +931,228 @@ async def test_missing_user_oauth_token_retains_unavailable_server_and_later_ser
 
 
 @pytest.mark.asyncio
+async def test_shared_google_grant_preferred_with_scope_check_and_legacy_fallback(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    provider_config = OAuthProvider(
+        provider_name="google",
+        name="Google",
+        client_id=encrypt_value("google-client-id"),
+        client_secret=encrypt_value("google-client-secret"),
+        auth_url="https://accounts.google.com/o/oauth2/v2/auth",
+        token_url="https://oauth2.googleapis.com/token",
+        default_scopes=["openid"],
+    )
+    db.add(provider_config)
+    _add_oauth_server(db, user, launch_config=_launch_config())
+    app = (
+        db.query(PublicMCPApp)
+        .filter(PublicMCPApp.app_id == "resolver-google-drive")
+        .one()
+    )
+    app.oauth_scopes = ["scope.drive"]
+    shared = UserOAuth(
+        user_id=int(user.id),
+        provider="google",
+        provider_user_id="google-subject",
+        access_token="shared-token",
+        refresh_token="shared-refresh",
+        scope="openid scope.drive",
+    )
+    legacy = UserOAuth(
+        user_id=int(user.id),
+        provider="resolver-google-drive",
+        provider_user_id="google-subject",
+        access_token="legacy-token",
+    )
+    # Keep the shared row newer than the legacy row so legacy resolution
+    # cannot pass merely because its id happens to win the descending order.
+    db.add_all([legacy, shared])
+    db.flush()
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="google-client-id",
+        app_id="resolver-google-drive",
+        legacy_oauth_account=legacy,
+    )
+    db.commit()
+    isolated_session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, autocommit=False
+    )
+
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "true")
+    configs = await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
+    assert _access_token_env(configs[0]) == "shared-token"
+
+    shared.scope = "openid"
+    db.commit()
+    configs = await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
+    assert _access_token_env(configs[0]) == "legacy-token"
+
+    shared.scope = "openid scope.drive"
+    shared.access_token = ""
+    shared.refresh_token = None
+    db.commit()
+    configs = await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
+    assert _access_token_env(configs[0]) == "legacy-token"
+
+    shared.access_token = "shared-token"
+    shared.refresh_token = "shared-refresh"
+    app.oauth_scopes = ["scope.drive", 42]
+    db.commit()
+    configs = await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
+    assert _access_token_env(configs[0]) == "legacy-token"
+
+    app.oauth_scopes = ["scope.drive"]
+    provider_config.client_id = ""
+    monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
+    db.commit()
+    configs = await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
+    assert _access_token_env(configs[0]) == "legacy-token"
+
+    provider_config.client_id = encrypt_value("google-client-id")
+    app.oauth_scopes = ["scope.drive"]
+    shared.scope = "openid scope.drive"
+    db.commit()
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "false")
+    configs = await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
+    assert _access_token_env(configs[0]) == "legacy-token"
+
+
+@pytest.mark.asyncio
+async def test_actor_apps_share_grant_lock_and_observe_refresh_writeback(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="google",
+            name="Google",
+            client_id=encrypt_value("google-client-id"),
+            client_secret=encrypt_value("google-client-secret"),
+            auth_url="https://accounts.google.com/o/oauth2/v2/auth",
+            token_url="https://oauth2.googleapis.com/token",
+            default_scopes=["openid"],
+        )
+    )
+    owner_key = "toby:workspace:actor"
+    shared = UserOAuth(
+        user_id=int(user.id),
+        provider="google",
+        resource_owner_key=owner_key,
+        provider_user_id="google-subject",
+        access_token="expired-shared-token",
+        refresh_token="shared-refresh",
+        scope="openid scope.drive",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+    )
+    db.add(shared)
+    db.flush()
+    for app_id in ("google-drive", "google-sheets"):
+        create_google_oauth_grant_association(
+            db,
+            oauth_account=shared,
+            oauth_client_id="google-client-id",
+            app_id=app_id,
+        )
+    db.commit()
+    isolated_session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, autocommit=False
+    )
+    config = _tool_config(db, user, db_factory=isolated_session_factory)
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "true")
+
+    drive_lock_key = config._resolve_actor_oauth_lock_key_in_worker(
+        session_factory=isolated_session_factory,
+        provider_name="google",
+        app_id="google-drive",
+        app_info={"oauth_scopes": ["scope.drive"]},
+        resource_owner_key=owner_key,
+        user_id=int(user.id),
+    )
+    sheets_lock_key = config._resolve_actor_oauth_lock_key_in_worker(
+        session_factory=isolated_session_factory,
+        provider_name="google",
+        app_id="google-sheets",
+        app_info={"oauth_scopes": ["scope.drive"]},
+        resource_owner_key=owner_key,
+        user_id=int(user.id),
+    )
+    assert drive_lock_key == sheets_lock_key == f"shared-google:{shared.id}"
+
+    observed_tokens: list[str] = []
+
+    async def refresh_shared(_db, oauth_account, _provider_name):
+        observed_tokens.append(str(oauth_account.access_token))
+        if len(observed_tokens) == 1:
+            oauth_account.access_token = "refreshed-shared-token"
+            oauth_account.expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        return True
+
+    monkeypatch.setattr(
+        web_tools_config, "refresh_oauth_token_if_needed", refresh_shared
+    )
+    first = await config._resolve_actor_oauth_access_token(
+        provider_name="google",
+        app_id="google-drive",
+        app_info={"oauth_scopes": ["scope.drive"]},
+        resource_owner_key=owner_key,
+        user_id=int(user.id),
+    )
+    second = await config._resolve_actor_oauth_access_token(
+        provider_name="google",
+        app_id="google-sheets",
+        app_info={"oauth_scopes": ["scope.drive"]},
+        resource_owner_key=owner_key,
+        user_id=int(user.id),
+    )
+
+    assert first.access_token == "refreshed-shared-token"
+    assert second.access_token == "refreshed-shared-token"
+    assert observed_tokens == ["expired-shared-token", "refreshed-shared-token"]
+    with isolated_session_factory() as verification_db:
+        refreshed_account = verification_db.get(UserOAuth, int(shared.id))
+        assert refreshed_account is not None
+        assert refreshed_account.access_token == "refreshed-shared-token"
+
+    async def permanently_invalid(*_args, **_kwargs):
+        raise web_tools_config._OAuthRefreshPermanentlyInvalid()
+
+    monkeypatch.setattr(
+        web_tools_config, "refresh_oauth_token_if_needed", permanently_invalid
+    )
+    invalid = await config._resolve_actor_oauth_access_token(
+        provider_name="google",
+        app_id="google-drive",
+        app_info={"oauth_scopes": ["scope.drive"]},
+        resource_owner_key=owner_key,
+        user_id=int(user.id),
+    )
+    assert invalid.access_token is None
+    assert invalid.refresh_failed is True
+    with isolated_session_factory() as verification_db:
+        tombstone = verification_db.get(UserOAuth, int(shared.id))
+        assert tombstone is not None
+        assert tombstone.access_token == ""
+        assert tombstone.refresh_token is None
+        assert tombstone.expires_at is None
+
+
+@pytest.mark.asyncio
 async def test_unexpected_server_config_failure_retains_failure_and_later_server(
     db_session,
     monkeypatch,
@@ -1190,7 +1415,160 @@ async def test_user_oauth_refresh_generic_invalid_grant_retains_row(
         oauth_token_required=True,
     )
     with isolated_session_factory() as verification_db:
-        assert verification_db.get(UserOAuth, account_id) is not None
+        preserved = verification_db.get(UserOAuth, account_id)
+        assert preserved is not None
+        assert preserved.access_token == "old-token"
+        assert preserved.refresh_token == "refresh-token-issued-under-old-client"
+        assert preserved.expires_at is not None
+
+
+@pytest.mark.asyncio
+async def test_user_oauth_refresh_google_revoked_token_keeps_reconnect_tombstone(
+    db_session, monkeypatch
+):
+    """Google's explicit revoked-token response is strong enough to stop
+    retrying, while preserving the account identity used by reconnect flows.
+    """
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="google",
+            name="Google",
+            client_id=encrypt_value("google-client-id"),
+            client_secret=encrypt_value("google-client-secret"),
+            auth_url="https://accounts.google.com/o/oauth2/v2/auth",
+            token_url="https://oauth2.googleapis.com/token",
+        )
+    )
+    oauth_server = _add_oauth_server(db, user, launch_config=_launch_config())
+    oauth_account = _add_user_oauth(
+        db, user, provider="google", access_token="expired-token"
+    )
+    oauth_account.refresh_token = "revoked-refresh-token"
+    oauth_account.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    account_id = oauth_account.id
+    db.commit()
+
+    isolated_session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, autocommit=False
+    )
+
+    class RevokedTokenAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return httpx.Response(
+                400,
+                json={
+                    "error": "invalid_grant",
+                    "error_description": "Token has been expired or revoked.",
+                },
+            )
+
+    monkeypatch.setattr(
+        web_tools_config, "create_public_async_client", RevokedTokenAsyncClient
+    )
+
+    configs = await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == ["Google Drive"]
+    _assert_unavailable_mcp_config(
+        configs[0],
+        oauth_server,
+        reason="oauth_token_refresh_failed",
+        oauth_token_required=True,
+    )
+    with isolated_session_factory() as verification_db:
+        tombstone = verification_db.get(UserOAuth, account_id)
+        assert tombstone is not None
+        assert tombstone.access_token == ""
+        assert tombstone.refresh_token is None
+        assert tombstone.expires_at is None
+
+
+def test_google_refresh_classifies_explicit_revocation():
+    with pytest.raises(web_tools_config._OAuthRefreshPermanentlyInvalid):
+        web_tools_config._log_and_classify_failed_refresh(
+            response=httpx.Response(
+                400,
+                json={
+                    "error": "invalid_grant",
+                    "error_description": "Token has been expired or revoked.",
+                },
+            ),
+            provider_name="google",
+        )
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "status_code", "payload"),
+    [
+        ("google", 400, {"error": "invalid_grant"}),
+        (
+            "google",
+            400,
+            {
+                "error": "invalid_grant",
+                "error_description": "Token was issued to another client.",
+            },
+        ),
+        (
+            "google",
+            400,
+            {
+                "error": "invalid_grant",
+                "error_description": "Token has been expired or revoked.",
+                "error_subtype": "invalid_rapt",
+            },
+        ),
+        (
+            "google",
+            500,
+            {
+                "error": "invalid_grant",
+                "error_description": "Token has been expired or revoked.",
+            },
+        ),
+        (
+            "google",
+            401,
+            {
+                "error": "invalid_grant",
+                "error_description": "Token has been expired or revoked.",
+            },
+        ),
+        (
+            "google",
+            200,
+            {
+                "error": "invalid_grant",
+                "error_description": "Token has been expired or revoked.",
+            },
+        ),
+        (
+            "zoom",
+            400,
+            {
+                "error": "invalid_grant",
+                "error_description": "Token has been expired or revoked.",
+            },
+        ),
+    ],
+)
+def test_google_refresh_rejects_ambiguous_status_or_provider(
+    provider_name, status_code, payload
+):
+    response = httpx.Response(status_code, json=payload)
+    web_tools_config._log_and_classify_failed_refresh(
+        response=response,
+        provider_name=provider_name,
+    )
 
 
 @pytest.mark.asyncio
@@ -1361,7 +1739,12 @@ def test_oauth_refresh_error_code_rejects_malformed_bodies(response):
     a falsy-but-truthy value (e.g. "") that would defeat the `error_code or
     "unknown"` logging fallback or accidentally satisfy an `in` check
     against _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES."""
-    assert web_tools_config._oauth_refresh_error_code(response, "google") is None
+    payload = web_tools_config._oauth_refresh_error_payload(response)
+    if payload is not None:
+        assert (
+            web_tools_config._oauth_refresh_error_code_from_payload(payload, "google")
+            is None
+        )
 
 
 def test_oauth_refresh_error_code_swallows_non_value_error_parse_failures():
@@ -1377,8 +1760,7 @@ def test_oauth_refresh_error_code_swallows_non_value_error_parse_failures():
             raise RecursionError("maximum recursion depth exceeded")
 
     assert (
-        web_tools_config._oauth_refresh_error_code(ExplodingJsonResponse(), "google")
-        is None
+        web_tools_config._oauth_refresh_error_payload(ExplodingJsonResponse()) is None
     )
 
 
@@ -1391,10 +1773,15 @@ def test_oauth_refresh_error_code_gates_meta_shape_on_provider():
     response = httpx.Response(
         400, json={"error": {"type": "OAuthException", "code": 190}}
     )
-    assert web_tools_config._oauth_refresh_error_code(response, "meta") == (
+    payload = web_tools_config._oauth_refresh_error_payload(response)
+    assert payload is not None
+    assert web_tools_config._oauth_refresh_error_code_from_payload(payload, "meta") == (
         "invalid_grant"
     )
-    assert web_tools_config._oauth_refresh_error_code(response, "google") is None
+    assert (
+        web_tools_config._oauth_refresh_error_code_from_payload(payload, "google")
+        is None
+    )
 
 
 @pytest.mark.asyncio

@@ -111,7 +111,10 @@ def test_missing_or_foreign_task_cannot_claim_draft(sessions, target, owner):
 def test_public_access_and_automatic_repair_reject_detached_file(sessions):
     from fastapi import HTTPException
 
-    from xagent.web.api.files import _validate_public_task_file_access
+    from xagent.web.api.files import (
+        PublicFileCredential,
+        _validate_public_task_file_access,
+    )
     from xagent.web.services.file_reference_output_service import (
         load_assistant_file_reference_records,
     )
@@ -121,7 +124,7 @@ def test_public_access_and_automatic_repair_reject_detached_file(sessions):
         db.commit()
         row = db.query(UploadedFile).filter_by(file_id="attached").one()
         with pytest.raises(HTTPException) as exc:
-            _validate_public_task_file_access(db, row, None)
+            _validate_public_task_file_access(db, row, PublicFileCredential())
         assert exc.value.status_code == 403
         assert "attached" not in {
             str(record.file_id)

@@ -406,7 +406,7 @@ def capture_previews(manifest: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         for entry in names:
             owned = (
-                entry == f"{file_id}.preview.pdf"
+                (entry.startswith(f"{file_id}.") and entry.endswith(".preview.pdf"))
                 or (
                     entry.startswith(f"{file_id}.")
                     and ".preview.png" in entry

@@ -950,3 +950,70 @@ def test_widget_auth_accepts_legacy_agent_ticket_without_owner_type() -> None:
     body = auth.json()
     assert body["agent_id"] == agent_id
     assert body.get("workforce_id") is None
+
+
+# ===== Public file tickets on workforce widgets =====
+
+
+def test_workforce_widget_file_ticket_resolves_and_dies_with_the_deployment_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A workforce widget guest's file ticket restores the live key from the
+    workforce deployment (not an agent row), so key rotation revokes it."""
+    workforce_id = _create_workforce("Ticket Widget Workforce")
+    key = _enable_widget(workforce_id)
+    guest_headers = _authenticate_widget_guest_by_key(key)
+    patch_schedule_bg(monkeypatch)
+    created = client.post(
+        "/api/widget/chat/task/create",
+        headers=guest_headers,
+        json={"title": "hello", "description": "hello"},
+    )
+    assert created.status_code == 200, created.text
+    uploaded = client.post(
+        "/api/widget/files/upload",
+        headers=guest_headers,
+        data={"task_type": "task", "task_id": str(created.json()["task_id"])},
+        files={"file": ("wf-ticket.txt", io.BytesIO(b"workforce"), "text/plain")},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    file_id = uploaded.json()["file_id"]
+
+    minted = client.post(f"/api/files/public/tickets/{file_id}", headers=guest_headers)
+    assert minted.status_code == 200, minted.text
+    ticket = minted.json()["ticket"]
+    url = f"/api/files/public/preview/{file_id}"
+    allowed = client.get(url, params={"ticket": ticket})
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.content == b"workforce"
+
+    rotated = client.post(
+        f"/api/workforces/{workforce_id}/widget-key/rotate", headers=_admin_headers()
+    )
+    assert rotated.status_code == 200, rotated.text
+    revoked = client.get(url, params={"ticket": ticket})
+    assert revoked.status_code == 403, revoked.text
+    assert revoked.json()["detail"] == "Widget is unavailable"
+
+
+def test_deployment_secret_lookup_prefers_the_workforce_deployment() -> None:
+    """Same precedence as the guest validators: a workforce id wins over an
+    agent id, so the ticket digest is checked against the workforce key."""
+    from xagent.web.api.public_chat_access import _current_deployment_secret
+
+    workforce_id = _create_workforce("Ticket Secret Precedence Workforce")
+    key = _enable_widget(workforce_id)
+    agent_id = _create_published_agent(_user_id(), "Ticket Secret Agent")
+    db = _direct_db_session()
+    try:
+        guest = {
+            "auth_mode": "widget",
+            "widget_workforce_id": workforce_id,
+            "widget_agent_id": agent_id,
+        }
+        assert _current_deployment_secret(db, guest) == key
+        # The share secret of the same workforce is not set: no secret.
+        share_guest = {"auth_mode": "share", "share_workforce_id": workforce_id}
+        assert _current_deployment_secret(db, share_guest) is None
+    finally:
+        db.close()

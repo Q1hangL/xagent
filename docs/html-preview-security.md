@@ -57,9 +57,16 @@ FastAPI serves a static export, set the **same variable at backend runtime**
 so its page CSP also allows that origin in `frame-src`. Any reverse proxy or
 CDN adding another CSP must permit the same origin: multiple policies
 intersect. The preview transport does not add cookies, bearer tokens, launch
-tickets or parent storage. Generated widget/share HTML can already contain
-file-scoped query tokens from its public access policy; those remain restricted
-to absolute managed-file URLs. File API asset URLs are made absolute before
+tickets or parent storage. Generated widget/share HTML never contains the
+guest token (`?token=` was retired): the public access policy signs each
+absolute managed-file asset URL with a short-lived, file-bound `?ticket=`
+minted over the guest's Authorization header (`POST
+/api/files/public/tickets/{file_id}`). Tickets live
+`XAGENT_FILE_STREAM_TICKET_TTL_SECONDS` (default 600) and are signed once when
+the preview is prepared; assets the document requests only after that (lazy
+images, in-document media, in-preview navigations) fail until the preview is
+reopened. Re-signing on a timer would re-deliver the document and reset its
+scroll, form and playback state each period, so it is intentionally not done. File API asset URLs are made absolute before
 delivery so an empty API URL still targets the app origin, not the runner host.
 
 Docker frontend builds accept the same named build argument. Official

@@ -214,7 +214,7 @@ def random_world(
     # One tenant and class with sixteen commands that wait for another process, then
     # one that does not: only a window of seventeen would reach it.
     leading: list[Cmd] = []
-    if heavy and tenants > 1 and rng.random() < 0.4:
+    if heavy and rng.random() < 0.4:
         name, klass = rng.choice(names), rng.choice(CLASSES)
         leading = [
             Cmd(name, klass, "start", "pending", pinned=True, priority=10)
@@ -533,13 +533,16 @@ class Reference:
         tenants: dict[str, dict[str, int]] = {}
         for (tenant, klass), first in oldest.items():
             tenants.setdefault(tenant, {})[klass] = first
-        if len(tenants) <= 1:
+        if not tenants:
             return today
+        # A tenant ranked alone is asked every scan: no skip is read or written.
+        alone = len(tenants) == 1
         now = self.clock()
         self.skips = {k: until for k, until in self.skips.items() if until > now}
+        skipped = {} if alone else self.skips
         ranked = []
         for tenant, classes in tenants.items():
-            remaining = sorted(k for k in classes if (tenant, k) not in self.skips)
+            remaining = sorted(k for k in classes if (tenant, k) not in skipped)
             if remaining:
                 ranked.append(
                     (
@@ -571,7 +574,7 @@ class Reference:
                     if klass == "interactive":
                         age = min(found)
                     hits.append((age, found[0]))
-                else:
+                elif not alone:
                     self.skips[(tenant, klass)] = now + 2.0
             if hits:
                 best = min(hits)[1]

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from types import ModuleType
@@ -41,6 +42,7 @@ from ...core.artifact_validation.service import validate_artifact
 from ...core.execution_scope import resolve_execution_scope
 from ...core.file_storage import get_user_file_storage, normalize_storage_key
 from ...core.tools.adapters.vibe.file_tool import read_file
+from ...core.tools.core import pptx_conversion
 from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
 from ...core.utils.svg import rasterize_svg_bytes
 from ...core.workspace import scoped_user_root
@@ -947,16 +949,36 @@ def _resolve_public_preview_target(
     return candidate
 
 
+@dataclass(frozen=True)
+class PublicFileCredential:
+    """Guest credential presented to one public file request.
+
+    ``token`` is a guest token from the Authorization header; ``ticket_claims``
+    are the claims of a file ticket already verified against the route file.
+    """
+
+    # repr=False on both: neither credential may be rendered in logs/tracebacks.
+    token: str | None = field(default=None, repr=False)
+    ticket_claims: dict[str, Any] | None = field(default=None, repr=False)
+
+
 def _validate_public_task_file_access(
     db: Session,
     file_record: UploadedFile,
-    token: str | None,
-) -> None:
+    credential: PublicFileCredential,
+) -> dict[str, Any] | None:
     """Apply guest-token isolation without changing normal file capabilities.
 
     Ordinary signed-in tasks use the unguessable file ID as the capability for
     public preview and download URLs. Share and widget tasks additionally bind
-    file access to a signed guest token, which must resolve to the same task.
+    file access to a guest credential -- the guest token in the Authorization
+    header, or a file-bound ticket minted from it -- which must resolve to the
+    same task. Credentials are only interpreted for guest-bound files, so a
+    signed-in client's own Bearer header on this route is simply unused.
+
+    Returns the guest claims that were validated for a guest-bound file (so a
+    ticket can be minted from them), or ``None`` when the file is not
+    guest-bound and no credential was consulted.
     """
     if (
         file_record.detached_reason is not None
@@ -964,36 +986,59 @@ def _validate_public_task_file_access(
     ):
         raise HTTPException(status_code=403, detail="Access denied")
     if not file_record.task_id:
-        return
+        return None
 
     task = db.query(Task).filter(Task.id == file_record.task_id).first()
     if not task or not isinstance(task.agent_config, dict):
-        return
+        return None
 
-    auth_mode = task.agent_config.get("auth_mode")
-
-    if auth_mode == "share":
-        if not token:
-            raise HTTPException(
-                status_code=403, detail="Public file access token required"
-            )
-        from .public_chat_access import get_share_chat_user, get_task_for_share_context
-
-        access_context = get_share_chat_user(token, db)
-        get_task_for_share_context(db, int(task.id), access_context)
-        return
+    from .public_chat_access import (
+        get_public_chat_user,
+        get_share_chat_user,
+        get_task_for_public_context,
+        get_task_for_share_context,
+        resolve_public_file_guest,
+    )
 
     guest_id = task.agent_config.get("guest_id")
+    if task.agent_config.get("auth_mode") == "share":
+        share_context, claims = resolve_public_file_guest(
+            credential, db, get_share_chat_user, task_guest_id=guest_id
+        )
+        get_task_for_share_context(db, int(task.id), share_context)
+        return claims
+
     if not isinstance(guest_id, str) or not guest_id:
-        return
+        return None
 
-    if not token:
-        raise HTTPException(status_code=403, detail="Public file access token required")
+    widget_context, claims = resolve_public_file_guest(
+        credential, db, get_public_chat_user, task_guest_id=guest_id
+    )
+    get_task_for_public_context(db, int(task.id), widget_context)
+    return claims
 
-    from .public_chat_access import get_public_chat_user, get_task_for_public_context
 
-    access_context = get_public_chat_user(token, db)
-    get_task_for_public_context(db, int(task.id), access_context)
+def _public_file_credential(
+    file_id: str,
+    ticket: Optional[str] = Query(default=None),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
+) -> PublicFileCredential:
+    """Collect the guest credential for a public file route.
+
+    The guest token is only read from the Authorization header; the retired
+    ``?token=`` query parameter is ignored. A present ``ticket`` is verified on
+    its own (signature, expiry, purpose, binding to this route's file id) and
+    never falls through to the header, mirroring the stream-ticket contract.
+    """
+    from .public_chat_access import verify_public_file_ticket
+
+    if ticket:
+        return PublicFileCredential(
+            ticket_claims=verify_public_file_ticket(ticket, file_id)
+        )
+    return PublicFileCredential(
+        token=credentials.credentials if credentials is not None else None
+    )
 
 
 def _find_registered_preview_asset(
@@ -1308,18 +1353,11 @@ def _pptx_pdf_cache_path(pptx_path: Path, file_id: Optional[str] = None) -> Path
       the upload endpoint live there.
 
     For registered UUID files the cache key is the ``file_id``, which lets
-    ``delete_file()`` remove it with a single unlink.  For legacy / non-UUID
-    paths (no lifecycle management) we fall back to a SHA-256 prefix of the
-    resolved source path — entries there age out naturally.
+    ``delete_file()`` remove all of its export variants.  For legacy / non-UUID
+    paths we fall back to a SHA-256 prefix of the resolved source path; legacy
+    source deletion uses that same prefix to remove its previews.
     """
-    import hashlib
-
-    cache_dir = get_storage_root() / "pptx_pdf_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    if file_id:
-        return cache_dir / f"{file_id}.preview.pdf"
-    path_key = hashlib.sha256(str(pptx_path.resolve()).encode()).hexdigest()[:24]
-    return cache_dir / f"{path_key}.preview.pdf"
+    return pptx_conversion.pptx_pdf_cache_path(pptx_path, file_id)
 
 
 async def _convert_pptx_to_pdf(
@@ -1351,6 +1389,12 @@ async def _convert_pptx_to_pdf_uncached(
     renderer. Production images (Docker) pre-install libreoffice so this
     path always succeeds there.
 
+    The LibreOffice process handling (argv list, per-call user profile,
+    timeout, kill/wait) is shared with the slide render tool in
+    :mod:`xagent.core.tools.core.pptx_conversion`. This function keeps the
+    preview-specific parts: the managed cache, the publication guard, the
+    same-filesystem temporary directory and the atomic cache publish.
+
     ``file_id`` is forwarded to ``_pptx_pdf_cache_path`` so the cache entry
     lands in the managed cache directory (keyed by file_id) rather than as
     a sidecar next to the source file.
@@ -1380,34 +1424,25 @@ async def _convert_pptx_to_pdf_uncached(
         with tempfile.TemporaryDirectory(
             dir=cache_path.parent, prefix=f".{file_id or cache_path.stem}.preview-"
         ) as temp_dir:
-            proc = await asyncio.create_subprocess_exec(
-                "soffice",
-                "--headless",
-                "--convert-to",
-                "pdf",
-                "--outdir",
-                temp_dir,
-                str(pptx_path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
             try:
-                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                logger.warning("pptx→pdf conversion timed out for %s", pptx_path)
-                return None
-            if proc.returncode != 0:
-                logger.warning(
-                    "soffice exited %s for %s: %s",
-                    proc.returncode,
+                converted_pdf = await pptx_conversion.convert_pptx_to_pdf(
                     pptx_path,
-                    stderr.decode("utf-8", "replace")[:200],
+                    Path(temp_dir),
+                    timeout_seconds=(
+                        pptx_conversion.DEFAULT_PPTX_CONVERSION_TIMEOUT_SECONDS
+                    ),
+                )
+            except pptx_conversion.PptxConverterUnavailableError:
+                # soffice binary is missing — this is the expected "fallback"
+                # path on developer machines. Log once at INFO so it doesn't
+                # spam.
+                logger.info(
+                    "soffice not on PATH; .pptx PDF previews will fall back to "
+                    "client-side rendering"
                 )
                 return None
-            pdf_files = list(Path(temp_dir).glob("*.pdf"))
-            if not pdf_files:
+            except pptx_conversion.PptxConversionError as exc:
+                logger.warning("pptx→pdf conversion failed for %s: %s", pptx_path, exc)
                 return None
             # The PDF is already fully written and closed inside the temp dir,
             # and the temp dir lives in the same filesystem as `cache_path`
@@ -1416,21 +1451,13 @@ async def _convert_pptx_to_pdf_uncached(
             # could leave orphans if a concurrent request raced. Per PR #542
             # review.
             try:
-                pdf_files[0].replace(cache_path)
+                converted_pdf.replace(cache_path)
             except OSError as exc:
                 logger.warning(
                     "Failed to cache pptx preview PDF at %s: %s", cache_path, exc
                 )
                 return None
             return cache_path
-    except FileNotFoundError:
-        # soffice binary is missing — this is the expected "fallback" path
-        # on developer machines. Log once at INFO so it doesn't spam.
-        logger.info(
-            "soffice not on PATH; .pptx PDF previews will fall back to "
-            "client-side rendering"
-        )
-        return None
     except Exception as exc:  # noqa: BLE001
         logger.warning("pptx→pdf conversion failed for %s: %s", pptx_path, exc)
         return None
@@ -2200,10 +2227,53 @@ async def preview_pptx_as_pdf(
     )
 
 
+@file_router.post("/public/tickets/{file_id:path}", response_model=None)
+async def issue_public_file_ticket(
+    file_id: str,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Exchange the header-carried guest token for a file-bound ticket.
+
+    For URLs the browser loads itself (media elements, HTML preview assets),
+    which cannot send an Authorization header. The ticket is short-lived,
+    bound to this one registered file (and relative assets under it), only
+    reads files, and is revalidated against the live share/widget deployment
+    on every use. The long-lived guest token never appears in a URL. Its
+    lifetime is ``XAGENT_FILE_STREAM_TICKET_TTL_SECONDS``.
+    """
+    from .public_chat_access import (
+        create_public_file_ticket,
+        decode_public_guest_token,
+    )
+
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    file_record = (
+        db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+        if is_valid_uuid(file_id)
+        else None
+    )
+    if file_record is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    guest_claims = _validate_public_task_file_access(
+        db, file_record, PublicFileCredential(token=credentials.credentials)
+    )
+    if guest_claims is None:
+        # Not a guest-bound file: the file id alone already opens it, but the
+        # mint still requires a genuine guest token rather than none at all.
+        guest_claims = decode_public_guest_token(credentials.credentials)
+    ttl_seconds = get_file_stream_ticket_ttl_seconds()
+    ticket = create_public_file_ticket(
+        guest_claims, file_id=file_id, ttl_seconds=ttl_seconds
+    )
+    return {"ticket": ticket, "expires_in": ttl_seconds}
+
+
 @file_router.get("/public/download/{file_id:path}", response_model=None)
 async def public_download_file(
     file_id: str,
-    token: Optional[str] = Query(default=None),
+    credential: PublicFileCredential = Depends(_public_file_credential),
     db: Session = Depends(get_db),
 ) -> Any:
     """Public source-download endpoint for the chat file-card 'Open' link.
@@ -2219,10 +2289,16 @@ async def public_download_file(
     ``/api/files/download/{file_id}`` route would 401 every plain
     browser navigation.
 
-    The ``file_id`` is the only required capability, matching the
-    existing ``public/preview`` contract. ``relative_path`` is
-    intentionally NOT supported: 'Open' always targets the registered
-    source artifact, never a sub-path inside it.
+    For ordinary files the ``file_id`` is the only required capability,
+    matching the ``public/preview`` contract. Files of share/widget guest
+    tasks additionally need a guest credential: the guest token in the
+    ``Authorization`` header, or -- for plain browser navigations, which
+    cannot send that header -- a short-lived ``?ticket=`` minted by
+    ``POST /public/tickets/{file_id}``. The public frontend adds that ticket
+    to the 'Open' href at click time. The retired ``?token=`` query
+    parameter is ignored. ``relative_path`` is intentionally NOT
+    supported: 'Open' always targets the registered source artifact, never
+    a sub-path inside it.
     """
     file_record: Optional[UploadedFile] = None
     target_path: Optional[Path] = None
@@ -2235,7 +2311,7 @@ async def public_download_file(
         )
 
     if file_record:
-        _validate_public_task_file_access(db, file_record, token)
+        _validate_public_task_file_access(db, file_record, credential)
         file_ref = ManagedFileRef(file_record)
         owner_user_id = _file_user_id_value(file_record)
         file_name = str(file_record.filename)
@@ -2287,7 +2363,7 @@ async def public_download_file(
 async def public_preview_file(
     file_id: str,
     relative_path: Optional[str] = Query(default=None),
-    token: Optional[str] = Query(default=None),
+    credential: PublicFileCredential = Depends(_public_file_credential),
     db: Session = Depends(get_db),
     validation_only: bool = False,
 ) -> Any:
@@ -2302,7 +2378,7 @@ async def public_preview_file(
         )
 
     if file_record:
-        _validate_public_task_file_access(db, file_record, token)
+        _validate_public_task_file_access(db, file_record, credential)
         file_ref = ManagedFileRef(file_record)
         base_path = file_ref.local_path
         owner_user_id = _file_user_id_value(file_record)
@@ -2357,7 +2433,7 @@ async def public_preview_file(
             relative_path=relative_path,
         )
         if asset_record is not None:
-            _validate_public_task_file_access(db, asset_record, token)
+            _validate_public_task_file_access(db, asset_record, credential)
             asset_ref = ManagedFileRef(asset_record)
             try:
                 target_path = await async_managed_copy(asset_ref, restore_local=True)

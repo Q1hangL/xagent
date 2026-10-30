@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import { requestInitialMessage, requestPromptContext } from "./widget-parent-message"
+import {
+  MAX_INITIAL_MESSAGE_LENGTH,
+  listenForOpenMessages,
+  requestInitialMessage,
+  requestPromptContext,
+} from "./widget-parent-message"
 
 function stubParent() {
   const postMessage = vi.fn()
@@ -212,5 +217,116 @@ describe("requestInitialMessage", () => {
     expect(post).not.toHaveBeenCalled()
     expect(onMessage).not.toHaveBeenCalled()
     stop()
+  })
+})
+
+describe("listenForOpenMessages", () => {
+  // Every listener a test starts, so a failing test cannot leave one behind.
+  let stops: Array<() => void> = []
+  afterEach(() => {
+    for (const stop of stops) stop()
+    stops = []
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  function listen(onMessage: (message: string, id: string) => void) {
+    const stop = listenForOpenMessages(onMessage)
+    stops.push(stop)
+    return stop
+  }
+
+  function send(
+    data: Record<string, unknown>,
+    source: MessageEventSource = window.parent as unknown as MessageEventSource,
+  ) {
+    window.dispatchEvent(new MessageEvent("message", {
+      data: { xagent: true, v: 1, type: "open_message", ...data },
+      source,
+    }))
+  }
+
+  const request = [{ xagent: true, v: 1, type: "open_message_request" }, "*"]
+
+  it.each([
+    { name: "a padded message", id: "1", value: " hi ", expected: "hi" },
+    {
+      name: "a message and an id at their length caps",
+      id: "9".repeat(64),
+      value: "x".repeat(MAX_INITIAL_MESSAGE_LENGTH),
+      expected: "x".repeat(MAX_INITIAL_MESSAGE_LENGTH),
+    },
+  ])("requests, then acknowledges and delivers $name", ({ id, value, expected }) => {
+    const post = stubParent()
+    const onMessage = vi.fn()
+    const stop = listen(onMessage)
+
+    send({ id, value })
+
+    expect(post.mock.calls).toEqual([
+      request,
+      [{ xagent: true, v: 1, type: "open_message_ack", id }, "*"],
+    ])
+    expect(onMessage.mock.calls).toEqual([[expected, id]])
+    stop()
+  })
+
+  it.each([
+    { name: "a non-string value", data: { id: "1", value: 42 } },
+    { name: "a blank value", data: { id: "1", value: "   " } },
+    { name: "an over-long value", data: { id: "1", value: "x".repeat(MAX_INITIAL_MESSAGE_LENGTH + 1) } },
+    { name: "a missing id", data: { value: "hi" } },
+    { name: "a non-string id", data: { id: 1, value: "hi" } },
+    { name: "an empty id", data: { id: "", value: "hi" } },
+    { name: "an over-long id", data: { id: "9".repeat(65), value: "hi" } },
+    { name: "another type", data: { id: "1", value: "hi", type: "initial_message" } },
+    { name: "another version", data: { id: "1", value: "hi", v: 2 } },
+    { name: "a missing envelope", data: { id: "1", value: "hi", xagent: false } },
+  ])("ignores $name without acknowledging it", ({ data }) => {
+    const post = stubParent()
+    const onMessage = vi.fn()
+    const stop = listen(onMessage)
+
+    send(data)
+
+    expect(post.mock.calls).toEqual([request])
+    expect(onMessage).not.toHaveBeenCalled()
+    stop()
+  })
+
+  it("ignores a message from another source without acknowledging it", () => {
+    const post = stubParent()
+    const onMessage = vi.fn()
+    const stop = listen(onMessage)
+
+    send({ id: "1", value: "hi" }, window as unknown as MessageEventSource)
+
+    expect(post.mock.calls).toEqual([request])
+    expect(onMessage).not.toHaveBeenCalled()
+    stop()
+  })
+
+  it("stops listening after cleanup", () => {
+    const post = stubParent()
+    const onMessage = vi.fn()
+    listen(onMessage)()
+
+    send({ id: "1", value: "hi" })
+
+    expect(post.mock.calls).toEqual([request])
+    expect(onMessage).not.toHaveBeenCalled()
+  })
+
+  it("neither requests nor listens on a direct visit", () => {
+    const post = vi.spyOn(window, "postMessage")
+    const onMessage = vi.fn()
+    const stop = listen(onMessage)
+
+    // Here window.parent === window, so the source check alone would accept this.
+    send({ id: "1", value: "hi" }, window as unknown as MessageEventSource)
+
+    expect(post).not.toHaveBeenCalled()
+    expect(onMessage).not.toHaveBeenCalled()
+    expect(stop()).toBeUndefined()
   })
 })

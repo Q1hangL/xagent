@@ -88,7 +88,12 @@ def _create_agent(**extra: Any) -> int:
         db.close()
 
 
-def _widget_guest() -> tuple[str, int]:
+def _guest_protocols(token: str) -> list[str]:
+    """The guest token rides the handshake headers, never the URL."""
+    return ["xagent-auth-v1", f"xagent-auth-token.{token}"]
+
+
+def _widget_guest() -> tuple[str, int, list[str]]:
     agent_id = _create_agent()
     enabled = client.put(
         f"/api/agents/{agent_id}",
@@ -113,12 +118,14 @@ def _widget_guest() -> tuple[str, int]:
         json={"title": "hello", "description": "hello", "agent_id": agent_id},
     )
     assert created.status_code == 200, created.text
-    return f"/api/widget/chat/ws/{created.json()['task_id']}?token={token}", int(
-        created.json()["task_id"]
+    return (
+        f"/api/widget/chat/ws/{created.json()['task_id']}",
+        int(created.json()["task_id"]),
+        _guest_protocols(token),
     )
 
 
-def _share_guest() -> tuple[str, int]:
+def _share_guest() -> tuple[str, int, list[str]]:
     share_token = f"trace-audience-{uuid.uuid4().hex[:8]}"
     _create_agent(share_enabled=True, share_token=share_token)
     auth = client.post("/api/share/auth", json={"share_token": share_token})
@@ -130,13 +137,15 @@ def _share_guest() -> tuple[str, int]:
         json={"title": "hello", "description": "hello"},
     )
     assert created.status_code == 200, created.text
-    return f"/api/share/chat/ws/{created.json()['task_id']}?token={token}", int(
-        created.json()["task_id"]
+    return (
+        f"/api/share/chat/ws/{created.json()['task_id']}",
+        int(created.json()["task_id"]),
+        _guest_protocols(token),
     )
 
 
 @pytest.fixture(params=["widget", "share"])
-def guest(request: pytest.FixtureRequest) -> Iterator[tuple[str, int]]:
+def guest(request: pytest.FixtureRequest) -> Iterator[tuple[str, int, list[str]]]:
     yield _widget_guest() if request.param == "widget" else _share_guest()
 
 
@@ -153,9 +162,9 @@ def _frames_until(ws: WebSocketTestSession, stop: Any) -> list[dict[str, Any]]:
 
 
 def test_live_llm_trace_frame_reaches_guest_without_llm_input(
-    guest: tuple[str, int],
+    guest: tuple[str, int, list[str]],
 ) -> None:
-    url, task_id = guest
+    url, task_id, protocols = guest
 
     async def emit() -> None:
         await TaskEventTraceHandler(task_id).handle_event(
@@ -170,7 +179,7 @@ def test_live_llm_trace_frame_reaches_guest_without_llm_input(
         )
         await manager.broadcast_to_task({"type": DONE_TYPE}, task_id)
 
-    with client.websocket_connect(url) as ws:
+    with client.websocket_connect(url, subprotocols=protocols) as ws:
         _frames_until(ws, lambda f: True)  # the socket is registered by now
         ws.portal.call(emit)
         frames = _frames_until(ws, lambda f: f.get("type") == DONE_TYPE)
@@ -186,9 +195,9 @@ def test_live_llm_trace_frame_reaches_guest_without_llm_input(
 
 
 def test_historical_llm_trace_row_replays_to_guest_without_llm_input(
-    guest: tuple[str, int],
+    guest: tuple[str, int, list[str]],
 ) -> None:
-    url, task_id = guest
+    url, task_id, protocols = guest
     db = _direct_db_session()
     try:
         db.add(
@@ -205,7 +214,7 @@ def test_historical_llm_trace_row_replays_to_guest_without_llm_input(
     finally:
         db.close()
 
-    with client.websocket_connect(url) as ws:
+    with client.websocket_connect(url, subprotocols=protocols) as ws:
         frames = _frames_until(ws, lambda f: f.get("event_type") == "llm_call_start")
 
     data = frames[-1]["data"]

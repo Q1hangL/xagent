@@ -13,6 +13,7 @@ import {
 } from "@/contexts/app-context-chat"
 import { useI18n } from "@/contexts/i18n-context"
 import { useWidgetInitialMessage } from "@/hooks/use-widget-initial-message"
+import { useWidgetOpenMessage } from "@/hooks/use-widget-open-message"
 import type { WebSocketConnection } from "@/hooks/use-websocket"
 import { readSendErrorCode } from "@/components/chat/clarification-delivery"
 import {
@@ -30,12 +31,15 @@ import {
   type WidgetSessionAgent,
   type WidgetSessionStatus,
 } from "./use-widget-session"
+import { useSessionOpenMessage } from "./use-session-open-message"
 
 const SESSION_PROTOCOL = "xagent-session-v1"
 // Asks the session server to confirm and send heartbeat frames. A server that
 // does not know the marker ignores it, and the connection then runs without
 // dead-connection detection.
 const SESSION_LIVENESS_PROTOCOL = "xagent-session-liveness-v1"
+// Asks the session server to announce when attach, including any resume replay, has finished.
+const SESSION_ATTACH_PROTOCOL = "xagent-session-attach-v1"
 type SessionTerminalPresentation = "expired" | "unavailable"
 
 const SESSION_TERMINAL_PRESENTATION: Readonly<Record<string, SessionTerminalPresentation>> = {
@@ -95,6 +99,7 @@ function SessionConversationContent({
     isMessageDeliveryPending,
     isSessionInteractionLocked,
     sessionConversationState,
+    sessionConversationAttachment,
   } = useApp()
   const { t } = useI18n()
   const conversationEstablished = state.taskId !== null
@@ -166,11 +171,43 @@ function SessionConversationContent({
     }
   }, [startNewConversation])
 
+  // The same failure line as the button above, and the failure is passed on
+  // so the open message driver drops its message.
+  const startNewConversationForOpen = useCallback(async () => {
+    setResetError(false)
+    try {
+      await startNewConversation()
+    } catch (error) {
+      setResetError(true)
+      throw error
+    }
+  }, [startNewConversation])
+
   useWidgetInitialMessage({
     ready: status === "active" && agent !== null && isConnected,
     // A first send queued during the initial connect has no task yet.
     hasConversation: state.taskId !== null || isMessageDeliveryPending,
     onMessage: (message) => handleStartMessage(message, []),
+  })
+
+  const sendStartMessageForOpen = useCallback(
+    (message: string) => handleStartMessage(message, []),
+    [handleStartMessage],
+  )
+
+  const openMessage = useWidgetOpenMessage({ enabled: true })
+  useSessionOpenMessage({
+    request: openMessage.request,
+    take: openMessage.take,
+    status,
+    hasAgent: agent !== null,
+    sessionConversationAttachment,
+    sessionConversationState,
+    isMessageDeliveryPending,
+    isConversationResetPending,
+    isAttachmentBusy,
+    startNewConversation: startNewConversationForOpen,
+    sendStartMessage: sendStartMessageForOpen,
   })
 
   if (status === "waiting" || (status === "refreshing" && !agent)) {
@@ -371,6 +408,7 @@ export function SessionAgentChatPage() {
         SESSION_PROTOCOL,
         `xagent-session-token.${bridge.session.token}`,
         SESSION_LIVENESS_PROTOCOL,
+        SESSION_ATTACH_PROTOCOL,
       ],
       expectedProtocol: SESSION_PROTOCOL,
       chatTaskIdMode: "omit",

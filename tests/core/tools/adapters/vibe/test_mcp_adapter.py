@@ -7439,3 +7439,25 @@ def test_normalized_mcp_call_result_preserves_server_reported_error():
     )
 
     assert result["is_error"] is True
+
+
+@pytest.mark.parametrize(
+    ("server_name", "expected"),
+    [("Google Slides", "path"), ("Google_Slides", None)],
+)
+def test_google_slides_thumbnail_download_registration(server_name, expected):
+    adapter = _build_mcp_tool_adapter(
+        server_name,
+        {"transport": "stdio", "command": "python", "args": []},
+        SimpleNamespace(
+            name="google_slides_get_slide_thumbnail",
+            description="Download a slide thumbnail",
+            inputSchema={
+                "type": "object",
+                "properties": {"presentation_id": {"type": "string"}},
+            },
+        ),
+        workspace=object(),
+    )
+    assert adapter._workspace_download_field == expected
+    assert ("durable file_ref" in adapter.description) == (expected is not None)

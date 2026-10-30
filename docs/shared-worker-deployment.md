@@ -88,13 +88,14 @@ signals, sorted and comma-separated, or `-` when there are none. `/health`
 reports them only for a web process; a worker has no HTTP endpoint, so this
 line is where a worker's degradations appear. `fair_misses` is how many times
 in the minute a query for the commands of one tenant key and dispatch class found
-nothing this process could claim; that pair is then skipped for two seconds. It
-counts lookups, not tenants: dispatch attempts woken together can each read the
-skip table before any of them records a miss, so one pair can be looked up and
-counted once per concurrent attempt in the same wake-up. It
-is 0 when `XAGENT_DISPATCHER_FAIR_SHARE` is off and in a process that does not
-dispatch task commands. `fair_fallbacks` is how many dispatch attempts in the
-minute were fallback rounds, which take the oldest claimable command instead of
+nothing this process could claim; that pair is then skipped for two seconds,
+unless its tenant key was the only one ranked, in which case every scan asks it
+again and each miss counts. It counts lookups, not tenants: dispatch attempts
+woken together can each read the skip table before any of them records a miss, so
+one pair can be looked up and counted once per concurrent attempt in the same
+wake-up. It is 0 when `XAGENT_DISPATCHER_FAIR_SHARE` is off and in a process that
+does not dispatch task commands. `fair_fallbacks` is how many dispatch attempts in
+the minute were fallback rounds, which take the oldest claimable command instead of
 ranking tenants; a fallback round that dispatched nothing counts too, so after a
 stretch of attempts that open no slot every attempt counts until one fallback
 round dispatches a command holding a slot token. `fair_all_missed` is how many
@@ -184,28 +185,30 @@ adopt it.
 onto the start, appended messages, manual and automatic resumes and answers; pause
 and cancel carry 0. A deployment classifier may return its own priority for a
 command. With `XAGENT_DISPATCHER_FAIR_SHARE` off the value is stored and changes
-nothing. With it on, it takes effect only while the process sees at least two tenant
-keys with queued commands, and it only orders commands of the same tenant key and
-dispatch class: of the sixteen highest-priority queued commands of that pair, the
-highest priority, then the oldest, that can be claimed is taken. When both classes
-of a tenant key have a candidate, the batch candidate is compared by its id and the
-interactive side by the smallest id among the claimable interactive commands of its
-window, so with equal priorities the order is the same as comparing ids. An older
-command that needs no new slot, such as a control command or one of a task already
-running in the process, still goes first, and a class the dispatcher has set aside
-for a while is not asked, so only the other class counts. Answers to waiting tasks
-are still taken first, oldest first. The fallback round, the step that takes an
-older command needing no new slot, a scan with no free slot (a process at its limit
-or on hold), and the path for a single queued tenant key ignore priority. Low-
-priority commands of a tenant key can be starved by a steady stream of higher-
-priority ones from the same key. If the sixteen highest-priority queued commands of
-a tenant key and class all wait for tasks leased by other processes, the tenant
-keeps being missed, even when a lower- priority command of it could run, until a
-fallback round happens to take it: that round takes the oldest claimable command of
-the whole table, which is not necessarily one of this tenant. With an admission hook
-installed, the same happens to a tenant whose command at the head of an admission
-queue has lower priority than the sixteen behind it, so do not enable admission
-together with priorities until admission waiters are ordered by priority.
+nothing. With it on, it only orders commands of the same tenant key and dispatch
+class, also when that tenant key is the only one with queued commands: of the
+sixteen highest-priority queued commands of that pair, the highest priority, then
+the oldest, that can be claimed is taken. When both classes of a tenant key have a
+candidate, the batch candidate is compared by its id and the interactive side by the
+smallest id among the claimable interactive commands of its window, so with equal
+priorities the order is the same as comparing ids. An older command that needs no
+new slot, such as a control command or one of a task already running in the process,
+still goes first, and a class the dispatcher has set aside for a while is not asked,
+so only the other class counts. Answers to waiting tasks are still taken first,
+oldest first. The fallback round, the step that takes an older command needing no
+new slot, and a scan with no free slot (a process at its limit or on hold) ignore
+priority. Low-priority commands of a tenant key can be starved by a steady stream
+of higher-priority ones from the same key. If the sixteen highest-priority queued
+commands of a tenant key and class all wait for tasks leased by other processes, the
+tenant keeps being missed, even when a lower-priority command of it could run, until
+a fallback round happens to take it: that round takes the oldest claimable command
+of the whole table, which is not necessarily one of this tenant. When every tenant
+key asked misses, the same scan takes the oldest claimable command instead; a tenant
+key ranked alone is not skipped after a miss, so the next scan asks it again. With
+an admission hook installed, the same happens to a tenant whose command at the head
+of an admission queue has lower priority than the sixteen behind it, so do not
+enable admission together with priorities until admission waiters are ordered by
+priority.
 
 ## Configuration and upgrade
 

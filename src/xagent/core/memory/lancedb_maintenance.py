@@ -13,6 +13,7 @@ import pyarrow as pa  # type: ignore
 from filelock import FileLock, Timeout
 
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
+from ..utils.lancedb_sql import sql_string_literal
 from .scope_columns import (
     SCOPE_DIMS_COLUMN,
     USER_ID_COLUMN,
@@ -170,22 +171,18 @@ def _needs_update(row: dict[str, Any]) -> bool:
     return (row.get(USER_ID_COLUMN), row.get(SCOPE_DIMS_COLUMN)) != expected
 
 
-def _sql_string(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
-
-
 def _sql_list(values: list[str]) -> str:
     if not values:
         return "arrow_cast([], 'List(Utf8)')"
-    return "[" + ", ".join(_sql_string(value) for value in values) + "]"
+    return "[" + ", ".join(sql_string_literal(value) for value in values) + "]"
 
 
 def _sql_nullable_string(value: str | None) -> str:
-    return "arrow_cast(NULL, 'Utf8')" if value is None else _sql_string(value)
+    return "arrow_cast(NULL, 'Utf8')" if value is None else sql_string_literal(value)
 
 
 def _backfill_batch(table: Any, rows: list[dict[str, Any]]) -> int:
-    ids = [_sql_string(row["id"]) for row in rows]
+    ids = [sql_string_literal(row["id"]) for row in rows]
     derived = [derive_scope_columns(row["metadata"]) for row in rows]
     position = f"cast(array_position([{', '.join(ids)}], id) as bigint)"
     metadata = ", ".join(_sql_nullable_string(row["metadata"]) for row in rows)

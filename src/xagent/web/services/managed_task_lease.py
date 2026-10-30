@@ -20,21 +20,24 @@ from .client_error_messages import CLIENT_SAFE_TASK_FAILURE
 from .db_runtime import (
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
+    task_returned,
 )
 from .execution_result_projection import (
     completion_outcome_for_status,
     interrupted_channel_result,
 )
+from .release_hold import release_hold
 from .task_lease_service import (
     TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR,
     TaskLease,
     TaskLeaseHeartbeatOutcome,
     acquire_task_lease_cancellation_safe,
     acquire_task_lease_no_commit,
+    log_unknown_tool_effect_settlement,
     release_task_lease_no_commit,
-    run_has_unknown_tool_effect,
     run_task_lease_heartbeat,
     stop_task_lease_heartbeat,
+    unknown_tool_effect_of_run,
 )
 from .task_settlement_report import RecordedInterruption, SettlementReport
 from .workforce_runtime import sync_workforce_run_status
@@ -105,6 +108,10 @@ def finalize_managed_task_lease_result(
 
     run_error = error_message
     recorded: RecordedInterruption | None = None
+    # Set when this settlement fails the run as an unknown tool effect;
+    # reported only once its transaction has committed.
+    unknown_tool_effect = False
+    unknown_tool_attempt_id: str | None = None
     try:
         interruption: InterruptionDecision | None = None
         if settle_interruption and status == TaskStatus.FAILED:
@@ -119,6 +126,8 @@ def finalize_managed_task_lease_result(
             and interruption.outcome is InterruptionOutcome.FAIL_UNKNOWN_TOOL_EFFECT
         ):
             error_message = TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR
+            unknown_tool_effect = True
+            unknown_tool_attempt_id = interruption.unknown_tool_attempt_id
         # For a pause this generic release is equivalent to
         # ``pause_and_release_task_lease_no_commit``: it does not itself
         # require RUNNING, but decide_owned_run_interruption has just locked
@@ -127,12 +136,12 @@ def finalize_managed_task_lease_result(
             db.rollback()
             return False
 
-        if (
-            status == TaskStatus.FAILED
-            and execution_result is None
-            and run_has_unknown_tool_effect(db, lease)
-        ):
-            error_message = TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR
+        if status == TaskStatus.FAILED and execution_result is None:
+            unknown = unknown_tool_effect_of_run(db, lease)
+            if unknown is not None:
+                error_message = TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR
+                unknown_tool_effect = True
+                unknown_tool_attempt_id = unknown.tool_attempt_id
         db.expire_all()
         task = db.query(Task).filter(Task.id == lease.task_id).one()
         setattr(
@@ -234,6 +243,10 @@ def finalize_managed_task_lease_result(
         db.rollback()
         raise
 
+    if unknown_tool_effect:
+        log_unknown_tool_effect_settlement(
+            lease.task_id, lease.run_id, unknown_tool_attempt_id
+        )
     if paused_state is not None and interruption is not None:
         if report is not None:
             report.control_state = dict(paused_state)
@@ -326,7 +339,16 @@ def _release_managed_task_lease_sync(lease: TaskLease) -> bool:
 
 @dataclass
 class ManagedTaskLease:
-    """Keep a pre-acquired lease alive and release it exactly once."""
+    """Keep a pre-acquired lease alive and release it exactly once.
+
+    The one settlement seam of every inline transport (Toby, the Slack,
+    Telegram and Feishu bots, channel runtime). A ``finalize_result`` or
+    ``close`` that does not confirm the release -- heartbeat lost or unhealthy,
+    the exact lease no longer matched, the write raised -- leaves the lease to
+    TTL recovery and is recorded as unsettled release evidence
+    (``release_hold.record_unsettled``). A repeated call on an already closed
+    lease attempts nothing and records nothing.
+    """
 
     lease: TaskLease
     stop_event: asyncio.Event
@@ -338,7 +360,7 @@ class ManagedTaskLease:
             return False
         self._closed = True
         cleanup_task = asyncio.create_task(self._close_resources())
-        return await drain_async_task_cancellation_safe(cleanup_task)
+        return await self._confirmed(cleanup_task, "close")
 
     async def finalize_result(
         self,
@@ -367,7 +389,24 @@ class ManagedTaskLease:
                 execution_result=execution_result,
             )
         )
-        return await drain_async_task_cancellation_safe(cleanup_task)
+        return await self._confirmed(cleanup_task, "finalize")
+
+    async def _confirmed(self, cleanup_task: asyncio.Task[bool], action: str) -> bool:
+        """Drain one settlement attempt; record it unless the release was confirmed.
+
+        Decided on the attempt's own result: a caller cancelled meanwhile
+        still gets ``CancelledError`` once the attempt is drained, whether the
+        release committed or not.
+        """
+        try:
+            return await drain_async_task_cancellation_safe(cleanup_task)
+        finally:
+            if not (task_returned(cleanup_task) and cleanup_task.result()):
+                release_hold.record_unsettled(
+                    "managed_lease",
+                    f"task:{self.lease.task_id}",
+                    f"managed lease {action} not confirmed; run left to TTL recovery",
+                )
 
     async def _stop_heartbeat_for_settlement(self) -> bool:
         heartbeat_outcome = await stop_task_lease_heartbeat(

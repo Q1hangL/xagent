@@ -16,6 +16,7 @@ from ..model.embedding import BaseEmbedding, DashScopeEmbedding
 from ..model.embedding.adapter import create_embedding_adapter
 from ..model.model import EmbeddingModelConfig
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
+from ..utils.lancedb_sql import sql_string_literal
 from .base import MemoryStore
 from .core import MemoryNote, MemoryResponse
 from .retrieval_compatibility import DEFAULT_STREAM_BATCH_SIZE, stream_lexical_top_k
@@ -686,7 +687,9 @@ class LanceDBMemoryStore(MemoryStore):
             )
 
             # Search by ID
-            results = table.search().where(f"id = '{note_id}'").to_pandas()
+            results = (
+                table.search().where(f"id = {sql_string_literal(note_id)}").to_pandas()
+            )
 
             if len(results) == 0:
                 return MemoryResponse(

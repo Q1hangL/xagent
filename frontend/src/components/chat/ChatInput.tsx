@@ -12,7 +12,8 @@ import { useAuth } from "@/contexts/auth-context";
 import { ConfigDialog } from "@/components/config-dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { apiRequest, classifyUploadError, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper";
-import { clientErrorTranslationKey, readClientErrorCode } from "@/lib/client-errors";
+import { clientErrorTranslationKey } from "@/lib/client-errors";
+import { notifySendFailure } from "@/lib/send-failure-notice";
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids";
 import { capabilityRefusal } from "@/lib/widget-session-upload";
 import { sanitizeFilesDisabledPresentationText } from "@/lib/files-disabled-presentation";
@@ -1006,23 +1007,9 @@ export function ChatInput({
       }
       // A containing surface (e.g. Builder preview) may already show a
       // persistent error. Keep retry state, but do not duplicate its notice.
-      if (typeof error === "object" && error !== null
-        && (error as { notificationHandled?: unknown }).notificationHandled === true) return;
       // A lost connection's failure can arrive up to a resend wait later, after
       // the user left; no toast for a gone input. Other failures still notify.
-      if (!mountedRef.current && typeof error === "object" && error !== null
-        && (error as { connectionLost?: unknown }).connectionLost === true) return;
-      const errorCode = typeof error === "object" && error !== null
-        ? readClientErrorCode((error as { errorCode?: unknown }).errorCode)
-        : null;
-      const userFacing = typeof error === "object" && error !== null
-        && (error as { userFacing?: unknown }).userFacing === true;
-      toast.error(errorCode
-        ? t(clientErrorTranslationKey(errorCode))
-        : userFacing && error instanceof Error
-          ? error.message
-          : t("builds.list.chat.sendFailed") || "Message was not sent"
-      );
+      notifySendFailure(error, t, { suppressConnectionLost: !mountedRef.current });
     } finally {
       // Small delay to prevent double submission
       setTimeout(() => {

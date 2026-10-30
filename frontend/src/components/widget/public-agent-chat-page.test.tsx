@@ -1,7 +1,10 @@
 import React from "react"
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest"
 import type { AppProviderTransportConfig } from "@/contexts/app-context-chat"
+import { MessageDeliveryError } from "@/hooks/use-websocket"
+import { W_SEND_FAILED } from "@/hooks/use-widget-open-message"
+import { clientErrorTranslationKey } from "@/lib/client-errors"
 
 const app = vi.hoisted(() => ({
   dispatch: vi.fn(),
@@ -15,6 +18,9 @@ const app = vi.hoisted(() => ({
     isProcessing: false,
   },
   rerender: null as null | React.Dispatch<React.SetStateAction<number>>,
+  // Sends started through the double's sendMessage and not yet settled; the
+  // double exposes it as isSendInFlight, like AppProvider does.
+  sendsInFlight: 0,
   provider: null as null | {
     token: string
     transport?: AppProviderTransportConfig
@@ -22,6 +28,8 @@ const app = vi.hoisted(() => ({
   startScreenProps: null as null | {
     onSend?: (message: string, files: File[], config?: Record<string, string>) => Promise<void>
     voiceInputEnabled?: boolean
+    inputValue?: string
+    onInputChange?: (value: string) => void
   },
   conversationPanelProps: null as null | {
     onSend?: (
@@ -33,6 +41,7 @@ const app = vi.hoisted(() => ({
 }))
 
 const i18n = vi.hoisted(() => ({ t: (key: string) => key }))
+const toastMock = vi.hoisted(() => ({ error: vi.fn() }))
 
 vi.mock("@/contexts/app-context-chat", () => ({
   AppProvider: ({
@@ -56,6 +65,7 @@ vi.mock("@/contexts/app-context-chat", () => ({
       sendMessage: app.sendMessage,
       setTaskId: app.setTaskId,
       connectionError: app.connectionError,
+      isSendInFlight: app.sendsInFlight > 0,
       voiceInputEnabled:
         app.provider?.transport?.capabilities?.voice !== "disabled",
     }
@@ -64,6 +74,10 @@ vi.mock("@/contexts/app-context-chat", () => ({
 
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => i18n,
+}))
+
+vi.mock("@/components/ui/sonner", () => ({
+  toast: toastMock,
 }))
 
 vi.mock("@/components/chat/ChatStartScreen", () => ({
@@ -196,16 +210,17 @@ function expectPublicProviderToken() {
     linksOpenInNewTab: "enabled",
   })
   expect(app.startScreenProps?.voiceInputEnabled).toBe(false)
+  // The guest token rides the handshake header / Authorization header, so
+  // neither the socket URL nor any file URL carries it.
   expect(app.provider?.transport?.buildWebSocketUrl?.({
     baseUrl: "wss://api.example",
     taskId: 42,
-    token: app.provider?.token,
-  })).toBe("wss://api.example/api/widget/chat/ws/42?token=public-access-token")
+  })).toBe("wss://api.example/api/widget/chat/ws/42")
   expect(app.provider?.transport?.fileAccess?.inlinePreviewUrl("public-file")).toBe(
-    "https://api.example/api/files/public/preview/public-file?token=public-access-token",
+    "https://api.example/api/files/public/preview/public-file",
   )
   expect(app.provider?.transport?.fileAccess?.inlineDownloadUrl("public-file")).toBe(
-    "https://api.example/api/files/public/download/public-file?token=public-access-token",
+    "https://api.example/api/files/public/download/public-file",
   )
   expect(app.provider?.transport?.uploadFiles).toEqual(expect.any(Function))
 }
@@ -255,6 +270,7 @@ describe("PublicAgentChatPage", () => {
       isProcessing: false,
     }
     app.rerender = null
+    app.sendsInFlight = 0
     app.provider = null
     app.startScreenProps = null
     app.conversationPanelProps = null
@@ -805,8 +821,7 @@ describe("PublicAgentChatPage", () => {
     expect(app.provider?.transport?.buildWebSocketUrl?.({
       baseUrl: "wss://api.example",
       taskId: 42,
-      token: app.provider?.token,
-    })).toBe("wss://api.example/api/share/chat/ws/42?token=public-access-token")
+    })).toBe("wss://api.example/api/share/chat/ws/42")
     // A share visitor already has the full page; unlike the embedded widget
     // iframe, an in-tab navigation away from it is ordinary browser behavior.
     expect(app.provider?.transport?.capabilities?.linksOpenInNewTab).toBe("disabled")
@@ -1117,5 +1132,507 @@ describe("PublicAgentChatPage", () => {
       expect(app.sendMessage).not.toHaveBeenCalled()
       expect(initialRequests(post)).toHaveLength(1)
     })
+  })
+
+  describe("open message from the host page", () => {
+    type Deferred<T> = { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void }
+    function deferred<T = void>(): Deferred<T> {
+      let resolve!: (value: T) => void
+      let reject!: (error: unknown) => void
+      const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise
+        reject = rejectPromise
+      })
+      return { promise, resolve, reject }
+    }
+
+    const STORAGE_KEY = "widget_task_17_guest-1"
+    const CREATE_URL = "https://api.example/api/widget/chat/task/create"
+    // Calls of the doubles below, in the order they happen; tests add their
+    // own markers ("resolve", "release") at the moment they let a send go.
+    let order: string[]
+    let storedAtCreate: Array<string | null>
+    let heldDeliveries: Array<Deferred<void>>
+    let holdDeliveries: boolean
+    let createResponses: Array<() => Promise<Response>>
+    let authResponse: () => Promise<Response>
+    let nextTaskId: number
+    let parentPost: ReturnType<typeof vi.fn>
+    let warn: MockInstance<typeof console.warn>
+
+    beforeEach(() => {
+      localStorage.clear()
+      order = []
+      storedAtCreate = []
+      heldDeliveries = []
+      holdDeliveries = false
+      createResponses = []
+      authResponse = () => Promise.resolve(jsonResponse(successfulAgentAuth))
+      nextTaskId = 101
+      toastMock.error.mockReset()
+      warn = vi.spyOn(console, "warn").mockImplementation(() => undefined)
+      // Counted synchronously at the call, and released when the test's
+      // delivery settles, the way AppProvider's isSendInFlight is.
+      app.sendMessage.mockImplementation((message: string) => {
+        order.push(`sendMessage(${message})`)
+        app.sendsInFlight += 1
+        app.rerender?.((value) => value + 1)
+        const delivery = deferred()
+        if (holdDeliveries) {
+          heldDeliveries.push(delivery)
+        } else {
+          delivery.resolve()
+        }
+        return delivery.promise.finally(() => {
+          app.sendsInFlight -= 1
+          app.rerender?.((value) => value + 1)
+        })
+      })
+      app.setTaskId.mockImplementation((taskId: number | null) => {
+        order.push(`setTaskId(${taskId})`)
+        app.state = { ...app.state, taskId }
+        app.rerender?.((value) => value + 1)
+      })
+      parentPost = vi.fn((message: { type?: string }) => {
+        if (message.type === "prompt_context_request") dispatchPromptContext(null)
+      })
+      vi.stubGlobal("parent", { postMessage: parentPost })
+      fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+        if (url !== CREATE_URL) return authResponse()
+        order.push(`create(${JSON.parse(String(init?.body)).title})`)
+        storedAtCreate.push(localStorage.getItem(STORAGE_KEY))
+        const respond = createResponses.shift()
+        if (respond) return respond()
+        return Promise.resolve(jsonResponse(widgetTaskResponse(nextTaskId++, "pending")))
+      })
+    })
+
+    const postedOfType = (type: string) => parentPost.mock.calls.filter(([data]) => data.type === type)
+    const creates = () => order.filter((entry) => entry.startsWith("create("))
+
+    function deliverOpen(id: string, value: string) {
+      window.dispatchEvent(new MessageEvent("message", {
+        data: { xagent: true, v: 1, type: "open_message", id, value },
+        source: window.parent as unknown as MessageEventSource,
+      }))
+    }
+
+    async function deliver(id: string, value: string) {
+      await act(async () => { deliverOpen(id, value) })
+    }
+
+    // Lets every queued promise callback and effect run.
+    async function settle() {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
+    }
+
+    async function renderReady({ storedTaskId, workforce = false }: { storedTaskId?: number; workforce?: boolean } = {}) {
+      if (storedTaskId) localStorage.setItem(STORAGE_KEY, String(storedTaskId))
+      if (workforce) authResponse = () => Promise.resolve(jsonResponse(successfulWorkforceAuth))
+      const view = renderWidgetPage(workforce
+        ? { searchAgentId: null, widgetKey: "widget-secret" }
+        : { widgetKey: "widget-secret" })
+      if (storedTaskId) {
+        await screen.findByTestId("conversation-panel")
+      } else {
+        await screen.findByRole("button", { name: /^start:/ })
+      }
+      await waitFor(() => expect(postedOfType("open_message_request")).toHaveLength(1))
+      // Mounting resolves the stored task through setTaskId; count from here.
+      app.setTaskId.mockClear()
+      order.length = 0
+      storedAtCreate.length = 0
+      return view
+    }
+
+    async function startsWithStoredConversation(isProcessing: boolean) {
+      app.state = { ...app.state, isProcessing }
+      await renderReady({ storedTaskId: 42 })
+
+      await deliver("1", "B")
+      await waitFor(() => expect(app.sendMessage).toHaveBeenCalledTimes(1))
+
+      expect(order).toEqual(["setTaskId(null)", "create(B)", "setTaskId(101)", "sendMessage(B)"])
+      expect(storedAtCreate).toEqual([null])
+      expect(app.sendMessage.mock.calls).toEqual([["B", { targetTaskId: 101 }, []]])
+    }
+
+    async function failsAfterTaskCreation(error: unknown, toasts: unknown[][]) {
+      holdDeliveries = true
+      await renderReady()
+      await deliver("1", "A")
+      await waitFor(() => expect(heldDeliveries).toHaveLength(1))
+
+      heldDeliveries[0].reject(error)
+      await settle()
+
+      expect(toastMock.error.mock.calls).toEqual(toasts)
+      expect(warn.mock.calls).toEqual([[W_SEND_FAILED]])
+      expect(screen.queryByText("widgetChat.messages.error_init")).toBeNull()
+      expect(screen.getByText("widgetChat.status.online")).toBeInTheDocument()
+    }
+
+    type GuestCaseId =
+      | "noConversation" | "finishedConversation" | "agentStillAnswering"
+      | "previousMessageStillStarting" | "rapidClicks" | "visitorSendInFlight"
+      | "startScreenDraft" | "taskCreationFails" | "sendFailsAfterTaskCreation"
+      | "shareLink" | "workforceWidget" | "authenticationPending" | "pageUnmounted"
+    type GuestCase = { name: string; run: () => Promise<void> }
+
+    // One key per guest-mode case of an open message; a new case needs a new
+    // key in GuestCaseId, and the Record type then requires its entry here.
+    // Not in this table: an iframe reloaded after acknowledging, before the
+    // message was taken (the message is lost, a known residual with nothing to
+    // drive), and a persisted pagehide and pageshow (widget.js's side is
+    // covered in widget-open.test.ts, and the iframe side lands on the cases
+    // here).
+    const GUEST_CASES: Record<GuestCaseId, readonly GuestCase[]> = {
+      noConversation: [{
+        name: "with no conversation, creates the task and sends the message to it",
+        run: async () => {
+          await renderReady()
+
+          await deliver("1", "A")
+          await waitFor(() => expect(app.sendMessage).toHaveBeenCalledTimes(1))
+
+          expect(creates()).toEqual(["create(A)"])
+          expect(app.sendMessage.mock.calls).toEqual([["A", { targetTaskId: 101 }, []]])
+        },
+      }],
+      finishedConversation: [{
+        name: "ends a finished conversation first, then creates the task in a later render",
+        run: () => startsWithStoredConversation(false),
+      }],
+      agentStillAnswering: [{
+        name: "ends a conversation whose agent is still running, without stopping it",
+        run: async () => {
+          await startsWithStoredConversation(true)
+          expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+            "https://api.example/api/widget/auth",
+            CREATE_URL,
+          ])
+        },
+      }],
+      previousMessageStillStarting: [{
+        name: "holds a message that arrives while the previous one is still being sent",
+        run: async () => {
+          holdDeliveries = true
+          await renderReady()
+          await deliver("1", "A")
+          await waitFor(() => expect(heldDeliveries).toHaveLength(1))
+          await settle()
+
+          await deliver("2", "B")
+          await settle()
+          expect(app.setTaskId.mock.calls).toEqual([[101, { navigate: false }]])
+          expect(creates()).toEqual(["create(A)"])
+
+          order.push("resolve")
+          heldDeliveries[0].resolve()
+          await waitFor(() => expect(app.sendMessage).toHaveBeenCalledTimes(2))
+
+          expect(order).toEqual([
+            "create(A)", "setTaskId(101)", "sendMessage(A)",
+            "resolve",
+            "setTaskId(null)", "create(B)", "setTaskId(102)", "sendMessage(B)",
+          ])
+        },
+      }],
+      rapidClicks: [
+        {
+          name: "rapid clicks while one is starting: the last waiting one replaces the others",
+          run: async () => {
+            holdDeliveries = true
+            await renderReady()
+            await deliver("1", "A")
+            await waitFor(() => expect(heldDeliveries).toHaveLength(1))
+            await deliver("2", "B")
+            await deliver("3", "C")
+
+            heldDeliveries[0].resolve()
+            await waitFor(() => expect(app.sendMessage).toHaveBeenCalledTimes(2))
+            await settle()
+
+            expect(creates()).toEqual(["create(A)", "create(C)"])
+          },
+        },
+        {
+          name: "rapid clicks before any is taken: only the last one is sent",
+          run: async () => {
+            await renderReady()
+
+            await act(async () => {
+              deliverOpen("1", "A")
+              deliverOpen("2", "B")
+              deliverOpen("3", "C")
+            })
+            await waitFor(() => expect(app.sendMessage).toHaveBeenCalledTimes(1))
+            await settle()
+
+            expect(creates()).toEqual(["create(C)"])
+            expect(app.sendMessage.mock.calls).toEqual([["C", { targetTaskId: 101 }, []]])
+          },
+        },
+      ],
+      visitorSendInFlight: [
+        {
+          name: "waits for the visitor's own start-screen send",
+          run: async () => {
+            const visitorCreate = deferred<Response>()
+            createResponses.push(() => visitorCreate.promise)
+            await renderReady()
+            fireEvent.click(screen.getByRole("button", { name: "start:Support Agent" }))
+            await waitFor(() => expect(creates()).toEqual(["create(first message)"]))
+
+            await deliver("1", "A")
+            await settle()
+            expect(creates()).toEqual(["create(first message)"])
+            expect(app.setTaskId).not.toHaveBeenCalledWith(null, { navigate: false })
+
+            order.push("release")
+            visitorCreate.resolve(jsonResponse(widgetTaskResponse(100, "pending")))
+            await waitFor(() => expect(app.sendMessage).toHaveBeenCalledTimes(2))
+
+            expect(order).toEqual([
+              "create(first message)",
+              "release",
+              "setTaskId(100)", "sendMessage(first message)",
+              "setTaskId(null)", "create(A)", "setTaskId(101)", "sendMessage(A)",
+            ])
+          },
+        },
+        {
+          name: "waits for the visitor's own conversation-panel send",
+          run: async () => {
+            holdDeliveries = true
+            await renderReady({ storedTaskId: 42 })
+            await act(async () => {
+              void Promise.resolve(app.conversationPanelProps!.onSend!("x", undefined, [])).catch(() => undefined)
+            })
+
+            await deliver("1", "A")
+            await settle()
+            expect(app.setTaskId).not.toHaveBeenCalled()
+            expect(creates()).toEqual([])
+
+            order.push("resolve")
+            heldDeliveries[0].resolve()
+            await waitFor(() => expect(app.sendMessage).toHaveBeenCalledTimes(2))
+
+            expect(order).toEqual([
+              "sendMessage(x)",
+              "resolve",
+              "setTaskId(null)", "create(A)", "setTaskId(101)", "sendMessage(A)",
+            ])
+          },
+        },
+        {
+          // A form answer and a form's skip-connector send both go through
+          // useApp().sendMessage, so at this double they are the same
+          // in-flight count; one row stands for both.
+          name: "waits for a form answer sent through useApp().sendMessage",
+          run: async () => {
+            await renderReady({ storedTaskId: 42 })
+            act(() => {
+              app.sendsInFlight = 1
+              app.rerender?.((value) => value + 1)
+            })
+
+            await deliver("1", "A")
+            await settle()
+            expect(app.setTaskId).not.toHaveBeenCalled()
+            expect(creates()).toEqual([])
+
+            act(() => {
+              app.sendsInFlight = 0
+              app.rerender?.((value) => value + 1)
+            })
+            await waitFor(() => expect(app.sendMessage).toHaveBeenCalledTimes(1))
+
+            expect(order).toEqual(["setTaskId(null)", "create(A)", "setTaskId(101)", "sendMessage(A)"])
+          },
+        },
+      ],
+      startScreenDraft: [{
+        name: "clears the start-screen draft once the opening send succeeds",
+        run: async () => {
+          await renderReady()
+          act(() => app.startScreenProps!.onInputChange!("draft"))
+          expect(app.startScreenProps!.inputValue).toBe("draft")
+          // Keep the start screen on the page so its draft stays observable:
+          // this double does not apply the new task id.
+          app.setTaskId.mockImplementation((taskId: number | null) => {
+            order.push(`setTaskId(${taskId})`)
+          })
+
+          await deliver("1", "A")
+          await waitFor(() => expect(app.sendMessage).toHaveBeenCalledTimes(1))
+          await settle()
+
+          expect(app.startScreenProps!.inputValue).toBe("")
+        },
+      }],
+      taskCreationFails: [
+        {
+          name: "a failed task creation shows the start screen's header error and toast, then the next message still goes",
+          run: async () => {
+            createResponses.push(() => Promise.resolve(jsonResponse({ detail: "task create failed" }, 500)))
+            await renderReady()
+
+            await deliver("1", "A")
+            expect(await screen.findByText("task create failed")).toBeInTheDocument()
+            await settle()
+            expect(toastMock.error.mock.calls).toEqual([["builds.list.chat.sendFailed"]])
+            expect(warn.mock.calls).toEqual([[W_SEND_FAILED]])
+
+            await deliver("2", "B")
+            await waitFor(() => expect(app.sendMessage).toHaveBeenCalledTimes(1))
+            expect(creates()).toEqual(["create(A)", "create(B)"])
+          },
+        },
+        {
+          name: "a created task without an id shows only the start screen's toast",
+          run: async () => {
+            createResponses.push(() => Promise.resolve(jsonResponse({ title: "A" })))
+            await renderReady()
+
+            await deliver("1", "A")
+            await waitFor(() => expect(warn).toHaveBeenCalled())
+            await settle()
+
+            expect(toastMock.error.mock.calls).toEqual([["builds.list.chat.sendFailed"]])
+            expect(warn.mock.calls).toEqual([[W_SEND_FAILED]])
+            expect(screen.queryByText("widgetChat.messages.error_init")).toBeNull()
+            expect(screen.getByText("widgetChat.status.online")).toBeInTheDocument()
+            expect(app.sendMessage).not.toHaveBeenCalled()
+          },
+        },
+        {
+          name: "a lost connection reported before the task exists still raises the start screen's toast",
+          run: async () => {
+            createResponses.push(() => Promise.reject(
+              Object.assign(new Error("Connection lost"), { connectionLost: true }),
+            ))
+            await renderReady()
+
+            await deliver("1", "A")
+            await waitFor(() => expect(warn).toHaveBeenCalled())
+            await settle()
+
+            expect(toastMock.error.mock.calls).toEqual([["builds.list.chat.sendFailed"]])
+            expect(warn.mock.calls).toEqual([[W_SEND_FAILED]])
+            expect(screen.queryByText("widgetChat.messages.error_init")).toBeNull()
+            expect(app.setTaskId).not.toHaveBeenCalled()
+            expect(app.sendMessage).not.toHaveBeenCalled()
+          },
+        },
+      ],
+      sendFailsAfterTaskCreation: [
+        {
+          name: "a send that timed out waiting for the task connection raises the generic toast",
+          run: () => failsAfterTaskCreation(
+            new MessageDeliveryError("Message not sent: timed out waiting for the task connection.", "not_sent"),
+            [["builds.list.chat.sendFailed"]],
+          ),
+        },
+        {
+          name: "a send dropped because the conversation was reset raises the generic toast",
+          run: () => failsAfterTaskCreation(
+            new MessageDeliveryError("Message not sent: the conversation was reset before it could be delivered.", "not_sent"),
+            [["builds.list.chat.sendFailed"]],
+          ),
+        },
+        {
+          name: "a send the server rejected raises its error code's toast",
+          run: () => failsAfterTaskCreation(
+            new MessageDeliveryError("Task is currently running; retry after it completes.", "rejected", {
+              errorCode: "task_busy",
+              userFacing: true,
+            }),
+            [[clientErrorTranslationKey("task_busy")]],
+          ),
+        },
+        {
+          name: "a send whose connection closed before acceptance raises no toast",
+          run: () => failsAfterTaskCreation(
+            new MessageDeliveryError("Connection closed before the message was accepted.", "outcome_unknown", {
+              connectionLost: true,
+            }),
+            [],
+          ),
+        },
+      ],
+      shareLink: [{
+        name: "a share link neither asks for nor sends open messages",
+        run: async () => {
+          renderSharePage()
+          await screen.findByRole("button", { name: "start:Support Agent" })
+
+          await deliver("1", "A")
+          await settle()
+
+          expect(postedOfType("open_message_request")).toEqual([])
+          expect(creates()).toEqual([])
+        },
+      }],
+      workforceWidget: [{
+        name: "a workforce widget starts each message in task creation and still sends one at a time",
+        run: async () => {
+          const firstCreate = deferred<Response>()
+          createResponses.push(() => firstCreate.promise)
+          await renderReady({ workforce: true })
+
+          await deliver("1", "A")
+          await waitFor(() => expect(creates()).toEqual(["create(A)"]))
+          await deliver("2", "B")
+          await settle()
+          expect(creates()).toEqual(["create(A)"])
+
+          order.push("release")
+          firstCreate.resolve(jsonResponse(widgetTaskResponse(100, "running")))
+          await waitFor(() => expect(creates()).toEqual(["create(A)", "create(B)"]))
+          await settle()
+
+          expect(order).toEqual([
+            "create(A)", "release", "setTaskId(100)",
+            "setTaskId(null)", "create(B)", "setTaskId(101)",
+          ])
+          expect(app.sendMessage).not.toHaveBeenCalled()
+        },
+      }],
+      authenticationPending: [{
+        name: "before authentication completes, nothing asks for or takes a message",
+        run: async () => {
+          authResponse = () => new Promise(() => {})
+          renderWidgetPage({ widgetKey: "widget-secret" })
+          await settle()
+
+          await deliver("1", "A")
+          await settle()
+
+          expect(postedOfType("open_message_request")).toEqual([])
+          expect(creates()).toEqual([])
+        },
+      }],
+      pageUnmounted: [{
+        name: "after the page unmounts, a message is neither acknowledged nor sent",
+        run: async () => {
+          const view = await renderReady()
+          view.unmount()
+
+          await deliver("1", "A")
+          await settle()
+
+          expect(postedOfType("open_message_ack")).toEqual([])
+          expect(creates()).toEqual([])
+        },
+      }],
+    }
+
+    for (const [id, guestCases] of Object.entries(GUEST_CASES)) {
+      for (const guestCase of guestCases) {
+        it(`${id}: ${guestCase.name}`, guestCase.run)
+      }
+    }
   })
 })

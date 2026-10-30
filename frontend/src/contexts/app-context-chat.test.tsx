@@ -50,6 +50,7 @@ const webSocketOptions = vi.hoisted(() => ({
     }, connectionIdentity: string) => void
     onMessage?: (message: TestWebSocketMessage) => void
     onConnect?: (openedTaskId?: number) => void
+    onConnectionCapabilities?: (capabilities: readonly string[]) => void
     uploadFiles?: unknown
     token?: string
   },
@@ -129,6 +130,7 @@ vi.mock("@/hooks/use-websocket", async (importOriginal) => ({
     }, connectionIdentity: string) => void
     onMessage?: (message: TestWebSocketMessage) => void
     onConnect?: (openedTaskId?: number) => void
+    onConnectionCapabilities?: (capabilities: readonly string[]) => void
     uploadFiles?: unknown
     token?: string
   }) => {
@@ -194,7 +196,7 @@ import { toast } from "sonner"
 type TaskControlMessage = Parameters<typeof extractTaskControlEnvelope>[0]
 
 function StateProbe() {
-  const { state } = useApp()
+  const { state, sessionConversationAttachment } = useApp()
   const allTraceEvents = [
     ...state.traceEvents,
     ...state.messages.flatMap((message) => message.traceEvents || []),
@@ -262,6 +264,7 @@ function StateProbe() {
       <div data-testid="preview-open">{String(state.filePreview.isOpen)}</div>
       <div data-testid="processing">{String(state.isProcessing)}</div>
       <div data-testid="stream-recovery">{state.streamRecoveryTaskId ?? ""}</div>
+      <div data-testid="session-conversation-attachment">{sessionConversationAttachment}</div>
     </>
   )
 }
@@ -9167,6 +9170,264 @@ describe("AppProvider websocket message routing", () => {
   })
 })
 
+describe("session conversation attachment", () => {
+  const ATTACH_CAPABILITIES = ["heartbeat", "conversation_attached"] as const
+  const attachedFrame = (): TestWebSocketMessage => ({
+    type: "conversation_attached",
+    timestamp: "2026-10-28T00:00:00Z",
+    data: { type: "conversation_attached" },
+  })
+  const futureFrame = (): TestWebSocketMessage => ({
+    type: "some_future_frame",
+    timestamp: "2026-10-28T00:00:00Z",
+    data: { type: "some_future_frame" },
+  })
+  const attachment = () =>
+    screen.getByTestId("session-conversation-attachment").textContent
+  const socket = () => webSocketOptions.current
+  const tree = (transport?: AppProviderTransportConfig) => (
+    <AppProvider token="token" transport={transport}>
+      <SessionControlsProbe />
+      <StateProbe />
+      <StateCapture />
+    </AppProvider>
+  )
+
+  let capturedState: ReturnType<typeof useApp>["state"] | null = null
+  function StateCapture() {
+    capturedState = useApp().state
+    return null
+  }
+  const currentState = () => {
+    if (!capturedState) throw new Error("AppProvider is not mounted")
+    return capturedState
+  }
+
+  beforeEach(() => {
+    webSocketOptions.current = null
+    webSocketOptions.all = []
+    sessionControls = null
+    capturedState = null
+    wsHarness.isConnected = true
+    wsHarness.connectionPhase = "connected"
+    sendRawMessageMock.mockReset()
+    sendRawMessageMock.mockReturnValue("sent")
+    sendChatMessageMock.mockReset()
+    sendChatMessageMock.mockResolvedValue({
+      client_message_id: "turn-optimistic",
+      turn_id: "turn-optimistic",
+    })
+    localStorage.clear()
+    ;(window as typeof window & { clearDuplicateMessageCache?: () => void })
+      .clearDuplicateMessageCache?.()
+  })
+
+  afterEach(() => {
+    cleanup()
+    wsHarness.isConnected = true
+    localStorage.clear()
+  })
+
+  const attachCurrentSocket = () => {
+    act(() => socket()?.onConnect?.())
+    act(() => socket()?.onConnectionCapabilities?.(ATTACH_CAPABILITIES))
+    act(() => socket()?.onMessage?.(attachedFrame()))
+  }
+
+  const renderAttached = () => {
+    const transport = makeSessionTransport()
+    const view = render(tree(transport))
+    attachCurrentSocket()
+    expect(attachment()).toBe("attached")
+    return { ...view, transport }
+  }
+
+  describe("exposes the current socket's conversation attachment", () => {
+    it("stays pending until the socket that declared it announces attach completion", () => {
+      render(tree(makeSessionTransport()))
+      act(() => socket()?.onConnect?.())
+      expect(attachment()).toBe("pending")
+
+      act(() => socket()?.onConnectionCapabilities?.(ATTACH_CAPABILITIES))
+      expect(attachment()).toBe("pending")
+
+      act(() => socket()?.onMessage?.(attachedFrame()))
+      expect(attachment()).toBe("attached")
+    })
+
+    it("is unsupported when the socket's server does not declare it", () => {
+      render(tree(makeSessionTransport()))
+      act(() => socket()?.onConnect?.())
+      act(() => socket()?.onConnectionCapabilities?.(["heartbeat"]))
+
+      expect(attachment()).toBe("unsupported")
+    })
+
+    it("returns to pending once the connection drops", () => {
+      const { rerender, transport } = renderAttached()
+      wsHarness.isConnected = false
+      rerender(tree(transport))
+
+      expect(attachment()).toBe("pending")
+    })
+
+    // Not reachable in production: every Session reconnect comes with a new
+    // connection identity. Kept as a defensive check of the reset on open.
+    it("returns to pending when a new socket opens under the same identity", () => {
+      renderAttached()
+      act(() => socket()?.onConnect?.())
+
+      expect(attachment()).toBe("pending")
+    })
+
+    it("voids the attachment as soon as the connection identity changes", () => {
+      const { rerender } = renderAttached()
+      rerender(tree(makeSessionTransport(makeSessionConnection("session-two"))))
+      expect(attachment()).toBe("pending")
+
+      act(() => socket()?.onConnect?.())
+      expect(attachment()).toBe("pending")
+      act(() => socket()?.onConnectionCapabilities?.(ATTACH_CAPABILITIES))
+      expect(attachment()).toBe("pending")
+      act(() => socket()?.onMessage?.(attachedFrame()))
+      expect(attachment()).toBe("attached")
+    })
+
+    it("ignores an announcement that arrives before any declared capability", () => {
+      render(tree(makeSessionTransport()))
+      act(() => socket()?.onConnect?.())
+      act(() => socket()?.onMessage?.(attachedFrame()))
+      expect(attachment()).toBe("pending")
+
+      // The ignored announcement is not remembered for a later declaration.
+      act(() => socket()?.onConnectionCapabilities?.(ATTACH_CAPABILITIES))
+      expect(attachment()).toBe("pending")
+    })
+
+    it("ignores an announcement from the previous identity's socket", () => {
+      const { rerender } = render(tree(makeSessionTransport()))
+      const previousOnMessage = socket()?.onMessage
+      act(() => socket()?.onConnect?.())
+      rerender(tree(makeSessionTransport(makeSessionConnection("session-two"))))
+      act(() => socket()?.onConnect?.())
+      act(() => socket()?.onConnectionCapabilities?.(ATTACH_CAPABILITIES))
+
+      act(() => previousOnMessage?.(attachedFrame()))
+      expect(attachment()).toBe("pending")
+
+      act(() => socket()?.onMessage?.(attachedFrame()))
+      expect(attachment()).toBe("attached")
+    })
+
+    it("is pending for a transport that is not a Session", () => {
+      render(tree())
+      expect(socket()?.onConnectionCapabilities).toBeUndefined()
+      act(() => socket()?.onConnect?.())
+      act(() => socket()?.onMessage?.(attachedFrame()))
+
+      expect(attachment()).toBe("pending")
+    })
+
+    // Not reachable in production, like the same-identity reopen above: this
+    // checks the reset on disconnect on its own, without the reset on open.
+    it("stays pending when the connection returns without a new socket opening", () => {
+      const { rerender, transport } = renderAttached()
+      wsHarness.isConnected = false
+      rerender(tree(transport))
+      wsHarness.isConnected = true
+      rerender(tree(transport))
+
+      expect(attachment()).toBe("pending")
+    })
+  })
+
+  type Phase = ReturnType<typeof useApp>["sessionConversationState"]
+  const BOUND_TASK_ID = 91
+  const reachBound = () => {
+    act(() => socket()?.onMessage?.(taskInfoMessage(BOUND_TASK_ID)))
+  }
+  const reachReplacementReady = async () => {
+    reachBound()
+    const reset = getSessionControls().startNewConversation()
+    await act(async () => {
+      socket()?.onMessage?.({
+        type: "conversation_reset",
+        timestamp: "2026-10-28T00:00:01Z",
+        data: {},
+      })
+      await reset
+    })
+  }
+  // A literal per phase: adding a phase fails type checking until it is listed.
+  const REACH_PHASE: Record<Phase, () => Promise<void>> = {
+    unbound: async () => {},
+    bound: async () => reachBound(),
+    reset_requested: async () => {
+      reachBound()
+      act(() => {
+        void getSessionControls().startNewConversation().catch(() => {})
+      })
+    },
+    replacement_ready: reachReplacementReady,
+    replacement_sending: async () => {
+      await reachReplacementReady()
+      sendChatMessageMock.mockReturnValueOnce(new Promise(() => {}))
+      act(() => {
+        void getSessionControls()
+          .sendMessage("Replacement", { clientMessageId: "attachment-sending" })
+          .catch(() => {})
+      })
+    },
+    replacement_awaiting_task: async () => {
+      await reachReplacementReady()
+      await act(async () => {
+        await getSessionControls().sendMessage("Replacement", {
+          clientMessageId: "attachment-awaiting",
+        })
+      })
+    },
+    reload_required: async () => {
+      reachBound()
+      act(() => socket()?.onMessage?.({
+        type: "conversation_reload_required",
+        timestamp: "2026-10-28T00:00:01Z",
+        task_id: BOUND_TASK_ID,
+        data: {},
+      }))
+    },
+  }
+  const PHASES = Object.keys(REACH_PHASE) as Phase[]
+  const FRAMES = [attachedFrame, futureFrame]
+
+  it.each(
+    PHASES.flatMap(phase => FRAMES.map(frame => [frame().type, phase, frame] as const))
+  )("ignores %s frames in the %s phase", async (frameType, phase, frame) => {
+    render(tree(makeSessionTransport()))
+    act(() => socket()?.onConnect?.())
+    act(() => socket()?.onConnectionCapabilities?.(ATTACH_CAPABILITIES))
+    await REACH_PHASE[phase]()
+    await waitFor(() => {
+      expect(currentState().sessionConversation.phase).toBe(phase)
+    })
+    const conversation = currentState().sessionConversation
+    const messages = currentState().messages
+
+    act(() => socket()?.onMessage?.(frame()))
+
+    expect(currentState().sessionConversation).toEqual(conversation)
+    expect(currentState().messages).toEqual(messages)
+    if (phase === "replacement_sending" && frameType === "conversation_attached") {
+      // More frames than the pre-adoption buffer holds.
+      act(() => {
+        for (let index = 0; index < 65; index += 1) {
+          socket()?.onMessage?.(frame())
+        }
+      })
+      expect(currentState().sessionConversation).toEqual(conversation)
+    }
+  })
+})
+
 describe("terminal error frames", () => {
   // Same reset as the routing suite above: the websocket harness ref and the
   // duplicate-message cache both outlive a single render, so without this the
@@ -12188,5 +12449,163 @@ describe("projectAppState exact settlement routing", () => {
 
     expect(state.messages).toHaveLength(0)
     expect(state.traceEvents.map(event => event.event_id)).toEqual(["orphan"])
+  })
+})
+
+describe("sends in flight", () => {
+  let latestApp: ReturnType<typeof useApp> | null = null
+  let renders: Array<{ taskId: number | null; inFlight: boolean }> = []
+
+  function SendProbe() {
+    latestApp = useApp()
+    renders.push({ taskId: latestApp.state.taskId, inFlight: latestApp.isSendInFlight })
+    return null
+  }
+
+  const app = () => {
+    if (!latestApp) throw new Error("SendProbe is not mounted")
+    return latestApp
+  }
+  // Each change of isSendInFlight across renders, starting from the first.
+  const inFlightChanges = () => renders
+    .map(({ inFlight }) => inFlight)
+    .filter((inFlight, index, all) => index === 0 || inFlight !== all[index - 1])
+
+  beforeEach(() => {
+    latestApp = null
+    renders = []
+    webSocketOptions.current = null
+    webSocketOptions.all = []
+    wsHarness.isConnected = true
+    wsHarness.connectionPhase = "connected"
+    wsHarness.loginIdentity = "auth:0"
+    sendChatMessageMock.mockReset()
+    localStorage.clear()
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+    localStorage.clear()
+  })
+
+  describe.each(["task", "session"] as const)("counts every exposed sendMessage call until it settles (%s transport)", (transport) => {
+    function mount() {
+      const view = transport === "session"
+        ? render(<AppProvider token="token" transport={makeSessionTransport()}><SendProbe /></AppProvider>)
+        : render(<AppProvider token="token"><SeedRunningTask /><SendProbe /></AppProvider>)
+      act(() => webSocketOptions.current?.onConnect?.())
+      return view
+    }
+
+    function holdAcknowledgement() {
+      const acknowledgement = deferred<{ client_message_id: string; turn_id: string }>()
+      sendChatMessageMock.mockReturnValueOnce(acknowledgement.promise)
+      return acknowledgement
+    }
+
+    const ack = (id: string) => ({ client_message_id: id, turn_id: id })
+
+    it("from the call until it is accepted", async () => {
+      mount()
+      const acknowledgement = holdAcknowledgement()
+      let send!: Promise<void>
+
+      act(() => { send = app().sendMessage("hi", { clientMessageId: "turn-1" }) })
+      expect(app().isSendInFlight).toBe(true)
+      await act(async () => {
+        acknowledgement.resolve(ack("turn-1"))
+        await send
+      })
+
+      expect(inFlightChanges()).toEqual([false, true, false])
+    })
+
+    it("from the call until it fails, handing the caller the same error", async () => {
+      mount()
+      const acknowledgement = holdAcknowledgement()
+      const rejection = new MessageDeliveryError("Message rejected.", "rejected")
+      let outcome: unknown = "pending"
+
+      act(() => {
+        void app().sendMessage("hi", { clientMessageId: "turn-1" }).catch((error) => { outcome = error })
+      })
+      expect(app().isSendInFlight).toBe(true)
+      await act(async () => {
+        acknowledgement.reject(rejection)
+        await Promise.resolve()
+      })
+      await waitFor(() => expect(outcome).toBe(rejection))
+
+      expect(inFlightChanges()).toEqual([false, true, false])
+    })
+
+    it("until the last of two concurrent calls settles", async () => {
+      mount()
+      const first = holdAcknowledgement()
+      const second = holdAcknowledgement()
+      let sends: Array<Promise<void>> = []
+
+      act(() => {
+        sends = [
+          app().sendMessage("one", { clientMessageId: "turn-1" }),
+          app().sendMessage("two", { clientMessageId: "turn-2" }),
+        ]
+      })
+      await act(async () => {
+        first.resolve(ack("turn-1"))
+        await sends[0]
+      })
+      expect(app().isSendInFlight).toBe(true)
+      await act(async () => {
+        second.resolve(ack("turn-2"))
+        await sends[1]
+      })
+
+      expect(inFlightChanges()).toEqual([false, true, false])
+    })
+
+    it.each(["accepted", "rejected"] as const)("and still hands the caller its outcome when it is %s after unmount", async (outcome) => {
+      const view = mount()
+      const acknowledgement = holdAcknowledgement()
+      const rejection = new MessageDeliveryError("Message rejected.", "rejected")
+      let send!: Promise<void>
+      act(() => { send = app().sendMessage("hi", { clientMessageId: "turn-1" }) })
+
+      view.unmount()
+      if (outcome === "accepted") {
+        acknowledgement.resolve(ack("turn-1"))
+        await expect(send).resolves.toBeUndefined()
+      } else {
+        acknowledgement.reject(rejection)
+        await expect(send).rejects.toBe(rejection)
+      }
+    })
+  })
+
+  it("keeps a send in flight from the moment it is called, with no render between setTaskId and the send", async () => {
+    vi.useFakeTimers()
+    wsHarness.isConnected = false
+    render(<AppProvider token="token"><SendProbe /></AppProvider>)
+    let failure: unknown
+    let delivery!: Promise<void>
+
+    // handleSend sets the new task and starts its first send with no await in
+    // between; nothing may render the new task without the send counted.
+    act(() => {
+      app().setTaskId(77, { navigate: false })
+      delivery = app().sendMessage("hi", { targetTaskId: 77 }).catch((error) => { failure = error })
+    })
+
+    expect(renders).not.toContainEqual({ taskId: 77, inFlight: false })
+    expect(renders[renders.length - 1]).toEqual({ taskId: 77, inFlight: true })
+
+    // No connection opens, so the queued send times out and settles.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000)
+    })
+    await delivery
+    expect(renders[renders.length - 1]).toEqual({ taskId: 77, inFlight: false })
+    expect(failure).toMatchObject({ disposition: "not_sent" })
   })
 })

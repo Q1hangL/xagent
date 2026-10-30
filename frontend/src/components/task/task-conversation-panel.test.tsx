@@ -653,7 +653,7 @@ describe("TaskConversationPanel", () => {
       viewMode: "preview",
     }
     getFileDownloadUrlMock.mockReturnValue(
-      "/api/files/public/download/public-file-id?token=guest-token",
+      "/api/files/public/download/public-file-id",
     )
     fileAccessRequestMock.mockResolvedValue({
       ok: true,
@@ -666,7 +666,7 @@ describe("TaskConversationPanel", () => {
     await Promise.resolve()
     expect(getFileDownloadUrlMock).toHaveBeenCalledWith("public-file-id")
     expect(fileAccessRequestMock).toHaveBeenCalledWith(
-      "/api/files/public/download/public-file-id?token=guest-token",
+      "/api/files/public/download/public-file-id",
     )
   })
 

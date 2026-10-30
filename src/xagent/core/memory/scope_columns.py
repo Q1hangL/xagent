@@ -25,6 +25,7 @@ import math
 from typing import Any, Mapping, Optional
 
 from ..execution_scope import MEMORY_DIMENSION_METADATA_PREFIX
+from ..utils.lancedb_sql import sql_and, sql_string_literal
 
 # Real column names the memory dimensions are promoted into.
 USER_ID_COLUMN = "user_id"
@@ -133,10 +134,6 @@ def strict_user_id(value: Any) -> Optional[int]:
     return user_id
 
 
-def _sql_string_literal(text: str) -> str:
-    return "'" + text.replace("'", "''") + "'"
-
-
 def user_id_where_term(value: Any) -> Optional[str]:
     """Equality predicate on the ``user_id`` column, or ``None`` if unparsable."""
     user_id = coerce_user_id(value)
@@ -152,7 +149,7 @@ def scope_dim_where_term(dim_key: str, value: Any) -> str:
     queried dimensions still matches while a different value or a prefix does
     not — no escaping or collision reasoning required.
     """
-    element = _sql_string_literal(scope_dim_element(dim_key, value))
+    element = sql_string_literal(scope_dim_element(dim_key, value))
     return f"array_contains({SCOPE_DIMS_COLUMN}, {element})"
 
 
@@ -204,8 +201,9 @@ def build_scope_where(
         clauses.append(
             f"(array_length({SCOPE_DIMS_COLUMN}) = 0 OR {SCOPE_DIMS_COLUMN} IS NULL)"
         )
-    where_sql = " AND ".join(clauses) if clauses else None
-    return where_sql, residual
+    # Each clause is parenthesised so no term's internal OR can loosen the
+    # owner (``user_id``) predicate it is AND-ed with.
+    return sql_and(clauses), residual
 
 
 def _parsed_metadata(metadata_json: Optional[str]) -> dict[str, Any]:

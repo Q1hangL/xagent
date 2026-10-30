@@ -477,6 +477,7 @@ async def fetch_public_http_bytes(
     allow_https_downgrade: bool = True,
     require_identity_encoding: bool = False,
     required_status_code: int | None = None,
+    host_validator: Callable[[str], None] | None = None,
 ) -> PublicHttpResponse:
     """Fetch a bounded HTTP body, validating and pinning every redirect hop.
 
@@ -498,13 +499,22 @@ async def fetch_public_http_bytes(
     without that gate must require public-only connect-time DNS enforcement
     by the proxy itself.
 
+    The optional host_validator receives each normalized logical hostname
+    before DNS and may raise to reject it. Public-network checks still apply.
+
     Input-download callers can forbid HTTPS downgrades, require a complete
     HTTP 200 response and reject compressed bodies before HTTPX decompression.
     """
 
+    # Optional caller restrictions supplement the public-network checks.
+    # Validate each logical host before DNS or any request, including redirects.
     logical_url = url
     display_name = resource_name[:1].upper() + resource_name[1:]
     for redirect_count in range(PUBLIC_HTTP_MAX_REDIRECTS + 1):
+        if host_validator is not None:
+            parsed_host = validate_public_http_url_shape(logical_url).hostname
+            assert parsed_host is not None
+            host_validator(parsed_host.rstrip("."))
         resolved_ips = await validate_public_http_url(logical_url)
         parsed = urlsplit(logical_url)
         request_headers = httpx.Headers(headers)

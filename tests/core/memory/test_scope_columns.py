@@ -138,9 +138,9 @@ def test_build_scope_where_exclusive_directive():
         {"metadata": {"user_id": 1}, SCOPE_EXCLUSIVE_FILTER_KEY: True}
     )
     assert where_sql == (
-        f"{USER_ID_COLUMN} = 1 AND "
-        f"(array_length({SCOPE_DIMS_COLUMN}) = 0 "
-        f"OR {SCOPE_DIMS_COLUMN} IS NULL)"
+        f"({USER_ID_COLUMN} = 1) AND "
+        f"((array_length({SCOPE_DIMS_COLUMN}) = 0 "
+        f"OR {SCOPE_DIMS_COLUMN} IS NULL))"
     )
     # The reserved directive is consumed, never left for equality matching.
     assert residual == {}

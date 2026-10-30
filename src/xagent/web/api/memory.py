@@ -3,10 +3,11 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Callable, Iterator, Optional
+from typing import Annotated, Any, Callable, Iterator, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel, Field
+from starlette import convertors as starlette_url  # codespell:ignore
 
 from xagent.core.memory.base import MemoryStore
 from xagent.core.memory.core import MemoryNote
@@ -21,6 +22,44 @@ from ..user_isolated_memory import UserContext
 
 logger = logging.getLogger(__name__)
 MEMORY_READ_UNAVAILABLE_DETAIL = "Memory storage is temporarily unavailable."
+
+
+# Memory IDs are opaque strings. New notes get ``str(uuid.uuid4())``, but the
+# store keeps any non-empty ID it is given and legacy admission preserves
+# existing unique non-empty IDs, so the by-ID routes must accept exactly what
+# ``/list`` returned -- quotes, spaces, ``%``/``_`` and an encoded ``/``
+# included. The value is only ever compared as an exact literal: every LanceDB
+# predicate built from it goes through ``xagent.core.utils.lancedb_sql``. Only
+# the empty string is refused, because no store can hold it (an empty ID is
+# replaced on add and rejected by legacy admission).
+class _MemoryIdConverter(starlette_url.Convertor[str]):  # codespell:ignore
+    """One non-empty path remainder, ``/`` included.
+
+    Unlike Starlette's ``path`` converter it never matches an empty remainder,
+    so ``/api/memory/`` still falls through to the collection routes instead of
+    answering 405 from a by-ID route. The pattern is DOTALL: Starlette compiles
+    route regexes without it and ``$`` can match before a terminal newline, so a
+    plain ``.+`` would route ``note\n`` to ``note``.
+    """
+
+    regex = r"(?s:.+)"
+
+    def convert(self, value: str) -> str:
+        return value
+
+    def to_string(self, value: str) -> str:
+        return value
+
+
+starlette_url.register_url_convertor(  # codespell:ignore
+    "memory_id", _MemoryIdConverter()
+)
+
+MemoryIdPath = Annotated[
+    str,
+    Path(min_length=1, description="Memory ID, exactly as listed"),
+]
+MEMORY_ID_ROUTE = "/{memory_id:memory_id}"
 
 
 @contextmanager
@@ -230,9 +269,9 @@ class MemoryManagementRouter:
                     status_code=500, detail="Failed to list memories."
                 ) from None
 
-        @self.router.delete("/{memory_id}")
+        @self.router.delete(MEMORY_ID_ROUTE)
         async def delete_memory(
-            memory_id: str, user: User = Depends(get_current_user)
+            memory_id: MemoryIdPath, user: User = Depends(get_current_user)
         ) -> dict[str, Any]:
             try:
                 # Set user context for memory operations
@@ -254,9 +293,9 @@ class MemoryManagementRouter:
                     status_code=500, detail=f"Failed to delete memory: {str(e)}"
                 )
 
-        @self.router.put("/{memory_id}")
+        @self.router.put(MEMORY_ID_ROUTE)
         async def update_memory(
-            memory_id: str,
+            memory_id: MemoryIdPath,
             update_request: MemoryUpdateRequest,
             user: User = Depends(get_current_user),
         ) -> dict[str, Any]:
@@ -412,9 +451,9 @@ class MemoryManagementRouter:
                     status_code=500, detail="Failed to get store info."
                 ) from None
 
-        @self.router.get("/{memory_id}")
+        @self.router.get(MEMORY_ID_ROUTE)
         async def get_memory(
-            memory_id: str, user: User = Depends(get_current_user)
+            memory_id: MemoryIdPath, user: User = Depends(get_current_user)
         ) -> dict[str, Any]:
             try:
                 # Set user context for memory operations

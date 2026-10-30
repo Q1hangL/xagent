@@ -215,7 +215,10 @@ def test_agent_share_ws_connect_denies_foreign_guest() -> None:
     task_b = int(created.json()["task_id"])
 
     token_a = guest_a["Authorization"].removeprefix("Bearer ")
-    with client.websocket_connect(f"/api/share/chat/ws/{task_b}?token={token_a}") as ws:
+    with client.websocket_connect(
+        f"/api/share/chat/ws/{task_b}",
+        subprotocols=["xagent-auth-v1", f"xagent-auth-token.{token_a}"],
+    ) as ws:
         with pytest.raises(WebSocketDisconnect) as denied:
             ws.receive_text()
     assert denied.value.code == 4003

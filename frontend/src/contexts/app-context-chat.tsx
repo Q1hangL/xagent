@@ -2523,6 +2523,12 @@ interface SendMessageOptions {
   canAdoptCreatedTask?: () => boolean
 }
 
+// Whether the current Session socket has finished attaching: its server has
+// sent everything it owes on attach, including any resume replay, and reads
+// client frames from here on. "unsupported" means that socket's server does
+// not announce it. Every other case is "pending", including no Session.
+export type SessionConversationAttachment = "pending" | "attached" | "unsupported"
+
 interface AppContextType {
   state: AppState
   dispatch: React.Dispatch<AppAction>
@@ -2548,8 +2554,11 @@ interface AppContextType {
   stopState: SessionStopState
   isConversationResetPending: boolean
   isMessageDeliveryPending: boolean
+  // Some sendMessage call has not settled yet, on any transport.
+  isSendInFlight: boolean
   isSessionInteractionLocked: boolean
   sessionConversationState: SessionConversationState["phase"]
+  sessionConversationAttachment: SessionConversationAttachment
   setTaskId: (taskId: number | null, options?: { navigate?: boolean }) => void
   requestStatus: () => void
   getFilePreviewUrl: (fileId: string) => string
@@ -2591,7 +2600,7 @@ export interface AppProviderTransportConfig {
    * transports must opt out; the authenticated page keeps its legacy default.
    */
   legacyErrorProse?: "trusted" | "untrusted"
-  buildWebSocketUrl?: (params: { baseUrl: string; taskId: number; token?: string }) => string
+  buildWebSocketUrl?: (params: { baseUrl: string; taskId: number }) => string
   /**
    * Owns every file URL and request made below this provider. Public
    * transports use this to keep guest credentials instance-scoped.
@@ -2634,6 +2643,20 @@ interface SessionResetFlight {
 
 interface SessionMessageOwner {
   connectionIdentity: string
+}
+
+// What one physical Session socket has said about attach completion, and the
+// connection identity it was written for.
+interface SessionAttachmentRecord {
+  connectionIdentity: string | null
+  capability: "unknown" | "declared" | "absent"
+  attached: boolean
+}
+
+const UNKNOWN_SESSION_ATTACHMENT: SessionAttachmentRecord = {
+  connectionIdentity: null,
+  capability: "unknown",
+  attached: false,
 }
 
 interface SessionPreAdoptionBuffer {
@@ -2868,6 +2891,21 @@ export function AppProvider({
   // never import a legacy route/storage Task id into this protocol state.
   const sessionTaskIdRef = useRef<number | null>(null)
 
+  // Written only through writeSessionAttachment. It is reset whenever a socket
+  // opens or the connection drops, and the exposed value also requires its
+  // identity to equal the current connection identity: every Session
+  // reconnect comes with a new identity, so a record an earlier connection
+  // left behind never reads as current.
+  const sessionAttachmentRef = useRef<SessionAttachmentRecord>(
+    UNKNOWN_SESSION_ATTACHMENT
+  )
+  const [sessionAttachment, setSessionAttachment] =
+    useState<SessionAttachmentRecord>(UNKNOWN_SESSION_ATTACHMENT)
+  const writeSessionAttachment = useCallback((next: SessionAttachmentRecord) => {
+    sessionAttachmentRef.current = next
+    if (mountedRef.current) setSessionAttachment(next)
+  }, [])
+
   const rejectSessionResetFlight = useCallback(
     (
       resetFlight: SessionResetFlight | null,
@@ -3100,6 +3138,11 @@ export function AppProvider({
     openedTaskIdsRef.current.add(openedTaskId ?? null)
     resendWaitersRef.current.release(true)
     if (sessionTransport?.history === "none") {
+      writeSessionAttachment({
+        connectionIdentity: sessionConnectionIdentityRef.current,
+        capability: "unknown",
+        attached: false,
+      })
       const connectionIdentity = sessionConnectionIdentityRef.current
       if (connectionIdentity && connectionIdentity === sessionConnectionIdentity) {
         sessionTransport.onConnectionOpen?.(connectionIdentity)
@@ -3180,6 +3223,7 @@ export function AppProvider({
     sessionConnectionIdentity,
     sessionTransport?.history,
     sessionTransport?.onConnectionOpen,
+    writeSessionAttachment,
   ])
 
   const sessionMessageOwner = sessionConnectionIdentity
@@ -3233,6 +3277,26 @@ export function AppProvider({
       }
       handleMessage(message, dispatch, stateRef.current, { filesDisabled })
     },
+    onConnectionCapabilities: sessionTransport
+      ? (capabilities) => {
+        if (
+          !mountedRef.current
+          || !sessionMessageOwner
+          || sessionMessageOwner.connectionIdentity
+            !== sessionConnectionIdentityRef.current
+          || sessionAttachmentRef.current.connectionIdentity
+            !== sessionMessageOwner.connectionIdentity
+        ) {
+          return
+        }
+        writeSessionAttachment({
+          ...sessionAttachmentRef.current,
+          capability: capabilities.includes("conversation_attached")
+            ? "declared"
+            : "absent",
+        })
+      }
+      : undefined,
     onConnect: onConnect, // Pass the callback
     autoConnect: true,
   })
@@ -3322,6 +3386,16 @@ export function AppProvider({
       new Error("Conversation outcome is unknown because the Session disconnected; reload required.")
     )
   }, [isConnected, requireSessionReload, sessionTransport])
+
+  useEffect(() => {
+    if (sessionTransport && !isConnected) {
+      writeSessionAttachment({
+        connectionIdentity: sessionConnectionIdentityRef.current,
+        capability: "unknown",
+        attached: false,
+      })
+    }
+  }, [isConnected, sessionTransport, writeSessionAttachment])
 
   // Handle pending messages separately since we need sendChatMessage
   useEffect(() => {
@@ -7069,6 +7143,20 @@ export function AppProvider({
       return
     }
 
+    // Handled ahead of the phase routing below and in every phase, so it is
+    // never held with a replacement conversation's pre-adoption frames. It
+    // counts only on a socket whose capabilities declared it.
+    if (message.type === "conversation_attached") {
+      const attachment = sessionAttachmentRef.current
+      if (
+        attachment.connectionIdentity === owner.connectionIdentity
+        && attachment.capability === "declared"
+      ) {
+        writeSessionAttachment({ ...attachment, attached: true })
+      }
+      return
+    }
+
     if (message.type === "conversation_reload_required") {
       const binding = extractSessionTaskBinding(message)
       const lifecycle = sessionConversationRef.current
@@ -7963,6 +8051,26 @@ export function AppProvider({
     state.taskId,
   ])
 
+  // The sendMessage every consumer gets, counted from the call until it
+  // settles, for isSendInFlight. Counting around the call covers every caller
+  // of useApp().sendMessage, and the count rises before sendMessage runs, so no
+  // render can show a send that has started without it. The result and any
+  // error pass through unchanged.
+  const sendCallsInFlightRef = useRef(0)
+  const [sendCallsInFlight, setSendCallsInFlight] = useState(0)
+  const trackedSendMessage = useCallback<AppContextType["sendMessage"]>(async (...args) => {
+    sendCallsInFlightRef.current += 1
+    setSendCallsInFlight(sendCallsInFlightRef.current)
+    try {
+      return await sendMessage(...args)
+    } finally {
+      sendCallsInFlightRef.current -= 1
+      // Defensive only: React already drops an update to an unmounted
+      // provider without a warning, so nothing observable depends on this.
+      if (mountedRef.current) setSendCallsInFlight(sendCallsInFlightRef.current)
+    }
+  }, [sendMessage])
+
   const startNewConversation = useCallback((): Promise<void> => {
     const existingReset = sessionResetFlightRef.current
     if (existingReset) return existingReset.promise
@@ -8284,6 +8392,17 @@ export function AppProvider({
     startDelayedPlaybackRef.current = initializeReplayScheduler
   }, [initializeReplayScheduler])
 
+  const sessionConversationAttachment: SessionConversationAttachment =
+    !sessionTransport
+    || !isConnected
+    || sessionAttachment.connectionIdentity !== sessionConnectionIdentity
+      ? "pending"
+      : sessionAttachment.capability === "absent"
+        ? "unsupported"
+        : sessionAttachment.capability === "declared" && sessionAttachment.attached
+          ? "attached"
+          : "pending"
+
   return (
     <AgentCardPresentationCapability.Provider value={agentCardsEnabled}>
       <LinksOpenInNewTabCapability.Provider value={linksOpenInNewTab}>
@@ -8296,7 +8415,7 @@ export function AppProvider({
           agentCardsEnabled,
           voiceInputEnabled,
           taskControlsEnabled,
-          sendMessage,
+          sendMessage: trackedSendMessage,
           executeTask,
           pauseTask,
           resumeTask,
@@ -8313,9 +8432,11 @@ export function AppProvider({
           isConversationResetPending:
             state.sessionConversation.phase === "reset_requested",
           isMessageDeliveryPending: messageDeliveryCount > 0,
+          isSendInFlight: sendCallsInFlight > 0,
           isSessionInteractionLocked:
             state.sessionConversation.phase === "reload_required",
           sessionConversationState: state.sessionConversation.phase,
+          sessionConversationAttachment,
           setTaskId,
           requestStatus,
           getFilePreviewUrl,

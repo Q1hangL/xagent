@@ -25,6 +25,7 @@ from ...core.tools.core.RAG_tools.LanceDB.jieba_dictionary import (
     ensure_jieba_dictionary_once,
 )
 from ...core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
+from ...core.utils.lancedb_sql import sql_string_in
 from .base import VectorStore
 
 logger = logging.getLogger(__name__)
@@ -409,9 +410,9 @@ class LanceDBVectorStore(VectorStore):
         try:
             table = self._conn.open_table(self._collection_name)
 
-            # Build delete condition
-            id_conditions = " OR ".join([f"id = '{id_}'" for id_ in ids])
-            table.delete(id_conditions)
+            # Every id is a quoted literal, so a crafted id cannot widen the
+            # predicate beyond exact-match rows.
+            table.delete(sql_string_in("id", ids))
 
             return True
         except Exception as e:

@@ -50,26 +50,47 @@ const STREAMING_URL_CACHE_TTL_MS = 4 * 60 * 1000
 // mounts of the same fileId within one render burst (e.g. the same
 // attachment shown on two messages) would otherwise each pay a separate
 // mint round trip before either resolves.
-const streamingUrlCache = new Map<string, Promise<{ url: string; expiresAt: number }>>()
-// Insertion time per fileId, tracked separately from the cache above: an
-// entry's own settled `expiresAt` isn't knowable until its promise resolves,
-// but pruning needs to sweep entries for fileIds nobody has asked about
-// since, which are never re-awaited to trigger that resolution. Without this,
-// a long chat session that streams many distinct attachments over time would
-// grow this module-level Map unbounded, one entry per fileId ever mounted.
-const streamingUrlCacheInsertedAt = new Map<string, number>()
+//
+// Keyed by policy first, then fileId: a streaming URL carries the credential
+// of the policy that minted it (the signed-in user's stream ticket, or one
+// widget/share guest's file ticket), so a URL minted under one policy must
+// never be served to another mounted in the same realm (e.g. two public
+// guests, or a public preview next to the in-app one). A WeakMap lets a
+// policy's whole cache go away with the policy instance.
+//
+// ``insertedAt`` is tracked separately from ``entries``: an entry's own
+// settled `expiresAt` isn't knowable until its promise resolves, but pruning
+// needs to sweep entries for fileIds nobody has asked about since, which are
+// never re-awaited to trigger that resolution. Without this, a long chat
+// session that streams many distinct attachments over time would grow the
+// cache unbounded, one entry per fileId ever mounted.
+interface StreamingUrlCache {
+  entries: Map<string, Promise<{ url: string; expiresAt: number }>>
+  insertedAt: Map<string, number>
+}
+let streamingUrlCaches = new WeakMap<FileAccessPolicy, StreamingUrlCache>()
+
+function streamingUrlCacheFor(fileAccess: FileAccessPolicy): StreamingUrlCache {
+  let cache = streamingUrlCaches.get(fileAccess)
+  if (!cache) {
+    cache = { entries: new Map(), insertedAt: new Map() }
+    streamingUrlCaches.set(fileAccess, cache)
+  }
+  return cache
+}
 
 function setStreamingUrlCacheEntry(
+  cache: StreamingUrlCache,
   fileId: string,
   promise: Promise<{ url: string; expiresAt: number }>
 ): void {
-  streamingUrlCache.set(fileId, promise)
-  streamingUrlCacheInsertedAt.set(fileId, Date.now())
+  cache.entries.set(fileId, promise)
+  cache.insertedAt.set(fileId, Date.now())
 }
 
-function deleteStreamingUrlCacheEntry(fileId: string): void {
-  streamingUrlCache.delete(fileId)
-  streamingUrlCacheInsertedAt.delete(fileId)
+function deleteStreamingUrlCacheEntry(cache: StreamingUrlCache, fileId: string): void {
+  cache.entries.delete(fileId)
+  cache.insertedAt.delete(fileId)
 }
 
 // Opportunistic, not timer-driven: piggybacks on the natural traffic of
@@ -78,10 +99,10 @@ function deleteStreamingUrlCacheEntry(fileId: string): void {
 // `expiresAt` check inside mintStreamingUrl (nobody's asking about it to run
 // that check), so it needs its own sweep independent of any particular
 // fileId's own access pattern.
-function pruneStaleStreamingUrlCacheEntries(): void {
+function pruneStaleStreamingUrlCacheEntries(cache: StreamingUrlCache): void {
   const now = Date.now()
-  for (const [id, insertedAt] of streamingUrlCacheInsertedAt) {
-    if (now - insertedAt > STREAMING_URL_CACHE_TTL_MS) deleteStreamingUrlCacheEntry(id)
+  for (const [id, insertedAt] of cache.insertedAt) {
+    if (now - insertedAt > STREAMING_URL_CACHE_TTL_MS) deleteStreamingUrlCacheEntry(cache, id)
   }
 }
 
@@ -89,8 +110,9 @@ async function mintStreamingUrl(
   fileAccess: FileAccessPolicy,
   fileId: string
 ): Promise<string> {
-  pruneStaleStreamingUrlCacheEntries()
-  const cached = streamingUrlCache.get(fileId)
+  const cache = streamingUrlCacheFor(fileAccess)
+  pruneStaleStreamingUrlCacheEntries(cache)
+  const cached = cache.entries.get(fileId)
   if (cached) {
     const entry = await cached.catch(() => null)
     if (entry && entry.expiresAt > Date.now()) return entry.url
@@ -99,8 +121,8 @@ async function mintStreamingUrl(
     // rather than leaving a dead/expired promise for the next caller to
     // hit this same branch again, but only if nothing else already
     // replaced it (e.g. a concurrent caller's own retry).
-    if (streamingUrlCache.get(fileId) === cached) {
-      deleteStreamingUrlCacheEntry(fileId)
+    if (cache.entries.get(fileId) === cached) {
+      deleteStreamingUrlCacheEntry(cache, fileId)
     } else {
       // A concurrent caller already replaced this stale/failed entry with
       // its own fresh mint while this call was awaiting it above -- reuse
@@ -116,14 +138,14 @@ async function mintStreamingUrl(
     url,
     expiresAt: Date.now() + STREAMING_URL_CACHE_TTL_MS,
   }))
-  setStreamingUrlCacheEntry(fileId, mintPromise)
+  setStreamingUrlCacheEntry(cache, fileId, mintPromise)
   try {
     return (await mintPromise).url
   } catch (error) {
     // Don't let a failed mint poison the cache for the next caller --
     // without this, every subsequent mount of this fileId would
     // immediately re-throw this same rejection instead of retrying.
-    if (streamingUrlCache.get(fileId) === mintPromise) deleteStreamingUrlCacheEntry(fileId)
+    if (cache.entries.get(fileId) === mintPromise) deleteStreamingUrlCacheEntry(cache, fileId)
     throw error
   }
 }
@@ -149,8 +171,69 @@ export function __mintStreamingUrlForTests(
  * mock. Call from `beforeEach` in any test that mocks `getStreamingUrl`.
  */
 export function __resetStreamingUrlCacheForTests(): void {
-  streamingUrlCache.clear()
-  streamingUrlCacheInsertedAt.clear()
+  streamingUrlCaches = new WeakMap()
+}
+
+/**
+ * Open a blank tab synchronously (inside the click handler, so the later
+ * async navigation isn't blocked as a popup) and send it to ``resolve()``'s
+ * URL once that settles. Severs ``window.opener`` (the reverse-tabnabbing
+ * risk rel="noreferrer" normally guards against on a static
+ * <a target="_blank">) while keeping our own reference to redirect it --
+ * window.open's own "noopener" feature string would null out that
+ * reference too.
+ */
+function openResolvedUrlInNewTab(resolve: () => Promise<string>): void {
+  const tab = window.open('about:blank', '_blank')
+  if (!tab) {
+    // Popup blocked (or a webview that refuses window.open): there is no
+    // tab left to redirect once resolve settles, so say so rather than
+    // resolving a URL nothing will ever navigate to.
+    toast.error('Unable to open in a new tab. Check your browser’s pop-up blocker.')
+    return
+  }
+  tab.opener = null
+  void resolve().then((url) => {
+    if (!tab.closed) tab.location.href = url
+  })
+}
+
+/**
+ * Give a policy-built file URL to a plain browser navigation. Under a policy
+ * whose URLs need a header the browser cannot send (the public widget/share
+ * policy, for share/widget task files), add a short-lived file ticket;
+ * otherwise, or if that fails, return the URL unchanged.
+ */
+async function authorizeForNavigation(
+  fileAccess: FileAccessPolicy,
+  url: string
+): Promise<string> {
+  if (!fileAccess.authorizeBrowserUrl) return url
+  try {
+    return await fileAccess.authorizeBrowserUrl(url)
+  } catch {
+    return url
+  }
+}
+
+/**
+ * Click/auxclick handler for a plain file link (``href`` built by the
+ * policy). A no-op when the href already loads as is; otherwise opens it in
+ * a new tab with a ticket added at click time, so the static href (and so
+ * the address bar of a copied link) never carries a credential.
+ * Middle-click/ctrl-click fire 'auxclick', which bypasses onClick, so wire
+ * this to both. Right-click "Open in new tab" cannot be intercepted and
+ * still navigates the bare href.
+ */
+function handleAuthorizedLinkClick(
+  event: React.MouseEvent<HTMLAnchorElement>,
+  fileAccess: FileAccessPolicy,
+  href: string
+): void {
+  if (!fileAccess.authorizeBrowserUrl) return
+  if (event.type === 'auxclick' && event.button !== 1) return
+  event.preventDefault()
+  openResolvedUrlInNewTab(() => authorizeForNavigation(fileAccess, href))
 }
 
 /**
@@ -158,34 +241,38 @@ export function __resetStreamingUrlCacheForTests(): void {
  *
  * Three strategies, tried in this order:
  *
- * 1. ``fileAccess.getStreamingUrl`` (only the default in-app policy
- *    implements this, and only when ``allowStreaming`` is true): mints a
- *    short-lived, file-scoped ticket and hands the media element a direct
- *    URL, preserving HTTP range requests for progressive playback. Falls
- *    through to (2) if minting fails (e.g. offline) rather than leaving
- *    the player on a permanent spinner. If the media element itself then
+ * 1. ``fileAccess.getStreamingUrl`` (both built-in policies implement
+ *    this; used only when ``allowStreaming`` is true): mints a short-lived,
+ *    file-scoped ticket and hands the media element a direct URL,
+ *    preserving HTTP range requests for progressive playback. The default
+ *    in-app policy mints a signed-in stream ticket; the public widget/share
+ *    policy exchanges its header-carried guest token for a public file
+ *    ticket (``POST /api/files/public/tickets/{fileId}``) -- the guest
+ *    token itself never goes in a URL. Falls through to (2) if minting
+ *    fails (e.g. offline, or the mint times out) rather than leaving the
+ *    player on a permanent spinner. If the media element itself then
  *    fails to load that URL after the ticket expires mid-session, the
  *    caller's ``onError`` should invoke the returned ``remintStreamingUrl``
- *    first -- minting is cheap and doesn't re-check ownership, so it's the
- *    right recovery for the common case of "the ticket simply expired
- *    while a long video was still playing" -- and only fall back to
- *    ``reportLoadFailure`` (which retries via (2)/(3) instead of leaving a
- *    dead ``src``) if the re-mint itself fails: this is not hypothetical,
- *    minting never checks file ownership by design (only redemption does),
- *    so a ticket can mint successfully for a file the caller can't
- *    actually read.
- * 2. Blob fetch: the default policy's authenticated preview route needs a
- *    Bearer header that media elements cannot send, so managed files are
- *    fetched into a blob object URL. If that fetch fails, the public
- *    preview URL is a last-resort fallback: on Agent Builder surfaces it
- *    may also require auth, but a spinner with no recovery path is worse
- *    than attempting the anonymous endpoint.
- * 3. Direct src: a policy that declares ``requiresBlobFetch: false`` (the
- *    public widget/share policy carries its guest token in the query
- *    string) hands the URL to the media element directly — a blob fetch
- *    would add no authorization there, and skipping it also preserves
- *    range requests. Policies that declare neither capability get the
- *    conservative blob path, which works everywhere.
+ *    first -- minting is cheap, so it's the right recovery for the common
+ *    case of "the ticket simply expired while a long video was still
+ *    playing" -- and only fall back to ``reportLoadFailure`` (which retries
+ *    via (2)/(3) instead of leaving a dead ``src``) if the re-mint itself
+ *    fails: the in-app stream-ticket mint never checks file ownership by
+ *    design (only redemption does), so a ticket can mint successfully for
+ *    a file the caller can't actually read.
+ * 2. Blob fetch: both built-in policies' preview routes need an
+ *    Authorization header that media elements cannot send (the signed-in
+ *    Bearer, or the guest token for share/widget task files), so managed
+ *    files are fetched through ``fileAccess.request`` into a blob object
+ *    URL. If that fetch fails, the public preview URL is a last-resort
+ *    fallback: it may also require a credential, but a spinner with no
+ *    recovery path is worse than attempting it.
+ * 3. Direct src: only a custom policy that declares
+ *    ``requiresBlobFetch: false`` (its previewUrl loads without headers)
+ *    hands the URL to the media element directly -- a blob fetch would add
+ *    no authorization there, and skipping it also preserves range requests.
+ *    Policies that declare neither capability get the conservative blob
+ *    path, which works everywhere.
  *
  * ``allowStreaming`` restricts strategy (1) to audio/video: images have no
  * seek-before-download or progressive-loading need, so paying an extra
@@ -318,12 +405,12 @@ function useResolvedMediaUrl(
       // The ticket minted but the media element couldn't actually load it.
       // Evict the cache entry too, so a remount of this same fileId mints
       // fresh rather than immediately reusing the ticket that just failed.
-      deleteStreamingUrlCacheEntry(fileId)
+      deleteStreamingUrlCacheEntry(streamingUrlCacheFor(fileAccess), fileId)
       setStreamingFailedFor(fileId)
       return false // not terminal -- a (2)/(3) fallback attempt is starting
     }
     return true // every strategy has been exhausted
-  }, [isStreamingUrl, fileId])
+  }, [isStreamingUrl, fileId, fileAccess])
 
   // setResolvedUrl below fires from a callback whose completion the
   // component's own lifecycle doesn't otherwise gate (unlike the main
@@ -350,7 +437,8 @@ function useResolvedMediaUrl(
   // deleted or access was revoked since the last successful load.
   const remintStreamingUrl = useCallback(async (): Promise<boolean> => {
     if (!fileId) return false
-    deleteStreamingUrlCacheEntry(fileId) // the cached ticket just failed to load
+    // the cached ticket just failed to load
+    deleteStreamingUrlCacheEntry(streamingUrlCacheFor(fileAccess), fileId)
     try {
       const freshUrl = await mintStreamingUrl(fileAccess, fileId)
       // JWT iat/exp have whole-second precision, so a mint within the same
@@ -386,9 +474,15 @@ function useResolvedMediaUrl(
 
   const resolveOpenUrl = useCallback(async (): Promise<string> => {
     // Not currently on the ticketed path: resolvedUrl is already either a
-    // blob: URL or a direct src that's safe to hand to a new tab as-is.
-    if (!isStreamingUrl) return resolvedUrl
-    if (!needsBlobFetch || !fileId) return previewUrl
+    // blob: URL or a direct src that's safe to hand to a new tab as-is --
+    // except the bare previewUrl (the blob fetch fell back to it), which
+    // under the public policy needs a file ticket to load in a new tab.
+    if (!isStreamingUrl) {
+      return resolvedUrl === previewUrl
+        ? authorizeForNavigation(fileAccess, previewUrl)
+        : resolvedUrl
+    }
+    if (!needsBlobFetch || !fileId) return authorizeForNavigation(fileAccess, previewUrl)
     try {
       const response = await fileAccess.request(fileAccess.previewUrl(fileId), {
         cache: 'no-cache',
@@ -397,13 +491,13 @@ function useResolvedMediaUrl(
           Pragma: 'no-cache',
         },
       })
-      if (!response.ok) return previewUrl
+      if (!response.ok) return authorizeForNavigation(fileAccess, previewUrl)
       const blob = await response.blob()
       const objectUrl = URL.createObjectURL(blob)
       openBlobUrlsRef.current.push(objectUrl)
       return objectUrl
     } catch {
-      return previewUrl
+      return authorizeForNavigation(fileAccess, previewUrl)
     }
   }, [isStreamingUrl, needsBlobFetch, fileId, fileAccess, previewUrl, resolvedUrl])
 
@@ -536,26 +630,14 @@ function InlineMediaPreview({
     // navigation -- popup-blocker-dependent window.open plumbing exists
     // only to smuggle a fresh URL past the 403-prone static href while
     // streaming, and would be pure overhead (and a needless popup-blocker
-    // dependency) here.
-    if (!isStreamingUrl) return
+    // dependency) here. The one exception is the bare previewUrl under a
+    // policy that authorizes browser URLs (public widget/share): that href
+    // needs a ticket added before a new tab can load it.
+    const hrefLoadsAsIs =
+      !isStreamingUrl && (openUrl !== previewUrl || !fileAccess.authorizeBrowserUrl)
+    if (hrefLoadsAsIs) return
     event.preventDefault()
-    const tab = window.open('about:blank', '_blank')
-    if (!tab) {
-      // Popup blocked (or a webview that refuses window.open): there is no
-      // tab left to redirect once resolveOpenUrl settles, so say so rather
-      // than resolving a URL nothing will ever navigate to.
-      toast.error('Unable to open in a new tab. Check your browser’s pop-up blocker.')
-      return
-    }
-    // Severs window.opener (the reverse-tabnabbing risk rel="noreferrer"
-    // normally guards against on a static <a target="_blank">) while still
-    // keeping our own reference to redirect once resolveOpenUrl settles --
-    // window.open's own "noopener" feature string would null out that
-    // reference too, which this handler needs.
-    tab.opener = null
-    void resolveOpenUrl().then((url) => {
-      if (!tab.closed) tab.location.href = url
-    })
+    openResolvedUrlInNewTab(resolveOpenUrl)
   }
   const [failedUrl, setFailedUrl] = useState('')
   const [loadedUrl, setLoadedUrl] = useState('')
@@ -907,6 +989,13 @@ function InlineFilePreviewContent({
     event.preventDefault()
     onFileClick(resolvedSource.fileId, filename)
   }
+  // Without an in-app dialog (or on middle-click), the download href is a
+  // plain navigation: under the public policy a share/widget task file needs
+  // a file ticket added at click time, or it would 403.
+  const handleDownloadLinkClick = (event: React.MouseEvent<HTMLAnchorElement>) => {
+    if (!resolvedSource.fileId || !downloadUrl) return
+    handleAuthorizedLinkClick(event, fileAccess, downloadUrl)
+  }
 
   if (!previewUrl) return null
 
@@ -973,7 +1062,8 @@ function InlineFilePreviewContent({
         href={downloadUrl}
         target={canOpenFilePreview ? undefined : '_blank'}
         rel={canOpenFilePreview ? undefined : 'noreferrer'}
-        onClick={canOpenFilePreview ? handleOpenPreview : undefined}
+        onClick={canOpenFilePreview ? handleOpenPreview : handleDownloadLinkClick}
+        onAuxClick={handleDownloadLinkClick}
         className={cn(
           'flex items-center gap-2 rounded-md border border-border/50 bg-muted/20 px-3 py-2 text-xs text-foreground hover:bg-muted/40',
           className
@@ -997,7 +1087,8 @@ function InlineFilePreviewContent({
           href={downloadUrl}
           target={canOpenFilePreview ? undefined : '_blank'}
           rel={canOpenFilePreview ? undefined : 'noreferrer'}
-          onClick={canOpenFilePreview ? handleOpenPreview : undefined}
+          onClick={canOpenFilePreview ? handleOpenPreview : handleDownloadLinkClick}
+          onAuxClick={handleDownloadLinkClick}
           className="shrink-0 text-foreground hover:underline"
         >
           {openLabel}

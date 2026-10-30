@@ -251,3 +251,102 @@ def test_header_authenticated_socket_keeps_idle_session_revocation_monitor(
             ws.receive_json()
         assert error.value.code == 4001
     assert calls[-1] == ("signed", {"verify_exp": False})
+
+
+@pytest.fixture
+def public_chat_client(monkeypatch):
+    """Share/widget chat routes with authorization stubbed to record the token.
+
+    The stub denies with a sentinel reason, so every test ends in a 4003 and
+    the recorded token shows exactly what reached access validation.
+    """
+    from fastapi import HTTPException
+
+    from xagent.web.api import public_chat_access
+    from xagent.web.api.share import share_router
+    from xagent.web.api.widget import widget_router
+    from xagent.web.services.share_rate_limit import reset_share_rate_limiter
+
+    reset_share_rate_limiter()
+    seen: list[str] = []
+
+    async def authorize(*, token, **kwargs):
+        seen.append(token)
+        raise HTTPException(status_code=403, detail="authorized-stub")
+
+    monkeypatch.setattr(
+        public_chat_access, "_authorize_share_chat_websocket", authorize
+    )
+    monkeypatch.setattr(
+        public_chat_access, "_authorize_public_chat_websocket", authorize
+    )
+    app = FastAPI()
+    app.include_router(share_router)
+    app.include_router(widget_router)
+    with TestClient(app) as client:
+        yield client, seen
+    reset_share_rate_limiter()
+
+
+_PUBLIC_CHAT_PATHS = ["/api/share/chat/ws/1", "/api/widget/chat/ws/1"]
+
+
+@pytest.mark.parametrize("path", _PUBLIC_CHAT_PATHS)
+@pytest.mark.parametrize("transport", ["subprotocol", "authorization"])
+def test_public_chat_socket_reads_guest_token_from_handshake_headers(
+    public_chat_client, path, transport
+):
+    client, seen = public_chat_client
+    options = (
+        {"subprotocols": ["xagent-auth-v1", "xagent-auth-token.guest.jwt"]}
+        if transport == "subprotocol"
+        else {"headers": {"authorization": "Bearer guest.jwt"}}
+    )
+    with client.websocket_connect(path, **options) as ws:
+        # Only the fixed protocol is negotiated, never the credential.
+        assert ws.accepted_subprotocol == (
+            "xagent-auth-v1" if transport == "subprotocol" else None
+        )
+        with pytest.raises(WebSocketDisconnect) as error:
+            ws.receive_text()
+    assert (error.value.code, error.value.reason) == (4003, "authorized-stub")
+    assert seen == ["guest.jwt"]
+
+
+@pytest.mark.parametrize("path", _PUBLIC_CHAT_PATHS)
+@pytest.mark.parametrize("with_header", [False, True])
+@pytest.mark.parametrize("query", ["token=guest.jwt", "access_token=guest.jwt"])
+def test_public_chat_socket_refuses_query_string_guest_tokens(
+    public_chat_client, path, with_header, query
+):
+    client, seen = public_chat_client
+    options = (
+        {"subprotocols": ["xagent-auth-v1", "xagent-auth-token.guest.jwt"]}
+        if with_header
+        else {}
+    )
+    with client.websocket_connect(f"{path}?{query}", **options) as ws:
+        with pytest.raises(WebSocketDisconnect) as error:
+            ws.receive_text()
+    assert (error.value.code, error.value.reason) == (4003, "Authentication required")
+    assert seen == []
+
+
+@pytest.mark.parametrize("path", _PUBLIC_CHAT_PATHS)
+@pytest.mark.parametrize(
+    "options",
+    [
+        {},
+        {"subprotocols": ["xagent-auth-v1"]},
+        {"subprotocols": ["xagent-auth-v1", "xagent-auth-token.a b"]},
+    ],
+)
+def test_public_chat_socket_refuses_missing_or_malformed_credentials(
+    public_chat_client, path, options
+):
+    client, seen = public_chat_client
+    with client.websocket_connect(path, **options) as ws:
+        with pytest.raises(WebSocketDisconnect) as error:
+            ws.receive_text()
+    assert (error.value.code, error.value.reason) == (4003, "Authentication required")
+    assert seen == []

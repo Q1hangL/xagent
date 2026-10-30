@@ -187,6 +187,7 @@ class ToolRegistry:
                 knowledge_tools,
                 mcp_tools,
                 music_tool,
+                pptx_render_tool,
                 pptx_tool,
                 skill_tools,
                 sound_effect_tool,

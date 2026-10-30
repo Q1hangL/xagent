@@ -56,21 +56,48 @@ describe("FileViewer HTML preview", () => {
     expect(screen.queryByTitle("next.html")).toBeNull()
   })
 
-  it("keeps a public file token scoped to absolute managed-file URLs", () => {
+  it("signs public managed-file assets with a file ticket, never the guest token", async () => {
     apiConfig.origin = ""
     vi.stubEnv("NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN", "https://preview.example.test")
+    const fetchMock = vi.fn().mockImplementation(async (url: string) => new Response(
+      JSON.stringify({ ticket: `ticket-for-${url.split("/").pop()}`, expires_in: 600 }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    ))
+    vi.stubGlobal("fetch", fetchMock)
     render(<FileAccessProvider policy={createPublicFileAccessPolicy("guest-token")}>
-      <FileViewer fileName="gallery.html" fileId="html-id" content={'<img src="file:image-id">'}
+      <FileViewer fileName="gallery.html" fileId="html-id"
+        content={'<img src="file:image-id"><link href="./style.css">'}
         isLoading={false} error={null} viewMode="preview" />
     </FileAccessProvider>)
-    const frame = screen.getByTitle("gallery.html") as HTMLIFrameElement
-    const post = vi.spyOn(frame.contentWindow!, "postMessage")
-    act(() => window.dispatchEvent(new MessageEvent("message", {
-      source: frame.contentWindow, origin: "null", data: { type: "xagent-html-preview-ready", version: 1 },
-    })))
-    expect((post.mock.calls[0][0].html as string)).toContain(
-      `${window.location.origin}/api/files/public/preview/image-id?token=guest-token`,
+    // Signing is asynchronous: wait for the frame that carries the signed
+    // document, then complete its ready handshake.
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    let html = ""
+    await waitFor(() => {
+      const frame = screen.getByTitle("gallery.html") as HTMLIFrameElement
+      const post = vi.spyOn(frame.contentWindow!, "postMessage")
+      act(() => window.dispatchEvent(new MessageEvent("message", {
+        source: frame.contentWindow, origin: "null", data: { type: "xagent-html-preview-ready", version: 1 },
+      })))
+      expect(post).toHaveBeenCalled()
+      html = post.mock.calls[0][0].html as string
+    })
+    expect(html).toContain(
+      `${window.location.origin}/api/files/public/preview/image-id?ticket=ticket-for-image-id`,
     )
+    expect(html).toContain(
+      `${window.location.origin}/api/files/public/preview/html-id?relative_path=.%2Fstyle.css&amp;ticket=ticket-for-html-id`,
+    )
+    expect(html).not.toContain("guest-token")
+    const mints = fetchMock.mock.calls as Array<[string, RequestInit]>
+    expect(mints.map(([url]) => url).sort()).toEqual([
+      "/api/files/public/tickets/html-id",
+      "/api/files/public/tickets/image-id",
+    ])
+    for (const [, options] of mints) {
+      expect(new Headers(options.headers).get("Authorization")).toBe("Bearer guest-token")
+    }
+    vi.unstubAllGlobals()
   })
 
   it("declares the scripts-only opaque-origin sandbox contract", () => {

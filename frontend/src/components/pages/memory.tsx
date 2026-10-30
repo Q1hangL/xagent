@@ -141,7 +141,7 @@ export function MemoryPage() {
   const handleBulkDelete = async () => {
     try {
       await Promise.all(Array.from(selectedIds).map(id =>
-        apiRequest(`${getApiUrl()}/api/memory/${id}`, { method: "DELETE", headers: {} })
+        apiRequest(`${getApiUrl()}/api/memory/${encodeURIComponent(id)}`, { method: "DELETE", headers: {} })
       ))
       setSelectedIds(new Set())
       setIsBulkDeleting(false)
@@ -258,7 +258,7 @@ export function MemoryPage() {
         metadata: formData.metadata ? JSON.parse(formData.metadata) : {}
       }
 
-      const response = await apiRequest(`${getApiUrl()}/api/memory/${editingMemory.id}`, {
+      const response = await apiRequest(`${getApiUrl()}/api/memory/${encodeURIComponent(editingMemory.id)}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(updateData)
@@ -277,7 +277,7 @@ export function MemoryPage() {
 
   const handleDeleteMemory = async (id: string) => {
     try {
-      const response = await apiRequest(`${getApiUrl()}/api/memory/${id}`, { method: "DELETE", headers: {} })
+      const response = await apiRequest(`${getApiUrl()}/api/memory/${encodeURIComponent(id)}`, { method: "DELETE", headers: {} })
       if (!response.ok) throw new Error("Failed to delete memory")
       setDeletingId(null)
       fetchData()

@@ -8,7 +8,6 @@ from fastapi import (
     File,
     Form,
     HTTPException,
-    Query,
     Request,
     UploadFile,
     WebSocket,
@@ -34,6 +33,7 @@ from .public_chat_access import (
     create_public_chat_access_token,
     create_share_chat_task,
     mint_share_guest_id,
+    public_websocket_header_token,
     share_chat_websocket_endpoint,
     upload_share_chat_files,
 )
@@ -198,10 +198,10 @@ async def create_share_task(
 async def websocket_share_chat_endpoint(
     websocket: WebSocket,
     task_id: int,
-    token: str = Query(..., description="Authentication token"),
 ) -> None:
+    """Share chat socket; the guest token rides the handshake headers."""
     await share_chat_websocket_endpoint(
         websocket=websocket,
         task_id=task_id,
-        token=token,
+        token=public_websocket_header_token(websocket),
     )

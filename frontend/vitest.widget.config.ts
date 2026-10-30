@@ -27,6 +27,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/widget/public-agent-chat-page.tsx",
         "src/components/widget/session-agent-chat-page.tsx",
         "src/components/widget/use-session-attachments.ts",
+        "src/components/widget/use-session-open-message.ts",
         "src/components/widget/use-widget-session.ts",
         "src/components/widget/widget-chrome-controls.tsx",
         "src/contexts/app-context-chat.tsx",
@@ -36,12 +37,14 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/hooks/use-file-mention.ts",
         "src/hooks/use-websocket.ts",
         "src/hooks/use-widget-initial-message.ts",
+        "src/hooks/use-widget-open-message.ts",
         "src/lib/api-wrapper.ts",
         "src/lib/auth-cache.ts",
         "src/lib/connector-runtime-api.ts",
         "src/lib/files-disabled-presentation.ts",
         "src/lib/remark-currency-safe-math.ts",
         "src/lib/remark-preserve-table-content.ts",
+        "src/lib/send-failure-notice.ts",
         "src/lib/widget-parent-message.ts",
         "src/lib/widget-session-upload.ts",
         "src/contexts/presentation-capabilities.tsx",
@@ -84,6 +87,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/widget/use-session-attachments.ts": {
           statements: 90, branches: 85, functions: 75, lines: 90,
         },
+        "src/components/widget/use-session-open-message.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
         "src/components/widget/use-widget-session.ts": {
           statements: 95, branches: 80, functions: 90, lines: 95,
         },
@@ -94,6 +100,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
           statements: 95, branches: 90, functions: 95, lines: 95,
         },
         "src/lib/widget-parent-message.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        "src/lib/send-failure-notice.ts": {
           statements: 100, branches: 100, functions: 100, lines: 100,
         },
         "src/lib/files-disabled-presentation.ts": {
@@ -126,6 +135,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
           statements: 40, branches: 60, functions: 60, lines: 40,
         },
         "src/hooks/use-widget-initial-message.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        "src/hooks/use-widget-open-message.ts": {
           statements: 100, branches: 100, functions: 100, lines: 100,
         },
         "src/hooks/use-websocket.ts": { statements: 80, branches: 75, functions: 65, lines: 80 },
@@ -214,10 +226,12 @@ export default defineConfig({
       "src/components/widget/widget-session.test.ts",
       "src/components/widget/widget-chrome.test.ts",
       "src/components/widget/widget-chrome-controls.test.tsx",
+      "src/components/widget/widget-open.test.ts",
       "src/components/widget/public-agent-chat-page.test.tsx",
       "src/components/widget/session-agent-chat-page.test.tsx",
       "src/components/widget/session-agent-chat-page.integration.test.tsx",
       "src/components/widget/use-session-attachments.test.tsx",
+      "src/components/widget/use-session-open-message.test.tsx",
       "src/components/widget/use-widget-session.test.tsx",
       "src/contexts/app-context-chat.test.tsx",
       "src/contexts/auth-context.test.tsx",
@@ -226,6 +240,7 @@ export default defineConfig({
       "src/hooks/use-file-mention.test.tsx",
       "src/hooks/use-websocket.test.ts",
       "src/hooks/use-widget-initial-message.test.tsx",
+      "src/hooks/use-widget-open-message.test.tsx",
       "src/lib/api-wrapper.test.ts",
       "src/lib/auth-cache.test.ts",
       "src/ci/dependency-security.test.ts",
@@ -239,6 +254,7 @@ export default defineConfig({
       "src/lib/widget-parent-message.test.ts",
       "src/lib/widget-session-upload.test.ts",
       "src/lib/client-errors.test.ts",
+      "src/lib/send-failure-notice.test.ts",
     ],
   },
 })

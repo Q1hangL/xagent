@@ -469,22 +469,25 @@ def test_a_scan_only_reads_the_balance_and_only_adds_to_the_attempt_count(
         assert (state.since_fallback, state.attempts_since_fallback) == (0, AFTER + 20)
 
 
+@pytest.mark.parametrize("together", [2, 3])
 def test_attempts_that_decided_a_fallback_together_each_take_their_debt_off(
-    world, on, clock
+    together, world, on, clock
 ):
     world.add("a")
     world.add("b")
     cap = cap_of()
     transport._fair_state.since_fallback = EVERY - 1
-    first, second = attempt(), attempt()
-    scan(cap, attempt=first)
-    scan(cap, attempt=second)
-    assert first.fallback and second.fallback
+    attempts = [attempt() for _ in range(together)]
+    for one in attempts:
+        scan(cap, attempt=one)
+    assert all(one.fallback for one in attempts)
 
-    transport._fair_count_dispatch(first, True)
-    transport._fair_count_dispatch(second, True)
+    for one in attempts:
+        transport._fair_count_dispatch(one, True)
 
-    assert transport._fair_state.since_fallback == -(EVERY - 1)
+    # The debt is not cut at one period, so the slots these rounds opened together
+    # are paid back.
+    assert transport._fair_state.since_fallback == -(EVERY - 1) * (together - 1)
     later = attempt()
     scan(cap, attempt=later)
     assert not later.fallback
@@ -630,10 +633,12 @@ def test_a_control_command_with_a_stale_key_does_not_hide_the_commands_ahead_of_
 
     chosen = scan(cap, attempt=attempt())
 
-    # One tenant has work that opens an execution, so the scan reads as it always
-    # did: no window is asked, nothing is missed or skipped.
+    # The pause makes no tenant of its own, so a is ranked alone. Its window holds
+    # the sixteen commands that wait elsewhere and misses, without a skip, and the
+    # plain lookup takes the seventeenth, the row it takes with the switch off.
     assert chosen == off == seventeenth
-    assert transport.drain_fair_misses() == 0
+    assert transport.drain_fair_misses() == 1
+    assert transport._fair_state.skips == {}
 
 
 def test_a_queue_with_no_interactive_command_between_the_lines_reads_as_today(
@@ -897,6 +902,12 @@ LOOP_ROWS = {
     "a fallback round the attempt count forced": (
         [add("a"), reach_the_attempt_line],
         0,
+        0,
+        0,
+    ),
+    "a fallback round both lines brought": (
+        [add("a"), reach_the_attempt_line],
+        EVERY - 1,
         -(EVERY - 1),
         0,
     ),
@@ -1141,10 +1152,11 @@ async def test_a_start_behind_a_missed_window_gets_the_fallback_round_after_the_
             db.commit()
 
     # Every attempt misses A's window and is counted; the attempt after AFTER of
-    # them is a fallback round, which reads past the window to A's START.
+    # them is a fallback round, which reads past the window to A's START. The
+    # attempt count brought it, so it leaves the balance alone.
     assert dispatched == expected
     state = transport._fair_state
-    assert (state.since_fallback, state.attempts_since_fallback) == (-(EVERY - 1), 0)
+    assert (state.since_fallback, state.attempts_since_fallback) == (0, 0)
 
 
 class Wakeups:
@@ -1283,6 +1295,41 @@ async def test_fallback_rounds_open_one_new_slot_in_every_fallback_period_howeve
     # and clearing the balance on a fallback round instead of taking its share off
     # gives 12 for freed = 2; with the fair rounds first, a fallback round on every
     # eighth attempt gives 0.
+    assert wakeups.opened.count("a") == slots // EVERY
+
+
+@pytest.mark.parametrize(
+    "fallback_first", [True, False], ids=["fallback first", "fair first"]
+)
+async def test_after_a_stretch_of_fair_rounds_that_open_no_slot_the_share_is_back_at_once(
+    fallback_first, world, on, clock, monkeypatch
+):
+    """For twenty attempt periods the fair rounds dispatch commands that open no
+    slot, as when they join running tasks, and only the fallback rounds the attempt
+    count brings open one. Then every wake-up frees one slot, as in the test above:
+    the fallback rounds open one in every FAIR_SHARE_FALLBACK_EVERY new slots from
+    the first period on, instead of after the fair rounds have paid a debt back."""
+    state = transport._fair_state
+    for _ in range(20):
+        one = attempt()
+        while not one.fallback:
+            one = attempt()
+            transport._ranks_tenants(one, None, None)
+            transport._fair_count_attempt(one)
+            transport._fair_count_dispatch(one, one.fallback)
+    assert (state.since_fallback, state.attempts_since_fallback) == (0, 0)
+
+    wakeups = Wakeups(world, monkeypatch, fallback_first)
+    wakeups.queue("a", 40)
+    wakeups.queue("b", 160)
+    slots = 128
+    for _ in range(slots):
+        await wakeups.wake(1)
+
+    assert len(wakeups.opened) == slots
+    # Taking a period's share off for each forced round leaves a debt of 140 here,
+    # and only the attempt count brings fallback rounds until it is paid: 7.
+    # Keeping the balance at or above one period's debt gives 15.
     assert wakeups.opened.count("a") == slots // EVERY
 
 
@@ -1514,11 +1561,104 @@ def test_an_interactive_command_that_waits_elsewhere_does_not_hold_back_batch_wo
     assert scan(cap, attempt=attempt()) == batch
 
 
-def test_one_tenant_alone_is_read_by_age_and_not_by_priority(world, on, clock):
-    oldest = world.add("a", priority=0)
-    world.add("a", priority=5)
+def test_one_tenant_alone_is_read_by_priority(world, on, clock):
+    world.add("a", priority=0)
+    higher = world.add("a", priority=5)
 
+    assert scan(cap_of(), attempt=attempt()) == higher
+
+
+def test_the_only_queued_tenant_takes_its_highest_priority_interactive_work_first(
+    world, on, clock
+):
+    ids = {
+        name: world.add("a", "interactive", priority=p)
+        for name, p in (("low", -5), ("five", 5), ("five again", 5), ("top", 10))
+    }
+
+    picks = []
+    for _ in ids:
+        chosen = scan(cap_of(), attempt=attempt())
+        picks.append(next(name for name, number in ids.items() if number == chosen))
+        settle(world, chosen)
+
+    assert picks == ["top", "five", "five again", "low"]
+
+
+def test_between_the_lines_a_tenant_with_only_batch_work_does_not_turn_priority_off(
+    world, on, clock
+):
+    world.add("a", "interactive", priority=0)
+    higher = world.add("a", "interactive", priority=9)
+    world.add("b", "batch")
+
+    # Only a has interactive work, so a is the one tenant ranked.
+    assert BATCH_CLOSED.batch_closed
+    assert scan(BATCH_CLOSED, attempt=attempt()) == higher
+
+
+def test_the_only_ranked_tenant_whose_window_misses_takes_the_oldest_row_unskipped(
+    world, on, clock
+):
+    oldest = world.add("a", priority=0)
+    first = world.add("a", pinned=True, priority=5)
+    for _ in range(15):
+        world.follow_up(world.task_of(first), "a", priority=5)
+
+    # No other tenant could take the turn, so the plain lookup decides in the same
+    # scan and the pair is not skipped: the next scan reads the window again.
     assert scan(cap_of(), attempt=attempt()) == oldest
+    assert transport.drain_fair_misses() == 1
+    assert transport._fair_state.skips == {}
+
+
+def test_a_class_of_the_only_ranked_tenant_that_missed_is_asked_again_next_scan(
+    world, on, clock
+):
+    world.add("a", "interactive", pinned=True)
+    assert scan(cap_of(), attempt=attempt()) is None
+
+    widget = world.add("a", "interactive", priority=10)
+    world.add("a", "batch")
+
+    # Had the interactive class been skipped, the newer batch command would win.
+    assert scan(cap_of(), attempt=attempt()) == widget
+
+
+def test_a_miss_while_ranked_alone_keeps_the_tenant_counted_for_the_cap(
+    world, on, clock
+):
+    held = world.add("a", "interactive")
+    band = cap_of(
+        active=[901, 902],
+        occupancy={"a": 2},
+        policy=DispatchPolicy(limit=3, interactive_reserve=1),
+    )
+    assert band.in_reserve_band
+
+    # a alone, its window missing because the attempt set its task aside.
+    assert scan(band, attempt=attempt(), busy=(world.task_of(held),)) is None
+    world.add("b", "interactive", pinned=True)
+
+    # a holds the most slots and b is queued, so a may not take the reserve slot.
+    assert scan(band, attempt=attempt()) is None
+
+
+def test_a_skip_left_from_two_ranked_tenants_is_not_read_once_one_is_left(
+    world, on, clock
+):
+    older = world.add("a", "interactive", priority=0)
+    other = world.add("b", "batch")
+    cap = cap_of(occupancy={"b": 1})
+
+    # a ranks first; its window misses because the attempt set its task aside, and
+    # with b ranked too the pair is skipped.
+    assert scan(cap, attempt=attempt(), busy=(world.task_of(older),)) == other
+    assert ("a", "interactive") in transport._fair_state.skips
+    settle(world, other)
+    widget = world.add("a", "interactive", priority=10)
+
+    assert scan(cap, attempt=attempt()) == widget
 
 
 def test_a_window_full_of_commands_that_wait_elsewhere_is_missed_until_the_fallback_round(
@@ -1624,17 +1764,32 @@ def test_without_an_interactive_reserve_no_command_is_held_for_its_class(
         )
 
 
-def test_a_queue_of_one_tenant_is_scanned_as_before_plus_one_listing(world, on, clock):
+def test_a_queue_of_one_tenant_follows_the_reference(world, on, clock):
     for seed in range(200):
-        rng = random.Random(20_000 + seed)
+        play(
+            world,
+            clock,
+            20_000 + seed,
+            tenants=1,
+            reserves=lambda limit: range(limit),
+        )
+
+
+def test_a_shallow_queue_of_one_tenant_at_one_priority_is_scanned_as_before(
+    world, on, clock
+):
+    for seed in range(200):
+        rng = random.Random(40_000 + seed)
         spec = random_world(
             rng,
             tenants=1,
-            size=rng.randint(4, 30),
+            size=rng.randint(4, 16),
             answers=False,
             admission=False,
             heavy=False,
         )
+        for cmd in spec.commands:
+            cmd.priority = 0
         world.reset()
         store_world(world, spec)
         transport._fair_state = transport._FairState()
@@ -1652,11 +1807,10 @@ def test_a_queue_of_one_tenant_is_scanned_as_before_plus_one_listing(world, on, 
         )
         assert not cap.closed
 
-        off, off_seen = recorded(world, lambda: scan(cap))
-        on_choice, on_seen = recorded(world, lambda: scan(cap, attempt=attempt()))
+        off = scan(cap)
+        on_choice = scan(cap, attempt=attempt())
 
         assert on_choice == off, f"seed {seed}: {spec.commands}"
-        assert len(on_seen) == len(off_seen) + 1, f"seed {seed}: {spec.commands}"
 
 
 def test_a_scan_that_finds_no_open_command_is_not_counted(world, on, clock):

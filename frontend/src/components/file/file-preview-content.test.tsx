@@ -22,7 +22,7 @@ vi.mock("@/contexts/app-context-chat", () => ({
     },
     dispatch: dispatchMock,
     filesDisabled: true,
-    getFilePreviewUrl: () => "/api/files/public/preview/guest-file?token=guest-token",
+    getFilePreviewUrl: () => "/api/files/public/preview/guest-file",
   }),
 }))
 
@@ -59,7 +59,7 @@ describe("FilePreviewContent", () => {
     render(<FilePreviewContent open />)
 
     await waitFor(() => expect(fileAccessRequestMock).toHaveBeenCalledWith(
-      "/api/files/public/preview/guest-file?token=guest-token",
+      "/api/files/public/preview/guest-file",
       expect.objectContaining({ cache: "no-cache" }),
     ))
     expect(dispatchMock).toHaveBeenCalledWith(expect.objectContaining({
