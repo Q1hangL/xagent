@@ -1,7 +1,7 @@
 """show the Freshdesk connector in the catalog
 
 Revision ID: 20261028_enable_freshdesk
-Revises: 20261027_wrap_legacy_password_hashes
+Revises: 20261029_update_chartmogul_description
 Create Date: 2026-10-28 00:00:00
 
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20261028_enable_freshdesk"
-down_revision: str | None = "20261027_wrap_legacy_password_hashes"
+down_revision: str | None = "20261029_update_chartmogul_description"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

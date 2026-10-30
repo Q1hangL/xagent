@@ -192,7 +192,7 @@ def test_revision_metadata() -> None:
     migration = _load_migration_module()
 
     assert migration.revision == "20261028_enable_freshdesk"
-    assert migration.down_revision == "20261027_wrap_legacy_password_hashes"
+    assert migration.down_revision == "20261029_update_chartmogul_description"
 
 
 def test_registry_default_is_visible() -> None:
